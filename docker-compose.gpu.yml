@@ -1,0 +1,105 @@
+# =============================================================================
+# Suite 366 — GPU inference overlay (vLLM)
+#
+# Adds on-host LLM + embedding inference, replicating the Devana DGX Spark
+# (NVIDIA GB10) configuration. REQUIRES an NVIDIA GPU with the Container Toolkit
+# and NVFP4 support (Blackwell / GB10). It will NOT run on a CPU-only host.
+#
+# Use it as an overlay on top of the base stack:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Models are pulled from Hugging Face on first boot — set HF_TOKEN in .env.
+# =============================================================================
+
+services:
+  # --- Chat / vision LLM: Gemma 4 26B-A4B (NVFP4) --------------------------
+  vllm-gemma:
+    image: vllm/vllm-openai:cu130-nightly
+    container_name: suite366-vllm-gemma
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN in .env}
+      VLLM_USE_FLASHINFER_MOE_FP4: "0"
+      VLLM_NVFP4_GEMM_BACKEND: marlin
+      # Online by default so the model can download on first boot. Once the HF
+      # cache volume is warm you may flip these to "1" for offline boots.
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      VLLM_NO_USAGE_STATS: "1"
+    volumes:
+      - hfcache:/root/.cache/huggingface
+      - ./tool_chat_template_gemma4.jinja:/app/tool_chat_template_gemma4.jinja:ro
+      - ./boot-guard.sh:/boot-guard.sh:ro
+    # Wait for the GPU to be ready after a reboot before starting vLLM.
+    entrypoint: ["/bin/bash", "/boot-guard.sh"]
+    command: >
+      nvidia/Gemma-4-26B-A4B-NVFP4
+      --served-model-name gemma-4-26b-a4b-nvfp4 gemma4-it gemma4-nvfp4
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      --dtype auto
+      --quantization modelopt
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.90
+      --max-model-len 262144
+      --kv-cache-dtype fp8
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --max-num-seqs 4
+      --moe-backend marlin
+      --async-scheduling
+      --chat-template /app/tool_chat_template_gemma4.jinja
+      --enable-auto-tool-choice
+      --tool-call-parser gemma4
+      --reasoning-parser gemma4
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 1200s
+
+  # --- Embeddings: Qwen3-VL-Embedding 8B ----------------------------------
+  # Needed for semantic search (RAG). Configure it as the embedding provider
+  # inside Suite 366 (endpoint: http://vllm-embeddings:8000/v1).
+  vllm-embeddings:
+    image: vllm/vllm-openai:cu130-nightly
+    container_name: suite366-vllm-embeddings
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN in .env}
+      VLLM_MEDIA_URL_ALLOW_REDIRECTS: "0"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - hfcache:/root/.cache/huggingface
+    command: >
+      --model Qwen/Qwen3-VL-Embedding-8B
+      --served-model-name qwen3-vl-embedding-8b
+      --host 0.0.0.0
+      --port 8000
+      --runner pooling
+      --dtype bfloat16
+      --trust-remote-code
+      --gpu-memory-utilization 0.90
+      --max-model-len 32768
+      --limit-mm-per-prompt.image 4
+      --limit-mm-per-prompt.video 0
+
+  # --- Wire the app to the on-host LLM ------------------------------------
+  app:
+    environment:
+      # Chat / vision model served by vllm-gemma (OpenAI-compatible API).
+      LLM_API_URL: http://vllm-gemma:8000/v1
+      LLM_API_KEY: ${LLM_API_KEY:-local-vllm}
+      LLM_MODEL: gemma-4-26b-a4b-nvfp4
+
+volumes:
+  hfcache:

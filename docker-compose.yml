@@ -1,0 +1,89 @@
+name: suite366
+
+# Suite 366 — self-hosting stack.
+# Configure everything through the .env file next to this compose file
+# (copy .env.example → .env). Data lives in named volumes (see bottom).
+
+services:
+  app:
+    image: ${SUITE366_IMAGE:-ghcr.io/scriptor-group/suite-366:latest}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # Migrations run automatically on startup (prisma migrate deploy).
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(()=>process.exit(0)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-suite366}
+      POSTGRES_USER: ${POSTGRES_USER:-suite366}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-suite366}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}
+    volumes:
+      - miniodata:/data
+    ports:
+      # MinIO console (optional, for inspecting stored files). API stays internal.
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Optional: collaborative document editing (OnlyOffice) ---------------
+  # Uncomment to enable in-app editing of DOCX/XLSX/PPTX. Set the matching
+  # ONLYOFFICE_* variables in .env.
+  # onlyoffice:
+  #   image: onlyoffice/documentserver:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     JWT_ENABLED: "true"
+  #     JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?set ONLYOFFICE_JWT_SECRET in .env}
+  #   ports:
+  #     - "${ONLYOFFICE_PORT:-8080}:80"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

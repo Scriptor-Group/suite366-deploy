@@ -1,0 +1,14 @@
+# Local configuration with generated secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Install directory created by install.sh when run in-place
+/suite366/
+
+# Backups
+*.sql
+*.tgz
+
+# OS noise
+.DS_Store
