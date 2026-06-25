@@ -1,8 +1,8 @@
-# Suite 366 — DGX Spark appliance
+# Suite 366 - DGX Spark appliance
 
-[Suite 366](https://www.suite366.ai/) is a sovereign, AI-native work suite —
-documents, collaborative editing, chat, realtime voice/video, and built-in AI
-agents. This repo is the **DGX Spark appliance installer**: a fully self-hosted,
+[Suite 366](https://www.suite366.ai/) is a sovereign, AI-native work suite
+(documents, collaborative editing, chat, realtime voice/video, and built-in AI
+agents). This repo is the **DGX Spark appliance installer**: a fully self-hosted,
 on-device deployment where your data never leaves the box.
 
 One-liner installer that turns a **single NVIDIA DGX Spark** (Ubuntu 22.04 /
@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main
 
 > **What this is for.** The DGX Spark is a 121 GiB unified-memory ARM64 box
 > with a Blackwell GB10 GPU. It's well-suited to a single-machine private
-> deployment of Suite 366 — your documents and prompts never leave the host.
+> deployment of Suite 366 - your documents and prompts never leave the host.
 > This installer is the appliance flavor: opinionated, idempotent, designed
 > to boot and stay up across reboots without manual care.
 
@@ -56,7 +56,7 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
 - DGX Spark running DGX OS (NVIDIA driver + Docker preinstalled). The installer:
   - installs `nvidia-container-toolkit` if missing;
   - runs `nvidia-ctk runtime configure --runtime=docker` if the package is
-    present but Docker doesn't see the runtime (common DGX OS case — the
+    present but Docker doesn't see the runtime (common DGX OS case - the
     compose uses `gpus: all` and works either way, but the runtime
     registration is useful for other tools);
   - generates a **persistent** CDI spec at `/etc/cdi/nvidia.yaml` so
@@ -69,7 +69,7 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
   - Override `CHART_REF=` if you mirror the chart somewhere else.
 - **arm64 images**: all Suite 366 container images on GHCR are currently
   arm64-only (matching DGX Spark / GB10). The chart's CI is expected to
-  publish multi-arch (`linux/amd64 + linux/arm64`) eventually — until then,
+  publish multi-arch (`linux/amd64 + linux/arm64`) eventually - until then,
   do not point amd64 clusters at the same tags.
 - **Outbound network** to `get.k3s.io`, `get.helm.sh`, `ghcr.io`,
   `registry-1.docker.io`, `huggingface.co`, `charts.jetstack.io`. The
@@ -103,7 +103,7 @@ Validated on Spark `aarch64 / GB10 / DGX OS 6.17 / 121 GiB unified`,
 Gemma-4-26B-A4B-NVFP4 under `vllm/vllm-openai:cu130-nightly` (vLLM 0.19.2rc1):
 
 **Unified memory budget.** `gpu_memory_utilization` is NOT pre-allocated in
-VRAM (there is no VRAM on GB10) — vLLM uses it to compute the KV cache size
+VRAM (there is no VRAM on GB10) - vLLM uses it to compute the KV cache size
 after weights are loaded. With the defaults:
 - LLM `0.55` → weights 17.97 GiB + workspace + cudagraphs + **KV cache = 402,416 tokens** (fp8).
 - EMBED `0.30` → ~36 GiB raw budget, but ~14 GiB perceived as "workspace" (the
@@ -132,7 +132,7 @@ platform.
 worst-case KV demand (`2×262144 = 524,288`) exceeds budget (`402,416`), but on
 2 cold concurrent 200k prompts measured: `Running: 2, Waiting: 0`, **no
 preemption**, KV usage < 6%. The practical bottleneck is prefill compute, not
-memory — `max_num_seqs > 2` brings nothing (the 2nd request slows down the 1st
+memory - `max_num_seqs > 2` brings nothing (the 2nd request slows down the 1st
 via chunked_prefill).
 
 **Critical prefix caching.** Observed hit rate 44-56% even on synthetic prompts
@@ -223,7 +223,7 @@ systemctl status suite366-avahi-aliases        # mDNS aliases
 ### Updates
 
 The installer arms a **daily systemd timer** (`suite366-update.timer`) that
-polls a **channel manifest** — [`channel.json`](channel.json) in this repo — and
+polls a **channel manifest** ([`channel.json`](channel.json) in this repo) and
 **notifies** when a newer chart or vLLM image is published. It never applies an
 upgrade on its own.
 
@@ -244,7 +244,7 @@ the releases published here. Point a box at a manifest you control with
 (a fork's raw URL, an object store, an internal web server) and set
 `MANIFEST_URL` to it on each box. Rolling everything forward is then a single
 edit: bump `chart_version` (and/or `vllm_image`) in your manifest, and every
-appliance picks it up within a day — no per-box changes. If you also mirror the
+appliance picks it up within a day (no per-box changes). If you also mirror the
 chart and images, point `CHART_REF` (and, at install time, `BASE_URL`) at your
 own registry.
 
@@ -263,8 +263,8 @@ fields return `N/A`. To monitor memory pressure, use `free -h` on the host.
 ## Survival across reboots
 
 On DGX OS, the NVIDIA Container Toolkit auto-generates CDI device specs at
-container start, but only under `/var/run/cdi/` — a tmpfs that is wiped at
-every reboot. Compose services declared with `gpus: all` (which we use) then
+container start, but only under `/var/run/cdi/` (a tmpfs that is wiped at
+every reboot). Compose services declared with `gpus: all` (which we use) then
 fail to start with:
 
 ```
@@ -291,7 +291,7 @@ persistent.
 ## Security posture
 
 - `/etc/rancher/k3s/k3s.yaml` is the k3s default **0600** (cluster-admin
-  credentials — bypass RBAC). Any local user with read access becomes
+  credentials - bypass RBAC). Any local user with read access becomes
   cluster-admin and can dump every secret rendered by the chart. Inspect
   via `sudo` only.
 - `/opt/suite366/` is **0700 root:root**. Contains `values.yaml`
@@ -299,7 +299,7 @@ persistent.
   state. Do not loosen.
 - `/opt/suite366/llm/.env` is **0600** (vLLM key, HF token).
 - `/opt/suite366/values.yaml` is **0600** (vLLM key copy fed to Helm).
-- `/usr/local/share/suite366-local-ca.crt` is **0644** — a *public* CA cert,
+- `/usr/local/share/suite366-local-ca.crt` is **0644** - a *public* CA cert,
   safe to scp to client machines as-is (no `sudo cat` needed).
 - The `curl|sudo bash` chain (k3s, Helm, this installer) relies on TLS +
   the integrity of `get.k3s.io`, `raw.githubusercontent.com`, and the host
@@ -309,10 +309,10 @@ persistent.
 ## TLS / browser trust
 
 The CA is published at two paths:
-- `/usr/local/share/suite366-local-ca.crt` (0644) — ready to `scp` to client
+- `/usr/local/share/suite366-local-ca.crt` (0644) - ready to `scp` to client
   machines.
 - `/opt/suite366/suite366-local-ca.crt` (0644 inside a 0700 directory, so
-  root-only access from outside) — same bytes, kept next to the rest of the
+  root-only access from outside) - same bytes, kept next to the rest of the
   install state.
 
 Install one of these on each client (system keychain / trusted authorities)
