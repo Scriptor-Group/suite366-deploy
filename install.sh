@@ -31,6 +31,8 @@
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
 #   VLLM_EMBEDDING_DIMENSIONS  embedding vector dimension served by the local
 #                              model (default 4096 = Qwen3-VL-Embedding-8B)
+#   VLLM_MAX_CONTEXT_WINDOW    max context window (tokens) the app advertises
+#                              for the local model (default 200000)
 #   LICENSE_PUBLIC_KEY         Ed25519 SPKI PEM the app uses to VERIFY signed
 #                              license tokens (default: shipped public key).
 #                              Verification-only — cannot sign/forge licenses.
@@ -74,6 +76,9 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 # Embedding dimension served by the local embed model — exposed to the app
 # via VLLM_EMBEDDING_DIMENSIONS so pgvector indexes the right shape.
 VLLM_EMBEDDING_DIMENSIONS="${VLLM_EMBEDDING_DIMENSIONS:-4096}"
+# Max context window (tokens) the app advertises for the local model — exposed
+# via VLLM_MAX_CONTEXT_WINDOW so prompt assembly / truncation sizes correctly.
+VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-200000}"
 
 # --- Licensing ---------------------------------------------------------------
 # Ed25519 (EdDSA) PUBLIC key shipped to the app to VERIFY signed license
@@ -510,6 +515,7 @@ deploy_suite() {
             -e "s|@EMBED_MODEL@|$EMBED_MODEL|g" \
             -e "s|@VLLM_API_KEY@|$VLLM_API_KEY|g" \
             -e "s|@VLLM_EMBEDDING_DIMENSIONS@|$VLLM_EMBEDDING_DIMENSIONS|g" \
+            -e "s|@VLLM_MAX_CONTEXT_WINDOW@|$VLLM_MAX_CONTEXT_WINDOW|g" \
             -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
         > "$vals" )

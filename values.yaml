@@ -63,6 +63,10 @@ config:
   VLLM_MODEL_VISION: "@LLM_MODEL@"
   VLLM_MODEL_EMBEDDING: "@EMBED_MODEL@"
   VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
+  # Max context window (tokens) the app advertises for the local model, so
+  # prompt assembly / truncation sizes correctly. install.sh substitutes
+  # @VLLM_MAX_CONTEXT_WINDOW@ (default 200000, override via env var).
+  VLLM_MAX_CONTEXT_WINDOW: "@VLLM_MAX_CONTEXT_WINDOW@"
   # --- Licensing -----------------------------------------------------------
   # Ed25519 (EdDSA) PUBLIC key the app uses to VERIFY signed license tokens.
   # Verification-only: it cannot forge or sign licenses, so it is safe to ship
