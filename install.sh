@@ -41,7 +41,7 @@ DOMAIN="${DOMAIN:-suite366.local}"
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
-CHART_VERSION="${CHART_VERSION:-0.6.0}"
+CHART_VERSION="${CHART_VERSION:-0.7.0}"
 NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"

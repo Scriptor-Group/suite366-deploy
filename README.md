@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main
 | **k3s** single-node | Traefik (ingress) + local-path (storage) + CoreDNS (k3s defaults) |
 | **vLLM ×2** (Docker host) | generative on `:8001`, embeddings on `:8002`, Blackwell GPU |
 | **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart per [PR #325](https://github.com/Scriptor-Group/suite-366/pull/325) |
-| **Suite 366** (`drive` chart 0.6.0) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
+| **Suite 366** (`drive` chart 0.7.0) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **TLS** | self-signed local CA (cert-manager), `*.suite366.local` certificates automatic |
 | **DNS** | mDNS/Avahi: `*.suite366.local` resolved on the LAN without client-side config |
@@ -43,7 +43,7 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
     `gpus: all` survives reboots (see *Survival across reboots* below).
 - **Helm chart + container images**: all hosted anonymously on GHCR under
   the Scriptor-Group org. No login required.
-  - Chart: `oci://ghcr.io/scriptor-group/chart/drive` (v `0.6.0`)
+  - Chart: `oci://ghcr.io/scriptor-group/chart/drive` (v `0.7.0`)
   - Images: `ghcr.io/scriptor-group/suite-366`, `…-sandbox-api`,
     `…-sandbox-runner` (referenced by the chart, no override needed)
   - Override `CHART_REF=` if you mirror the chart somewhere else.
@@ -204,7 +204,7 @@ directory is 0700) and run, as root:
 
 ```bash
 sudo helm upgrade drive oci://ghcr.io/scriptor-group/chart/drive \
-  --version 0.6.0 -n suite366 -f /opt/suite366/values.yaml
+  --version 0.7.0 -n suite366 -f /opt/suite366/values.yaml
 ```
 
 **Note on `nvidia-smi` on GB10**: with unified memory, the `memory.used/free`
