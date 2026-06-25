@@ -31,6 +31,9 @@
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
 #   VLLM_EMBEDDING_DIMENSIONS  embedding vector dimension served by the local
 #                              model (default 4096 = Qwen3-VL-Embedding-8B)
+#   LICENSE_PUBLIC_KEY         Ed25519 SPKI PEM the app uses to VERIFY signed
+#                              license tokens (default: shipped public key).
+#                              Verification-only — cannot sign/forge licenses.
 #   ASSUME_YES=1               don't prompt, accept defaults
 # =============================================================================
 set -euo pipefail
@@ -71,6 +74,15 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 # Embedding dimension served by the local embed model — exposed to the app
 # via VLLM_EMBEDDING_DIMENSIONS so pgvector indexes the right shape.
 VLLM_EMBEDDING_DIMENSIONS="${VLLM_EMBEDDING_DIMENSIONS:-4096}"
+
+# --- Licensing ---------------------------------------------------------------
+# Ed25519 (EdDSA) PUBLIC key shipped to the app to VERIFY signed license
+# tokens. Public/verification-only -> safe to ship with the appliance; it
+# cannot sign or forge licenses (the private key stays with Devana). Stored
+# single-line with literal `\n`; YAML turns them into real PEM newlines when
+# the chart renders the value. Override per-deployment via the env var.
+_DEFAULT_LICENSE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk84/ONPJm9WFpnlQAf7IpRTfdcwwH4Ua3f7NAZtf6/4=\n-----END PUBLIC KEY-----\n'
+LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 
 # --- vLLM tuning for the GB10 UNIFIED memory (one shared pool ~121 GiB) -------
 # Both vLLM instances share this pool (along with the OS, runtime, and KV
@@ -479,6 +491,12 @@ deploy_suite() {
     --overwrite >/dev/null
 
   local vals="$DATA_DIR/values.yaml"
+  # The PEM public key carries `\`, which is special in a sed REPLACEMENT
+  # (and `&`/`|` too) — escape it so the literal `\n` lands verbatim in the
+  # YAML (where the double-quoted scalar then turns it into real newlines).
+  # The other tokens are alphanumeric / paths and need no escaping.
+  local lpk_esc
+  lpk_esc="$(printf '%s' "$LICENSE_PUBLIC_KEY" | sed -e 's/[&|\\]/\\&/g')"
   # values.yaml carries `secrets.VLLM_API_KEY` in clear and feeds it
   # to Helm — write it under a restrictive umask so the rendered file lands
   # at 0600 (root-only), and follow with an explicit chmod as belt-and-braces
@@ -492,6 +510,7 @@ deploy_suite() {
             -e "s|@EMBED_MODEL@|$EMBED_MODEL|g" \
             -e "s|@VLLM_API_KEY@|$VLLM_API_KEY|g" \
             -e "s|@VLLM_EMBEDDING_DIMENSIONS@|$VLLM_EMBEDDING_DIMENSIONS|g" \
+            -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
         > "$vals" )
   chmod 0600 "$vals"

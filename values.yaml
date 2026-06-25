@@ -63,6 +63,16 @@ config:
   VLLM_MODEL_VISION: "@LLM_MODEL@"
   VLLM_MODEL_EMBEDDING: "@EMBED_MODEL@"
   VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
+  # --- Licensing -----------------------------------------------------------
+  # Ed25519 (EdDSA) PUBLIC key the app uses to VERIFY signed license tokens.
+  # Verification-only: it cannot forge or sign licenses, so it is safe to ship
+  # with every appliance. The matching PRIVATE key never leaves the issuer
+  # (Devana) — see suite-366 serveur/LICENSE-GENERATION.md. install.sh
+  # substitutes @LICENSE_PUBLIC_KEY@ (default baked in, override via the
+  # LICENSE_PUBLIC_KEY env var). The \n escapes become real PEM newlines once
+  # YAML parses this double-quoted scalar. To actually unlock multi-org /
+  # paid limits, also set a signed LICENSE_KEY (issued against your org id).
+  LICENSE_PUBLIC_KEY: "@LICENSE_PUBLIC_KEY@"
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com
   # SMTP_PORT: "587"
