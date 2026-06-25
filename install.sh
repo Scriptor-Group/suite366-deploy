@@ -497,33 +497,33 @@ deploy_suite() {
       --version "$CHART_VERSION" --namespace "$NAMESPACE" -f "$vals" --wait --timeout 15m
 }
 
-# Workaround pour les fetches server-to-server entre drive-app et OnlyOffice :
-# le drive-app utilise aujourd'hui ONLYOFFICE_URL (https://office.$DOMAIN, en
-# mDNS) pour les callbacks de forcesave, mais les pods k3s n'ont pas de
-# résolveur mDNS — getaddrinfo() renvoie ENOTFOUND et la sauvegarde du doc
-# plante avec "Failed to save document".
+# Workaround for server-to-server fetches between drive-app and OnlyOffice:
+# drive-app currently uses ONLYOFFICE_URL (https://office.$DOMAIN, mDNS) for
+# its forcesave callbacks, but k3s pods have no mDNS resolver — getaddrinfo()
+# returns ENOTFOUND and saving the document fails with
+# "Failed to save document".
 #
-# On injecte donc les 5 noms *.$DOMAIN dans le ConfigMap NodeHosts de CoreDNS
-# pour qu'ils résolvent vers le ClusterIP de Traefik. Le trafic reste
-# in-cluster, traefik termine le TLS et route vers le bon service.
+# So we inject the 5 *.$DOMAIN names into CoreDNS's NodeHosts ConfigMap so they
+# resolve to Traefik's ClusterIP. Traffic stays in-cluster, Traefik terminates
+# TLS and routes to the right service.
 #
-# ⚠️ TEMPORAIRE : à supprimer dès que suite-366 utilise ONLYOFFICE_INTERNAL_URL
-# (déjà fourni par le chart) pour ses fetches server-side au lieu de
-# ONLYOFFICE_URL. Cf. /etc/cm/coredns dans le cluster pour l'état courant.
+# ⚠️ TEMPORARY: remove once suite-366 uses ONLYOFFICE_INTERNAL_URL (already
+# provided by the chart) for its server-side fetches instead of ONLYOFFICE_URL.
+# See /etc/cm/coredns in the cluster for the current state.
 patch_coredns_for_local_domain() {
-  log "CoreDNS : *.$DOMAIN -> Traefik ClusterIP (in-cluster resolution)"
+  log "CoreDNS: *.$DOMAIN -> Traefik ClusterIP (in-cluster resolution)"
   local traefik_ip
   traefik_ip="$(kc -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-  [[ -n "$traefik_ip" ]] || { warn "Traefik ClusterIP introuvable — skip CoreDNS patch."; return 0; }
-  info "Traefik ClusterIP : $traefik_ip"
+  [[ -n "$traefik_ip" ]] || { warn "Traefik ClusterIP not found — skipping CoreDNS patch."; return 0; }
+  info "Traefik ClusterIP: $traefik_ip"
   local nh corefile
   nh="$(kc -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}')"
   corefile="$(kc -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')"
   if grep -q "${traefik_ip}.*drive\.${DOMAIN}" <<<"$nh"; then
-    info "Entrées *.$DOMAIN déjà présentes — skip."
+    info "*.$DOMAIN entries already present — skipping."
     return 0
   fi
-  # Append les 5 noms à NodeHosts puis re-créé le CM (kubectl create … --dry-run | apply)
+  # Append the 5 names to NodeHosts, then re-create the CM (kubectl create … --dry-run | apply)
   local new_nh
   new_nh="$(printf '%s\n%s drive.%s\n%s office.%s\n%s livekit.%s\n%s turn.%s\n%s %s\n' \
     "$nh" \

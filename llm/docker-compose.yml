@@ -7,7 +7,7 @@
 # role-specific VLLM_MODEL_*). The Suite 366 chart is wired automatically via
 # values-dgx-spark.yaml.
 #
-# ⚠️ UNIFIED memory: the GB10 shares a single pool (~128 GB) between CPU, GPU,
+# ⚠️ UNIFIED memory: the GB10 shares a single pool (~121 GiB) between CPU, GPU,
 # OS, container runtime, model weights, and KV cache. BOTH vLLM instances pull
 # from this same pool -> we explicitly bound each one via
 # --gpu-memory-utilization (sum < 1.0, headroom kept for OS/runtime/KV).
@@ -47,7 +47,7 @@ services:
       # crashes at boot with "chat template not found").
       - ./tool_chat_template_gemma4.jinja:/app/tool_chat_template_gemma4.jinja:ro
     # Bind on the LAN IP: reachable by k3s pods via the node's IP. Kept
-    # exposed for direct debugging; the chart talks to the LiteLLM proxy.
+    # exposed for direct debugging; the chart talks to the nginx proxy.
     ports:
       - "${HOST_IP}:${LLM_PORT}:8000"
     command:

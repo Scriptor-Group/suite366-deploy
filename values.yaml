@@ -34,8 +34,8 @@ migrations:
 
 # generateSecrets: true (default) -> AUTH_SECRET, CRON_SECRET, POSTGRES_PASSWORD,
 # DATABASE_URL, MinIO, ONLYOFFICE_JWT_SECRET, LIVEKIT_* are generated and
-# persisted. We add VLLM_API_KEY (shared between vLLM, LiteLLM, and the app)
-# so chooseDefaultModel() can authenticate against the local proxy.
+# persisted. We add VLLM_API_KEY (shared between vLLM and the app)
+# so chooseDefaultModel() can authenticate against the local nginx proxy.
 secrets:
   VLLM_API_KEY: "@VLLM_API_KEY@"
 
