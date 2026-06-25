@@ -1,0 +1,134 @@
+# ============================================================================
+# Suite 366 — full stack in-cluster on a single-node k3s.
+# Rendered by install.sh, which substitutes the @DOMAIN@ / @HOST_IP@ tokens
+# before `helm upgrade --install`.
+#
+# Defaults target the LAN-appliance mode:
+#   • local domain *.suite366.local (resolved via mDNS/Avahi on the host);
+#   • TLS via a self-signed local CA (ClusterIssuer "suite366-local-ca");
+#   • public image pulled from ghcr.io (no registry credentials needed);
+#   • AI served by vLLM OUTSIDE the cluster (host Docker) -> wired MANUALLY
+#     post-install (see docs/gpu-inference.md). We therefore do NOT set
+#     LITELLM_BASE_URL here.
+#
+# For a real public domain, override config.*_URL + the ingress hosts and swap
+# the cert-manager issuer for Let's Encrypt (see docs/configuration.md).
+# ============================================================================
+appName: drive-app
+
+image:
+  repository: ghcr.io/scriptor-group/suite-366
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicas: 1
+podAntiAffinity:
+  enabled: false
+customCA:
+  enabled: false
+
+# DB schema applied automatically on first deploy.
+migrations:
+  enabled: true
+
+# generateSecrets: true (default) -> AUTH_SECRET, CRON_SECRET, POSTGRES_PASSWORD,
+# DATABASE_URL, MinIO, ONLYOFFICE_JWT_SECRET, LIVEKIT_* are generated and
+# persisted. No external key is set here: the LLMs are local (vLLM) and wired by
+# hand from the app admin (org "CUSTOM" providers -> http://@HOST_IP@:8001|8002/v1).
+secrets: {}
+
+config:
+  NODE_ENV: "production"
+  PORT: "3000"
+  HOSTNAME: "0.0.0.0"
+  WS_PORT: "3001"
+  AUTH_URL: https://drive.@DOMAIN@
+  APP_URL: https://drive.@DOMAIN@
+  WS_URL: wss://drive.@DOMAIN@
+  MINIO_BUCKET: suite-366
+  ONLYOFFICE_URL: https://office.@DOMAIN@
+  LIVEKIT_PUBLIC_URL: wss://livekit.@DOMAIN@
+  # --- Local AI (vLLM host) — NOT wired automatically -----------------------
+  # See docs/gpu-inference.md. Target the host IP (@HOST_IP@): k3s pods do NOT
+  # resolve the .local mDNS name (host-side resolution only).
+  #  (A) recommended: create 2 "CUSTOM" providers in the Suite 366 admin:
+  #        chat/vision  -> http://@HOST_IP@:8001/v1   (model = name served by vLLM)
+  #        embeddings   -> http://@HOST_IP@:8002/v1   (model = name served by vLLM)
+  #  (B) system env: uncomment and `helm upgrade` (a SINGLE endpoint, so mostly
+  #      useful for chat; embeddings still need wiring via (A)).
+  # LITELLM_BASE_URL: http://@HOST_IP@:8001/v1
+  # SMTP (optional) — fill in to enable outbound e-mail:
+  # SMTP_HOST: smtp.example.com
+  # SMTP_PORT: "587"
+  # SMTP_FROM: "Suite 366 <noreply@@DOMAIN@>"
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: suite366-local-ca
+  hosts:
+    - host: drive.@DOMAIN@
+      paths:
+        - path: /socket.io/
+          pathType: Prefix
+          port: 3001
+        - path: /
+          pathType: Prefix
+          port: 80
+  tls:
+    - secretName: drive-tls
+      hosts: [drive.@DOMAIN@]
+
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: local-path
+
+postgres:
+  enabled: true
+  database: suite366
+  username: suite366
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: local-path
+
+minio:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: local-path
+
+onlyoffice:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: local-path
+  ingress:
+    enabled: true
+    className: traefik
+    host: office.@DOMAIN@
+    clusterIssuer: suite366-local-ca
+
+livekit:
+  enabled: true
+  hostNetwork: true                        # media UDP on single-node k3s
+  ingress:
+    enabled: true
+    className: traefik
+    host: livekit.@DOMAIN@
+    clusterIssuer: suite366-local-ca
+  turn:
+    enabled: true
+    domain: turn.@DOMAIN@
+    tlsPort: 5349
+    tlsSecretName: drive-turn-tls
+    certManager:
+      enabled: true
+      issuerName: suite366-local-ca
+      issuerKind: ClusterIssuer

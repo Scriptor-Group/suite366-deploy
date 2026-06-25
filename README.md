@@ -2,10 +2,11 @@
 
 # Suite 366 (Self-Hosting)
 
-**IA-native document management, on your own infrastructure.**
+**AI-native document management, on your own infrastructure.**
 
-Run the official Suite 366 container on any compatible machine with Docker. A laptop, a
-server, or a sovereign AI appliance (NVIDIA DGX Spark, AMD Ryzen AI Max).
+Deploy the full Suite 366 — app, database, storage, collaborative editing and
+real-time — on a **single-node Kubernetes (k3s)** cluster. One command, on a
+server, a workstation, or a sovereign AI appliance (NVIDIA DGX Spark).
 
 </div>
 
@@ -13,42 +14,47 @@ server, or a sovereign AI appliance (NVIDIA DGX Spark, AMD Ryzen AI Max).
 
 ## Quick start
 
-One command. Requires [Docker](https://docs.docker.com/engine/install/) with the
-Compose v2 plugin.
+One command. It installs **k3s**, then the full stack via the public Helm chart.
+Run it on a fresh Linux host (Ubuntu 22.04+ recommended) with outbound internet.
 
 ```bash
-curl -fsSL https://get.devana.ai/366 | sh
+curl -fsSL https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/install.sh | sudo bash
 ```
 
-This downloads `docker-compose.yml`, generates fresh secrets into a local
-`.env`, pulls the image, and starts the stack. When it finishes, open
-**http://localhost:3000**.
+When it finishes you get HTTPS URLs on a local domain (resolved over mDNS):
+**https://drive.suite366.local**.
 
-> Prefer to see what runs before running it? Use the [manual setup](#manual-setup)
-> below — same result, every step explicit.
+> Prefer to read before you run? Use the [manual setup](#manual-setup) below —
+> same result, every step explicit.
 
 ---
 
 ## What gets deployed
 
-| Service    | Image                              | Role                                   |
-| ---------- | ---------------------------------- | -------------------------------------- |
-| `app`      | `ghcr.io/scriptor-group/suite-366` | Suite 366 (Next.js, Server Actions)    |
-| `postgres` | `pgvector/pgvector:pg16`           | Database + vector search (pgvector)    |
-| `redis`    | `redis:7`                          | Cache, queues, pub/sub                 |
-| `minio`    | `minio/minio`                      | S3-compatible object storage for files |
+| Layer                     | Detail                                                                              |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| **k3s** (single node)     | Traefik (ingress) + local-path (storage) + CoreDNS                                  |
+| **Suite 366** (`drive`)   | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, in-cluster |
+| **TLS**                   | self-signed local CA (cert-manager), automatic `*.suite366.local` certificates      |
+| **DNS**                   | mDNS/Avahi: `*.suite366.local` resolved on the LAN with no client config            |
+| **AI** (optional, GPU)    | vLLM ×2 on the host GPU — generative + embeddings — auto-enabled when a GPU is found |
 
-Everything runs locally; your documents never leave the host. See
-[`docs/architecture.md`](docs/architecture.md) for the data flow.
+The app image is the public `ghcr.io/scriptor-group/suite-366`; the Helm chart is
+pulled from `oci://ghcr.io/scriptor-group/charts/drive`. Everything runs on your
+host — your documents never leave it. See [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
 ## Requirements
 
-- **Docker Engine 24+** with the **Compose v2** plugin (`docker compose version`)
-- **4 GB RAM** minimum (8 GB+ recommended — OCR and embeddings are memory-hungry)
-- **10 GB+ disk** for the image, database, and stored files
-- A **license key** from Devana to unlock the product — see [Licensing](#licensing)
+- A **Linux host** (Ubuntu 22.04+ recommended), `amd64` or `arm64`, run as **root**.
+- **Outbound internet** to pull k3s, Helm, cert-manager and the container images.
+- **~80 GB disk** (≈200 GB if you enable on-host GPU inference — models are large).
+- **Docker** on the host **only** if you enable the GPU/vLLM path.
+- A **license key** from Devana to unlock the product — see [Licensing](#licensing).
+
+No external database, registry credentials or object store needed — the chart
+brings its own, in-cluster.
 
 ---
 
@@ -59,16 +65,19 @@ Everything runs locally; your documents never leave the host. See
 git clone https://github.com/Scriptor-Group/suite366-deploy.git
 cd suite366-deploy
 
-# 2. Create your configuration
-cp .env.example .env
-#    → edit .env: set strong secrets, your domain, LICENSE_PUBLIC_KEY, OPENAI_API_KEY
+# 2. Review/adjust the Helm values and the installer variables
+#    → values.yaml (domain, ingress, storage sizes)
+#    → install.sh header (DOMAIN, WITH_GPU, chart ref, …)
 
-# 3. Launch
-docker compose pull
-docker compose up -d
+# 3. Run the installer from the cloned directory (reads the local files)
+sudo ./install.sh
+```
 
-# 4. Follow the boot (migrations run automatically on first start)
-docker compose logs -f app
+The installer is **idempotent** and can be re-run. It is also fully
+non-interactive via environment variables — e.g.:
+
+```bash
+sudo DOMAIN=suite366.local WITH_GPU=auto ASSUME_YES=1 ./install.sh
 ```
 
 Full variable reference: [`docs/configuration.md`](docs/configuration.md).
@@ -78,10 +87,11 @@ Full variable reference: [`docs/configuration.md`](docs/configuration.md).
 ## Common operations
 
 ```bash
-docker compose logs -f app        # tail application logs
-docker compose ps                 # service status
-docker compose down               # stop (data is kept in volumes)
-docker compose down -v            # stop AND delete all data (irreversible)
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+k3s kubectl -n suite366 get pods           # service status
+k3s kubectl -n suite366 logs -f deploy/drive-app   # tail application logs
+helm -n suite366 list                      # release status
 ```
 
 Upgrading to a new release: [`docs/upgrade.md`](docs/upgrade.md).
@@ -90,29 +100,34 @@ Upgrading to a new release: [`docs/upgrade.md`](docs/upgrade.md).
 
 ## On-host GPU inference (optional)
 
-On an NVIDIA GPU appliance (DGX Spark / GB10), run the LLM **on the machine
-itself** — no external API. The `docker-compose.gpu.yml` overlay adds vLLM
-serving **Gemma 4 26B-A4B (NVFP4)** for chat/vision and **Qwen3-VL 8B** for
-embeddings, mirroring the Devana Spark configuration.
+When an NVIDIA GPU is present, the installer also runs the LLM **on the machine
+itself** — no external API. It deploys **vLLM ×2** as host Docker services
+(generative on `:8001`, embeddings on `:8002`) and you wire them into Suite 366
+as two `CUSTOM` providers.
+
+It is auto-enabled when a GPU is detected. Control it with `WITH_GPU`:
 
 ```bash
-echo "HF_TOKEN=hf_xxx" >> .env
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+sudo WITH_GPU=1 ./install.sh    # force the GPU path (fail if no GPU)
+sudo WITH_GPU=0 ./install.sh    # never deploy vLLM (use an external provider)
 ```
 
-Requires an NVFP4-capable GPU (Blackwell / GB10) and the NVIDIA Container
-Toolkit. Full guide: [`docs/gpu-inference.md`](docs/gpu-inference.md).
+The default `VLLM_IMAGE` targets the **DGX Spark** (arm64 / Blackwell GB10). On a
+discrete x86 GPU, override it (e.g. `VLLM_IMAGE=vllm/vllm-openai:latest`). Full
+guide: [`docs/gpu-inference.md`](docs/gpu-inference.md).
 
 ---
 
-## Single instance vs. multiple replicas
+## Domain & TLS
 
-The default deployment is **single-instance** and works with zero extra config:
-the container generates an ephemeral Server Actions encryption key at startup.
+The default is a **LAN-appliance** setup: the local domain `*.suite366.local` is
+published over mDNS and certificates are issued by a self-signed local CA. Import
+`/opt/suite366/suite366-local-ca.crt` on each client to remove the browser
+warning.
 
-To run **multiple replicas** behind a load balancer, all replicas must share the
-same key — set `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` to one value across them.
-Details in [`docs/configuration.md`](docs/configuration.md#multi-replica).
+To run on a **real public domain** instead, set `DOMAIN` to your domain, point
+DNS at the host, and swap the cert-manager issuer for Let's Encrypt — see
+[`docs/configuration.md`](docs/configuration.md#real-domain).
 
 ---
 
@@ -130,13 +145,13 @@ In short:
 
 The product is gated by a **license key**: install runs out of the box, then you
 activate features with a key from Devana. Set `LICENSE_PUBLIC_KEY` (provided by
-Devana) and enter your key in the app. To obtain one:
-**https://366.devana.ai** · **[contact](https://devana.ai/contact?interest=366)**.
+Devana) in the Helm values and enter your key in the app. To obtain one:
+**https://www.suite366.ai** · **[contact](https://devana.ai/contact?interest=366)**.
 
 ---
 
 ## Links
 
-- Product & pricing — https://366.devana.ai
+- Product & pricing — https://www.suite366.ai
 - Deployment options (Cloud / Box / self-host) — https://devana.ai/deploy
 - Support — https://devana.ai/contact?interest=366

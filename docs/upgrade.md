@@ -1,40 +1,58 @@
 # Upgrading
 
 Suite 366 images apply database migrations automatically on startup, so an
-upgrade is usually two commands.
+upgrade is a single `helm upgrade`.
 
 ```bash
-cd suite366            # your install directory
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
 # Optional but recommended: back up first (see docs/configuration.md)
-docker compose exec postgres pg_dump -U suite366 suite366 > backup-$(date +%F).sql
+k3s kubectl -n suite366 exec deploy/drive-postgres -- \
+  pg_dump -U suite366 suite366 > backup-$(date +%F).sql
 
-docker compose pull    # fetch the new image
-docker compose up -d   # recreate the app; migrations run on boot
-docker compose logs -f app
+helm upgrade drive oci://ghcr.io/scriptor-group/charts/drive \
+  --version 0.5.0 -n suite366 -f /opt/suite366/values.yaml
+
+k3s kubectl -n suite366 rollout status deploy/drive-app
 ```
 
 ## Pinning a version
 
-`docker-compose.yml` defaults to the `:latest` tag. For reproducible
-deployments, pin an explicit version via `.env`:
+Pin both the **chart** and the **app image** for reproducible deployments:
 
-```env
-SUITE366_IMAGE=ghcr.io/scriptor-group/suite-366:v1.4.0
-```
+- Chart: pass `--version <chart-version>` (and/or set `CHART_VERSION` for the
+  installer).
+- App image: set `image.tag` in `values.yaml`, e.g.
 
-Then `docker compose up -d`. Upgrading later is just bumping that tag.
+  ```yaml
+  image:
+    repository: ghcr.io/scriptor-group/suite-366
+    tag: v1.5.0
+  ```
+
+Upgrading later is bumping `--version` and/or `image.tag`, then `helm upgrade`.
 
 ## Rolling back
 
-Set `SUITE366_IMAGE` back to the previous tag and `docker compose up -d`.
+```bash
+helm -n suite366 history drive          # list revisions
+helm -n suite366 rollback drive <REV>   # roll back the release
+```
 
 > ⚠️ Migrations are forward-only. If a release applied schema changes, rolling
-> the image back may not be enough on its own — restore your pre-upgrade
+> the release back may not be enough on its own — restore your pre-upgrade
 > database backup if you need to fully revert.
 
 ## Before upgrading multiple replicas
 
-Make sure `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` is set to a fixed shared value
-(see [configuration](configuration.md#multi-replica)). Otherwise each recreated
-replica gets a new key and active sessions break.
+If you run more than one replica, make sure
+`config.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` is set to a fixed shared value in
+`values.yaml` (see [configuration](configuration.md#single-instance-vs-multiple-replicas)).
+Otherwise each recreated replica gets a new key and active sessions break.
+
+## Upgrading the vLLM stack (GPU path)
+
+```bash
+# Edit the image/model in /opt/suite366/llm/.env, then:
+cd /opt/suite366/llm && docker compose pull && docker compose up -d
+```
