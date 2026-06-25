@@ -490,10 +490,58 @@ deploy_suite() {
         > "$vals" )
   chmod 0600 "$vals"
 
+  patch_coredns_for_local_domain
   info "helm install $RELEASE (pulling chart + images, several minutes)…"
   KUBECONFIG="$KUBECONFIG_PATH" run_progress "Suite 366 deployment" \
     helm upgrade --install "$RELEASE" "$CHART_REF" \
       --version "$CHART_VERSION" --namespace "$NAMESPACE" -f "$vals" --wait --timeout 15m
+}
+
+# Workaround pour les fetches server-to-server entre drive-app et OnlyOffice :
+# le drive-app utilise aujourd'hui ONLYOFFICE_URL (https://office.$DOMAIN, en
+# mDNS) pour les callbacks de forcesave, mais les pods k3s n'ont pas de
+# résolveur mDNS — getaddrinfo() renvoie ENOTFOUND et la sauvegarde du doc
+# plante avec "Failed to save document".
+#
+# On injecte donc les 5 noms *.$DOMAIN dans le ConfigMap NodeHosts de CoreDNS
+# pour qu'ils résolvent vers le ClusterIP de Traefik. Le trafic reste
+# in-cluster, traefik termine le TLS et route vers le bon service.
+#
+# ⚠️ TEMPORAIRE : à supprimer dès que suite-366 utilise ONLYOFFICE_INTERNAL_URL
+# (déjà fourni par le chart) pour ses fetches server-side au lieu de
+# ONLYOFFICE_URL. Cf. /etc/cm/coredns dans le cluster pour l'état courant.
+patch_coredns_for_local_domain() {
+  log "CoreDNS : *.$DOMAIN -> Traefik ClusterIP (in-cluster resolution)"
+  local traefik_ip
+  traefik_ip="$(kc -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+  [[ -n "$traefik_ip" ]] || { warn "Traefik ClusterIP introuvable — skip CoreDNS patch."; return 0; }
+  info "Traefik ClusterIP : $traefik_ip"
+  local nh corefile
+  nh="$(kc -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}')"
+  corefile="$(kc -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')"
+  if grep -q "${traefik_ip}.*drive\.${DOMAIN}" <<<"$nh"; then
+    info "Entrées *.$DOMAIN déjà présentes — skip."
+    return 0
+  fi
+  # Append les 5 noms à NodeHosts puis re-créé le CM (kubectl create … --dry-run | apply)
+  local new_nh
+  new_nh="$(printf '%s\n%s drive.%s\n%s office.%s\n%s livekit.%s\n%s turn.%s\n%s %s\n' \
+    "$nh" \
+    "$traefik_ip" "$DOMAIN" \
+    "$traefik_ip" "$DOMAIN" \
+    "$traefik_ip" "$DOMAIN" \
+    "$traefik_ip" "$DOMAIN" \
+    "$traefik_ip" "$DOMAIN")"
+  printf '%s' "$new_nh" > /tmp/_corefile_nodehosts
+  kc -n kube-system create cm coredns \
+    --from-file=NodeHosts=/tmp/_corefile_nodehosts \
+    --from-literal=Corefile="$corefile" \
+    --dry-run=client -o yaml | kc apply -f - >/dev/null
+  rm -f /tmp/_corefile_nodehosts
+  kc -n kube-system rollout restart deploy/coredns >/dev/null
+  kc -n kube-system rollout status deploy/coredns --timeout=60s >/dev/null || \
+    warn "CoreDNS rollout incomplete — DNS may take ~30s to settle."
+  info "CoreDNS NodeHosts updated."
 }
 
 # --- 5. mDNS (Avahi) ---------------------------------------------------------
