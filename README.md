@@ -182,6 +182,8 @@ to register a per-organization provider in the admin UI:
 
 ```
 install.sh                            entry point (curl|bash)
+update.sh                             update checker/applier (check | apply); run by the daily timer
+channel.json                          fleet release manifest (chart_version / vllm_image) polled by update.sh
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
 llm/tool_chat_template_gemma4.jinja   chat template required by --tool-call-parser=gemma4
@@ -199,8 +201,30 @@ systemctl status suite366-vllm                 # vLLM stack
 systemctl status suite366-avahi-aliases        # mDNS aliases
 ```
 
-Update the app config: edit `/opt/suite366/values.yaml` (via `sudo`, the
-directory is 0700) and run, as root:
+### Updates
+
+The installer arms a **daily systemd timer** (`suite366-update.timer`) that
+polls a **channel manifest** — [`channel.json`](channel.json) in this repo — and
+**notifies** when a newer chart or vLLM image is published. It never applies an
+upgrade on its own.
+
+```bash
+sudo /opt/suite366/update.sh check    # what the timer runs: compare + notify
+sudo /opt/suite366/update.sh apply    # actually upgrade (helm + vLLM image)
+systemctl list-timers suite366-update.timer
+journalctl -u suite366-update.service # past check results
+cat /opt/suite366/update-available    # marker file, present only when one is pending
+```
+
+**Rolling the fleet forward** is a single commit on your side: bump
+`chart_version` (and/or `vllm_image`) in `channel.json`, push to `main`, and
+every appliance picks it up within a day. Pin a box to a different source with
+`MANIFEST_URL=…`, or get a push notification by setting `UPDATE_WEBHOOK=…`
+(env vars honored at install time, persisted to `/opt/suite366/update.env`).
+
+To update the **app config** (not the version): edit
+`/opt/suite366/values.yaml` (via `sudo`, the directory is 0700) and run
+`sudo /opt/suite366/update.sh apply`, or call `helm upgrade` directly:
 
 ```bash
 sudo helm upgrade drive oci://ghcr.io/scriptor-group/chart/drive \

@@ -42,6 +42,12 @@ DOMAIN="${DOMAIN:-suite366.local}"
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 CHART_VERSION="${CHART_VERSION:-0.7.0}"
+# Channel manifest polled daily by the update timer (see setup_update_timer).
+# Publishing a new chart_version/vllm_image here rolls the fleet forward;
+# appliances NOTIFY only (no auto-apply). Override to pin a box to a private
+# channel. UPDATE_WEBHOOK (optional) gets a JSON POST when an update is found.
+MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/channel.json}"
+UPDATE_WEBHOOK="${UPDATE_WEBHOOK:-}"
 NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
@@ -570,6 +576,64 @@ EOF
   systemctl enable --now suite366-avahi-aliases.service
 }
 
+# --- 5b. Update checker (daily systemd timer, notify-only) ------------------
+# Installs update.sh + a daily timer that polls the channel manifest and
+# NOTIFIES when a newer chart/vLLM image is published (it never auto-applies —
+# `update.sh apply` is the manual trigger). The manifest lives in the repo, so
+# rolling the fleet forward is a single commit on your side.
+setup_update_timer() {
+  log "Update checker (daily timer, notify-only)"
+  fetch "update.sh" > "$DATA_DIR/update.sh"
+  chmod 0700 "$DATA_DIR/update.sh"
+
+  # Config consumed by update.sh both on manual runs (sourced) and via the
+  # systemd unit (EnvironmentFile). 0600 — it just carries non-secret config,
+  # but lives in the root-only $DATA_DIR anyway.
+  ( umask 077
+    cat > "$DATA_DIR/update.env" <<EOF
+MANIFEST_URL=$MANIFEST_URL
+CHART_REF=$CHART_REF
+NAMESPACE=$NAMESPACE
+RELEASE=$RELEASE
+DATA_DIR=$DATA_DIR
+KUBECONFIG_PATH=$KUBECONFIG_PATH
+UPDATE_WEBHOOK=$UPDATE_WEBHOOK
+EOF
+  )
+
+  # Units generated inline (not fetched) so the $DATA_DIR path is baked in,
+  # matching how suite366-vllm.service is created.
+  cat > /etc/systemd/system/suite366-update.service <<EOF
+[Unit]
+Description=Suite 366 — update check (notify-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=$DATA_DIR/update.env
+ExecStart=$DATA_DIR/update.sh check
+EOF
+
+  cat > /etc/systemd/system/suite366-update.timer <<EOF
+[Unit]
+Description=Suite 366 — daily update check
+
+[Timer]
+# Once a day, with up to 1h of jitter so a fleet doesn't hit the manifest in
+# lockstep. Persistent: runs on next boot if a scheduled tick was missed.
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now suite366-update.timer
+  info "Timer armed. Check now: sudo $DATA_DIR/update.sh check ; apply: … apply"
+}
+
 # --- 6. Summary --------------------------------------------------------------
 summary() {
   local ai
@@ -611,6 +675,10 @@ $ai
       (macOS, Windows 10+, Linux+nss-mdns) resolve it without config.
 
  systemd services: suite366-vllm, suite366-avahi-aliases, k3s
+ Updates         : checked daily (suite366-update.timer, notify-only).
+                   Check now : sudo $DATA_DIR/update.sh check
+                   Apply     : sudo $DATA_DIR/update.sh apply
+                   A pending update drops a marker at $DATA_DIR/update-available.
  Diagnostics     : sudo k3s kubectl -n $NAMESPACE get pods
  Security        : $DATA_DIR is 0700 (root-only); the kubeconfig at
                    $KUBECONFIG_PATH is 0600 — use sudo to inspect.
@@ -627,6 +695,7 @@ main() {
   install_cert_manager
   deploy_suite
   setup_mdns
+  setup_update_timer
   summary
 }
 main "$@"
