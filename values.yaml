@@ -28,6 +28,18 @@ podAntiAffinity:
 customCA:
   enabled: false
 
+# The chart default (1 GiB limit) is sized for a small Docker-compose host.
+# On DGX Spark (121 GiB unified RAM) drive-app actually needs more — its
+# background workers (calendar / mail / sandbox / agent NPC / OCR queue)
+# pile up and V8 OOMs around 500 MB heap. 4 GiB is comfortable; combined
+# with NODE_OPTIONS above it leaves headroom for native heap + Prisma.
+resources:
+  requests:
+    cpu: "200m"
+    memory: "1Gi"
+  limits:
+    memory: "4Gi"
+
 # DB schema applied automatically on first deployment.
 migrations:
   enabled: true
@@ -41,6 +53,9 @@ secrets:
 
 config:
   NODE_ENV: "production"
+  # Bump V8 heap above default (~500 MB on a 1 GiB cgroup). Without it, drive-app
+  # OOM-crashes within minutes once the agent + sandbox workers warm up.
+  NODE_OPTIONS: "--max-old-space-size=3072"
   PORT: "3000"
   HOSTNAME: "0.0.0.0"
   WS_PORT: "3001"
