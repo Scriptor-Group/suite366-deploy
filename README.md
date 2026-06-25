@@ -12,7 +12,7 @@ voice/video + on-device generative & embedding models, all behind HTTPS on a
 local mDNS domain.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/install.sh | sudo bash
+curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 ```
 
 > **What this is for.** The DGX Spark is a 121 GiB unified-memory ARM64 box
