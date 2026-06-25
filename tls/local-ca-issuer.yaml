@@ -1,0 +1,44 @@
+# Self-signed local CA to issue *.suite366.local certificates.
+#
+# Chain: selfsigned ClusterIssuer -> root CA Certificate (secret in
+# cert-manager) -> "suite366-local-ca" ClusterIssuer. The drive chart's
+# Ingresses carry the annotation `cert-manager.io/cluster-issuer:
+# suite366-local-ca`: cert-manager then AUTOMATICALLY issues one certificate
+# per host into the TLS secret referenced by each Ingress (no need to
+# pre-create a wildcard).
+#
+# The `suite366-local-ca` secret contains the ca.crt to distribute and install
+# on client machines so they trust the chain (otherwise: browser warning).
+# install.sh exports it to <DATA_DIR>/suite366-local-ca.crt.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: suite366-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: suite366-local-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: Suite 366 Local CA
+  secretName: suite366-local-ca
+  duration: 87600h   # 10 years
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: suite366-selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: suite366-local-ca
+spec:
+  ca:
+    secretName: suite366-local-ca
