@@ -1,6 +1,6 @@
 {
   "channel": "stable",
-  "chart_version": "0.7.0",
+  "chart_version": "0.7.1",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
   "notes": "Initial stable channel. Bump chart_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply)."
 }

@@ -41,7 +41,7 @@ DOMAIN="${DOMAIN:-suite366.local}"
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
-CHART_VERSION="${CHART_VERSION:-0.7.0}"
+CHART_VERSION="${CHART_VERSION:-0.7.1}"
 # Channel manifest polled daily by the update timer (see setup_update_timer).
 # Publishing a new chart_version/vllm_image here rolls the fleet forward;
 # appliances NOTIFY only (no auto-apply). Override to pin a box to a private
@@ -497,10 +497,23 @@ deploy_suite() {
   chmod 0600 "$vals"
 
   patch_coredns_for_local_domain
+  # CA locale auto-générée par cert-manager : la passer au chart pour qu'il
+  # la monte dans drive-app via `customCA` + propage `NODE_EXTRA_CA_CERTS`.
+  # Sans ça, drive-app rejette le cert OnlyOffice à
+  # `https://office.$DOMAIN/coauthoring/CommandService.ashx` avec
+  # `UNABLE_TO_VERIFY_LEAF_SIGNATURE` -> sauvegarde des docs cassée.
+  local ca_args=()
+  if [[ -f "$DATA_DIR/suite366-local-ca.crt" ]]; then
+    ca_args=(--set customCA.enabled=true \
+             --set-file "customCA.caCert=$DATA_DIR/suite366-local-ca.crt")
+  else
+    warn "Local CA not found at $DATA_DIR/suite366-local-ca.crt — drive-app may reject OnlyOffice's TLS cert."
+  fi
   info "helm install $RELEASE (pulling chart + images, several minutes)…"
   KUBECONFIG="$KUBECONFIG_PATH" run_progress "Suite 366 deployment" \
     helm upgrade --install "$RELEASE" "$CHART_REF" \
-      --version "$CHART_VERSION" --namespace "$NAMESPACE" -f "$vals" --wait --timeout 15m
+      --version "$CHART_VERSION" --namespace "$NAMESPACE" \
+      -f "$vals" "${ca_args[@]}" --wait --timeout 15m
 }
 
 # Workaround for server-to-server fetches between drive-app and OnlyOffice:
