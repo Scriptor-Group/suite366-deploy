@@ -1,0 +1,155 @@
+# ============================================================================
+# DGX Spark deployment — full Suite 366 in-cluster on single-node k3s.
+# Derived from charts/drive/values-client-autonome.yaml.
+#
+# DGX Spark specifics:
+#   • local domain *.suite366.local (resolved via mDNS/Avahi on the host);
+#   • TLS via self-signed local CA (ClusterIssuer "suite366-local-ca");
+#   • images pulled anonymously from ghcr.io/scriptor-group (chart defaults).
+#     The packages are public; no imagePullSecrets needed.
+#   • sandbox (code-exec) stack enabled — runs in the `@SANDBOX_NAMESPACE@`
+#     namespace pre-created (with PSS labels) by install.sh so helm doesn't
+#     have to manage the Namespace itself.
+#   • generative + embeddings served by vLLM OUTSIDE the cluster (Docker
+#     host), unified by an nginx proxy, wired AUTOMATICALLY into the chart
+#     via VLLM_* env vars (Suite 366 PR #325 `chooseDefaultModel`).
+#
+# install.sh substitutes @… tokens before `helm install`.
+# ============================================================================
+appName: drive-app
+
+# image.repository is left at the chart default (ghcr.io/scriptor-group/suite-366).
+# Override here only if you mirror the image to another registry. The GHCR
+# packages are public so no imagePullSecrets are needed (chart default = []).
+
+replicas: 1
+podAntiAffinity:
+  enabled: false
+customCA:
+  enabled: false
+
+# DB schema applied automatically on first deployment.
+migrations:
+  enabled: true
+
+# generateSecrets: true (default) -> AUTH_SECRET, CRON_SECRET, POSTGRES_PASSWORD,
+# DATABASE_URL, MinIO, ONLYOFFICE_JWT_SECRET, LIVEKIT_* are generated and
+# persisted. We add VLLM_API_KEY (shared between vLLM, LiteLLM, and the app)
+# so chooseDefaultModel() can authenticate against the local proxy.
+secrets:
+  VLLM_API_KEY: "@VLLM_API_KEY@"
+
+config:
+  NODE_ENV: "production"
+  PORT: "3000"
+  HOSTNAME: "0.0.0.0"
+  WS_PORT: "3001"
+  AUTH_URL: https://drive.@DOMAIN@
+  APP_URL: https://drive.@DOMAIN@
+  WS_URL: wss://drive.@DOMAIN@
+  MINIO_BUCKET: suite-366
+  ONLYOFFICE_URL: https://office.@DOMAIN@
+  LIVEKIT_PUBLIC_URL: wss://livekit.@DOMAIN@
+  # --- Local AI (vLLM host) — wired AUTOMATICALLY ---------------------------
+  # Suite 366 PR #325 (chooseDefaultModel): when VLLM_BASE_URL is set, the
+  # local vLLM is preferred over Anthropic/OpenAI for every role. The base
+  # URL points to the nginx proxy on the host, which routes by URL path
+  # (/v1/embeddings -> vllm-embed, everything else -> vllm-llm). We target
+  # @HOST_IP@ because k3s pods do NOT resolve `.local` mDNS (host-side
+  # resolution only).
+  VLLM_BASE_URL: "http://@HOST_IP@:@PROXY_PORT@/v1"
+  VLLM_MODEL_HIGH: "@LLM_MODEL@"
+  VLLM_MODEL_LIGHT: "@LLM_MODEL@"
+  VLLM_MODEL_VISION: "@LLM_MODEL@"
+  VLLM_MODEL_EMBEDDING: "@EMBED_MODEL@"
+  VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
+  # SMTP (optional) — fill in if you need outgoing email:
+  # SMTP_HOST: smtp.example.com
+  # SMTP_PORT: "587"
+  # SMTP_FROM: "Suite 366 <noreply@@DOMAIN@>"
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: suite366-local-ca
+  hosts:
+    - host: drive.@DOMAIN@
+      paths:
+        - path: /socket.io/
+          pathType: Prefix
+          port: 3001
+        - path: /
+          pathType: Prefix
+          port: 80
+  tls:
+    - secretName: drive-tls
+      hosts: [drive.@DOMAIN@]
+
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: local-path
+
+postgres:
+  enabled: true
+  database: suite366
+  username: suite366
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: local-path
+
+minio:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: local-path
+
+onlyoffice:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: local-path
+  ingress:
+    enabled: true
+    className: traefik
+    host: office.@DOMAIN@
+    clusterIssuer: suite366-local-ca
+
+livekit:
+  enabled: true
+  hostNetwork: true                        # UDP media on single-node k3s
+  ingress:
+    enabled: true
+    className: traefik
+    host: livekit.@DOMAIN@
+    clusterIssuer: suite366-local-ca
+  turn:
+    enabled: true
+    domain: turn.@DOMAIN@
+    tlsPort: 5349
+    tlsSecretName: drive-turn-tls
+    certManager:
+      enabled: true
+      issuerName: suite366-local-ca
+      issuerKind: ClusterIssuer
+
+# Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,
+# pre-created by install.sh so the GHCR pull secret lands BEFORE sandbox-api
+# / sandbox-runner pods schedule. The chart wires SANDBOX_API_URL into the
+# drive-app config automatically and shares SANDBOX_API_KEY (generated) with
+# secret-sandbox so the two sides match.
+sandbox:
+  enabled: true
+  namespace: @SANDBOX_NAMESPACE@
+  # install.sh creates the namespace + applies PSS labels, so the chart skips
+  # its own Namespace template (avoids ownership conflict with our pre-create).
+  createNamespace: false
+  # Default api/runner images come from the chart (ghcr.io/scriptor-group/
+  # suite-366-sandbox-{api,runner}:latest, arm64). Tune sessions/limits if the
+  # GB10 unified memory budget is tight — defaults aim at 20 pods × 512 MB.
