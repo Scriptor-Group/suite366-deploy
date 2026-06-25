@@ -1,5 +1,10 @@
 # Suite 366 — DGX Spark appliance
 
+[Suite 366](https://www.suite366.ai/) is a sovereign, AI-native work suite —
+documents, collaborative editing, chat, realtime voice/video, and built-in AI
+agents. This repo is the **DGX Spark appliance installer**: a fully self-hosted,
+on-device deployment where your data never leaves the box.
+
 One-liner installer that turns a **single NVIDIA DGX Spark** (Ubuntu 22.04 /
 DGX OS, **ARM64 GB10 Grace-Blackwell**) into a fully self-hosted Suite 366
 appliance: app + database + object storage + collaborative editor + realtime
@@ -16,14 +21,29 @@ curl -fsSL https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main
 > This installer is the appliance flavor: opinionated, idempotent, designed
 > to boot and stay up across reboots without manual care.
 
+## Contents
+
+- [What gets installed](#what-gets-installed)
+- [Prerequisites](#prerequisites)
+- [Parameters](#parameters-env-vars-or-interactive-prompts)
+- [Measured GB10 realities](#measured-gb10-realities-read-before-tuning)
+- [Wiring the AI](#wiring-the-ai-automatic)
+- [Repository layout](#repository-layout)
+- [Operations](#operations)
+- [Survival across reboots](#survival-across-reboots)
+- [Security posture](#security-posture)
+- [TLS / browser trust](#tls--browser-trust)
+- [Known limitations](#known-limitations)
+- [License](#license)
+
 ## What gets installed
 
 | Layer | Detail |
 |---|---|
 | **k3s** single-node | Traefik (ingress) + local-path (storage) + CoreDNS (k3s defaults) |
 | **vLLM ×2** (Docker host) | generative on `:8001`, embeddings on `:8002`, Blackwell GPU |
-| **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart per [PR #325](https://github.com/Scriptor-Group/suite-366/pull/325) |
-| **Suite 366** (`drive` chart 0.7.0) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
+| **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart |
+| **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **TLS** | self-signed local CA (cert-manager), `*.suite366.local` certificates automatic |
 | **DNS** | mDNS/Avahi: `*.suite366.local` resolved on the LAN without client-side config |
@@ -43,7 +63,7 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
     `gpus: all` survives reboots (see *Survival across reboots* below).
 - **Helm chart + container images**: all hosted anonymously on GHCR under
   the Scriptor-Group org. No login required.
-  - Chart: `oci://ghcr.io/scriptor-group/chart/drive` (v `0.7.0`)
+  - Chart: `oci://ghcr.io/scriptor-group/chart/drive` (v `0.7.1`)
   - Images: `ghcr.io/scriptor-group/suite-366`, `…-sandbox-api`,
     `…-sandbox-runner` (referenced by the chart, no override needed)
   - Override `CHART_REF=` if you mirror the chart somewhere else.
@@ -125,11 +145,10 @@ min on subsequent boots (compile cache at `~/.cache/vllm/torch_compile_cache`).
 Qwen3-VL-Embedding-8B weights download (15.5 GiB BF16) adds ~5-10 min on a
 fresh install.
 
-## Wiring the AI (automatic since Suite 366 PR #325)
+## Wiring the AI (automatic)
 
-Since [suite-366 PR #325](https://github.com/Scriptor-Group/suite-366/pull/325)
-(`chooseDefaultModel` + offline vLLM support), the local stack is **wired
-automatically** through the chart values:
+Suite 366 ships `chooseDefaultModel` + offline vLLM support, so the local stack
+is **wired automatically** through the chart values:
 
 ```yaml
 config:
@@ -150,7 +169,7 @@ is multimodal).
 
 ### Why an nginx proxy
 
-The PR #325 contract expects a **single** `VLLM_BASE_URL` with per-role
+The Suite 366 wiring contract expects a **single** `VLLM_BASE_URL` with per-role
 `VLLM_MODEL_*`, but we run two vLLM instances on different ports (one for
 chat + vision, one for pooling/embed). The `suite366-vllm-proxy` container
 (nginx:alpine, ~50 MB, ~10 lines of config) routes by URL path:
@@ -216,11 +235,18 @@ journalctl -u suite366-update.service # past check results
 cat /opt/suite366/update-available    # marker file, present only when one is pending
 ```
 
-**Rolling the fleet forward** is a single commit on your side: bump
-`chart_version` (and/or `vllm_image`) in `channel.json`, push to `main`, and
-every appliance picks it up within a day. Pin a box to a different source with
+By default each box polls the `channel.json` shipped in this repo, so it tracks
+the releases published here. Point a box at a manifest you control with
 `MANIFEST_URL=…`, or get a push notification by setting `UPDATE_WEBHOOK=…`
 (env vars honored at install time, persisted to `/opt/suite366/update.env`).
+
+**Running your own fleet?** Host a `channel.json` anywhere reachable over HTTPS
+(a fork's raw URL, an object store, an internal web server) and set
+`MANIFEST_URL` to it on each box. Rolling everything forward is then a single
+edit: bump `chart_version` (and/or `vllm_image`) in your manifest, and every
+appliance picks it up within a day — no per-box changes. If you also mirror the
+chart and images, point `CHART_REF` (and, at install time, `BASE_URL`) at your
+own registry.
 
 To update the **app config** (not the version): edit
 `/opt/suite366/values.yaml` (via `sudo`, the directory is 0700) and run
@@ -228,7 +254,7 @@ To update the **app config** (not the version): edit
 
 ```bash
 sudo helm upgrade drive oci://ghcr.io/scriptor-group/chart/drive \
-  --version 0.7.0 -n suite366 -f /opt/suite366/values.yaml
+  --version 0.7.1 -n suite366 -f /opt/suite366/values.yaml
 ```
 
 **Note on `nvidia-smi` on GB10**: with unified memory, the `memory.used/free`
