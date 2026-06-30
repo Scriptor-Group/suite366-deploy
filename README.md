@@ -201,7 +201,17 @@ to register a per-organization provider in the admin UI:
 ## Repository layout
 
 ```
-install.sh                            entry point (curl|bash)
+install.sh                            thin bootstrap entry point (curl|bash); loads lib/*.sh, runs main()
+lib/config.sh                         default settings (every overridable env var)
+lib/common.sh                         shared helpers (ask, run_progress, wait_http, kc)
+lib/preflight.sh                      env checks, NVIDIA toolkit setup, input gathering
+lib/k3s.sh                            single-node k3s + Helm
+lib/vllm.sh                           vLLM ×2 + nginx proxy (host Docker, systemd unit)
+lib/cert-manager.sh                   cert-manager + local self-signed CA
+lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
+lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
+lib/updater.sh                        install update.sh + daily notify-only timer
+lib/summary.sh                        final post-install summary
 update.sh                             update checker/applier (check | apply); run by the daily timer
 channel.json                          fleet release manifest (chart_version / vllm_image) polled by update.sh
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
