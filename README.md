@@ -26,6 +26,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 - [What gets installed](#what-gets-installed)
 - [Prerequisites](#prerequisites)
 - [Parameters](#parameters-env-vars-or-interactive-prompts)
+- [Running without a GPU](#running-without-a-gpu-test--non-spark-hosts)
 - [Measured GB10 realities](#measured-gb10-realities-read-before-tuning)
 - [Wiring the AI](#wiring-the-ai-automatic)
 - [Repository layout](#repository-layout)
@@ -67,10 +68,11 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
   - Images: `ghcr.io/scriptor-group/suite-366`, `…-sandbox-api`,
     `…-sandbox-runner` (referenced by the chart, no override needed)
   - Override `CHART_REF=` if you mirror the chart somewhere else.
-- **arm64 images**: all Suite 366 container images on GHCR are currently
-  arm64-only (matching DGX Spark / GB10). The chart's CI is expected to
-  publish multi-arch (`linux/amd64 + linux/arm64`) eventually - until then,
-  do not point amd64 clusters at the same tags.
+- **Multi-arch images**: the Suite 366 container images on GHCR are published
+  multi-arch (`linux/amd64 + linux/arm64`). The appliance targets the DGX Spark
+  (arm64/GB10), but the k3s + app layer runs on amd64 too - handy for testing
+  the installer on a plain Ubuntu box (see *[Running without a
+  GPU](#running-without-a-gpu-test--non-spark-hosts)* below).
 - **Outbound network** to `get.k3s.io`, `get.helm.sh`, `ghcr.io`,
   `registry-1.docker.io`, `huggingface.co`, `charts.jetstack.io`. The
   preflight fails loudly if any of these is unreachable.
@@ -96,6 +98,33 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `EMBED_MAX_MODEL_LEN` | `8192` | max length for embeddings (enough for RAG chunks) |
 | `VLLM_EMBEDDING_DIMENSIONS` | `4096` | embedding vector dimension (Qwen3-VL-Embedding-8B) |
 | `ASSUME_YES` | `0` | accept defaults without prompting |
+
+### Running without a GPU (test / non-Spark hosts)
+
+The installer targets the DGX Spark, but the k3s + Suite 366 layer runs on any
+Ubuntu amd64/arm64 box. Four env vars relax the hardware checks so you can try
+the installer (infra + app, **no local models**) on an ordinary machine:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SKIP_GPU` | `0` | skip the NVIDIA driver / toolkit / CDI checks. **Implies `SKIP_VLLM=1`** |
+| `SKIP_VLLM` | `0` | don't deploy the vLLM stack (k3s + app only) |
+| `SKIP_ARCH_CHECK` | `0` | allow arches other than `aarch64`/`x86_64` (both are supported natively) |
+| `SKIP_NET_CHECK` | `0` | skip the outbound-connectivity preflight |
+
+`aarch64` (DGX Spark) and `x86_64` (amd64) are both accepted natively, so an
+ordinary Ubuntu box needs no arch flag. Typical run on a plain amd64 machine
+with no GPU (pass the flag to `sudo` so it survives the privilege change):
+
+```bash
+curl -fsSL https://get.suite366.ai/install.sh | sudo SKIP_GPU=1 bash
+```
+
+`SKIP_GPU=1` alone already turns off vLLM (it sets `SKIP_VLLM=1`), so the suite
+comes up wired to a `VLLM_BASE_URL` that has no backend: the app installs and
+runs, but local-AI calls fail until a real vLLM - or a CUSTOM provider in the
+admin UI - is pointed at it. This mode validates the k3s / chart / TLS / mDNS
+plumbing, not the AI path.
 
 ## Measured GB10 realities (read before tuning)
 

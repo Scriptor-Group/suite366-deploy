@@ -38,6 +38,13 @@
 #                              Verification-only — cannot sign/forge licenses.
 #   ASSUME_YES=1               don't prompt, accept defaults
 #
+# Test / non-Spark hosts (relax hardware checks — see README "Running without
+# a GPU"). Pass through sudo: `... | sudo SKIP_GPU=1 SKIP_ARCH_CHECK=1 bash`:
+#   SKIP_GPU=1                 skip NVIDIA driver/toolkit/CDI (implies SKIP_VLLM=1)
+#   SKIP_VLLM=1                don't deploy the vLLM stack (k3s + app only)
+#   SKIP_ARCH_CHECK=1          allow arches other than aarch64/x86_64 (exotic)
+#   SKIP_NET_CHECK=1           skip the outbound-connectivity preflight
+#
 # -----------------------------------------------------------------------------
 # Structure: this file is a thin BOOTSTRAP. The real logic lives in lib/*.sh,
 # loaded at runtime by load_module() below. When run locally (repo cloned) the

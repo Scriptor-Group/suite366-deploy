@@ -83,7 +83,7 @@ ASSUME_YES="${ASSUME_YES:-0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 
 # --- Test mode (VM/box without DGX): relax hardware checks ------------------
-#   SKIP_ARCH_CHECK=1  don't require aarch64 (test on x86/arm64 VMs)
+#   SKIP_ARCH_CHECK=1  allow arches other than aarch64/x86_64 (both native now)
 #   SKIP_GPU=1         don't require an NVIDIA GPU (implies SKIP_VLLM=1)
 #   SKIP_VLLM=1        don't deploy the vLLM stack (infra + app only)
 SKIP_ARCH_CHECK="${SKIP_ARCH_CHECK:-0}"

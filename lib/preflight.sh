@@ -14,10 +14,16 @@ preflight() {
   mkdir -p "$DATA_DIR" && chmod 0700 "$DATA_DIR"
   [[ "$SKIP_VLLM" == "1" || "$SKIP_GPU" == "1" || "$SKIP_ARCH_CHECK" == "1" ]] && \
     warn "TEST MODE (SKIP_ARCH_CHECK=$SKIP_ARCH_CHECK SKIP_GPU=$SKIP_GPU SKIP_VLLM=$SKIP_VLLM)."
-  if [[ "$(uname -m)" != "aarch64" ]]; then
-    [[ "$SKIP_ARCH_CHECK" == "1" ]] || die "Architecture $(uname -m) ≠ aarch64. The DGX Spark is ARM64 (set SKIP_ARCH_CHECK=1 to test)."
-    warn "Architecture $(uname -m) ≠ aarch64 — tolerated (test mode)."
-  fi
+  # aarch64 is the reference target (DGX Spark / GB10). x86_64 is also
+  # supported: the Suite 366 images + vLLM image are multi-arch, so the k3s +
+  # app layer runs on amd64 too (with or without a GPU). Any other arch has no
+  # published image — refuse unless explicitly forced.
+  case "$(uname -m)" in
+    aarch64) ;;
+    x86_64)  info "Architecture x86_64 (amd64) — supported (images are multi-arch)." ;;
+    *) [[ "$SKIP_ARCH_CHECK" == "1" ]] || die "Architecture $(uname -m) unsupported (expected aarch64 or x86_64; set SKIP_ARCH_CHECK=1 to force)."
+       warn "Architecture $(uname -m) — unsupported, forced via SKIP_ARCH_CHECK." ;;
+  esac
   if have lsb_release; then
     local rel; rel="$(lsb_release -rs 2>/dev/null || echo '?')"
     [[ "$rel" == "22.04" ]] || warn "Ubuntu $rel detected (expected 22.04) — continuing."
