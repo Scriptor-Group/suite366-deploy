@@ -36,6 +36,7 @@ deploy_suite() {
     fetch "values.yaml" \
       | sed -e "s|@DOMAIN@|$DOMAIN|g" \
             -e "s|@HOST_IP@|$HOST_IP|g" \
+            -e "s|@SUITE_IP@|$SUITE_IP|g" \
             -e "s|@PROXY_PORT@|$PROXY_PORT|g" \
             -e "s|@LLM_MODEL@|$LLM_MODEL|g" \
             -e "s|@EMBED_MODEL@|$EMBED_MODEL|g" \

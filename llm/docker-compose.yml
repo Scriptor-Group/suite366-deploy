@@ -46,10 +46,11 @@ services:
       # Chat template required by --tool-call-parser=gemma4 (without it, vLLM
       # crashes at boot with "chat template not found").
       - ./tool_chat_template_gemma4.jinja:/app/tool_chat_template_gemma4.jinja:ro
-    # Bind on the LAN IP: reachable by k3s pods via the node's IP. Kept
-    # exposed for direct debugging; the chart talks to the nginx proxy.
+    # Bind on the STABLE internal IP (BIND_IP=SUITE_IP), reachable by k3s pods
+    # via the node's IP and independent of the LAN. Not exposed on the LAN by
+    # design; debug from the host with `curl http://$BIND_IP:$LLM_PORT`.
     ports:
-      - "${HOST_IP}:${LLM_PORT}:8000"
+      - "${BIND_IP}:${LLM_PORT}:8000"
     command:
       - --model=${LLM_MODEL}
       - --served-model-name=${LLM_MODEL}
@@ -105,7 +106,7 @@ services:
     volumes:
       - ${MODELS_DIR}:/root/.cache/huggingface
     ports:
-      - "${HOST_IP}:${EMBED_PORT}:8000"
+      - "${BIND_IP}:${EMBED_PORT}:8000"
     command:
       - --model=${EMBED_MODEL}
       - --served-model-name=${EMBED_MODEL}
@@ -148,7 +149,7 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "${HOST_IP}:${PROXY_PORT}:8000"
+      - "${BIND_IP}:${PROXY_PORT}:8000"
     depends_on:
       vllm-llm:
         condition: service_healthy

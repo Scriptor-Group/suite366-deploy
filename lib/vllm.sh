@@ -21,7 +21,7 @@ PROXY_IMAGE=$PROXY_IMAGE
 HF_TOKEN=${HF_TOKEN:-}
 VLLM_API_KEY=$VLLM_API_KEY
 MODELS_DIR=$MODELS_DIR
-HOST_IP=$HOST_IP
+BIND_IP=$SUITE_IP
 LLM_MODEL=$LLM_MODEL
 EMBED_MODEL=$EMBED_MODEL
 LLM_PORT=$LLM_PORT
@@ -56,20 +56,21 @@ EOF
   systemctl daemon-reload
   systemctl enable --now suite366-vllm.service
   info "Downloading + loading models (may take several minutes)…"
-  if wait_http "http://$HOST_IP:$LLM_PORT/health" "vLLM generative"; then
-    warmup_chat "http://$HOST_IP:$LLM_PORT" "$LLM_MODEL"
+  # Health-check on the stable internal IP: local, always reachable, offline-safe.
+  if wait_http "http://$SUITE_IP:$LLM_PORT/health" "vLLM generative"; then
+    warmup_chat "http://$SUITE_IP:$LLM_PORT" "$LLM_MODEL"
   else
     warn "vLLM generative not ready yet (see: docker logs suite366-vllm-llm)."
   fi
-  if wait_http "http://$HOST_IP:$EMBED_PORT/health" "vLLM embeddings"; then
-    warmup_embed "http://$HOST_IP:$EMBED_PORT" "$EMBED_MODEL"
+  if wait_http "http://$SUITE_IP:$EMBED_PORT/health" "vLLM embeddings"; then
+    warmup_embed "http://$SUITE_IP:$EMBED_PORT" "$EMBED_MODEL"
   else
     warn "vLLM embeddings not ready yet (see: docker logs suite366-vllm-embed)."
   fi
   # The nginx proxy only becomes healthy once both vLLM backends are healthy
   # (depends_on: service_healthy). nginx itself starts in ~1s.
-  if wait_http "http://$HOST_IP:$PROXY_PORT/health" "vLLM unified proxy"; then
-    info "  unified proxy ready at http://$HOST_IP:$PROXY_PORT/v1"
+  if wait_http "http://$SUITE_IP:$PROXY_PORT/health" "vLLM unified proxy"; then
+    info "  unified proxy ready at http://$SUITE_IP:$PROXY_PORT/v1"
   else
     warn "vLLM proxy not ready yet (see: docker logs suite366-vllm-proxy)."
   fi

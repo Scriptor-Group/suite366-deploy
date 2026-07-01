@@ -92,3 +92,15 @@ SKIP_VLLM="${SKIP_VLLM:-0}"
 [[ "$SKIP_GPU" == "1" ]] && SKIP_VLLM=1
 
 KUBECONFIG_PATH=/etc/rancher/k3s/k3s.yaml
+
+# --- Stable internal identity (network-independent) --------------------------
+# The whole cluster is pinned to a FIXED private IP carried by an always-up
+# `dummy` interface, NOT the LAN IP. This decouples k3s + vLLM + the app's
+# internal wiring from whatever the physical network does: a DHCP lease change,
+# a WiFi<->Ethernet switch, or going fully offline no longer breaks anything
+# (the LAN IP used to be baked into k3s node-ip, the vLLM port bind, and
+# VLLM_BASE_URL). External reachability (browsers) still follows the current
+# LAN IP via Traefik/ServiceLB (0.0.0.0) + dynamic mDNS — see lib/mdns.sh.
+# 10.99.0.0/16 is outside k3s' pod CIDR (10.42/16) and service CIDR (10.43/16).
+SUITE_IP="${SUITE_IP:-10.99.0.1}"
+SUITE_IFACE="${SUITE_IFACE:-suite0}"

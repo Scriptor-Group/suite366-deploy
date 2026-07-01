@@ -11,11 +11,13 @@ summary() {
   else
     ai=$(cat <<AI
  Local AI (wired AUTOMATICALLY into Suite 366 via PR #325 env contract):
-   • Unified endpoint (nginx)    : http://$HOST_IP:$PROXY_PORT/v1
+   • Unified endpoint (nginx)    : http://$SUITE_IP:$PROXY_PORT/v1
        /v1/embeddings -> vllm-embed ; everything else -> vllm-llm.
-   • Direct vLLM endpoints (debug):
-       - Generative : http://$HOST_IP:$LLM_PORT/v1   (model: $LLM_MODEL)
-       - Embeddings : http://$HOST_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)
+       ($SUITE_IP is the stable internal IP — reach it from the box; it is
+        network-independent so the app keeps working across LAN changes/offline.)
+   • Direct vLLM endpoints (debug, from the box):
+       - Generative : http://$SUITE_IP:$LLM_PORT/v1   (model: $LLM_MODEL)
+       - Embeddings : http://$SUITE_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)
    • API key (shared by vLLM + Suite 366): $VLLM_API_KEY
    -> The chart receives VLLM_BASE_URL + VLLM_MODEL_* + VLLM_API_KEY via
       values.yaml; chooseDefaultModel() picks vLLM by default.
@@ -43,7 +45,10 @@ $ai
  DNS: *.{$DOMAIN} is published via mDNS. LAN machines with mDNS support
       (macOS, Windows 10+, Linux+nss-mdns) resolve it without config.
 
- systemd services: suite366-vllm, suite366-avahi-aliases, k3s
+ Network     : cluster pinned to $SUITE_IP on $SUITE_IFACE (stable, survives
+                   LAN changes/offline). External access follows the current
+                   LAN IP via Traefik + dynamic mDNS.
+ systemd services: suite366-net, suite366-vllm, suite366-avahi-aliases, k3s
  Updates         : checked daily (suite366-update.timer, notify-only).
                    Check now : sudo $DATA_DIR/update.sh check
                    Apply     : sudo $DATA_DIR/update.sh apply

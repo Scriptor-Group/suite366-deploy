@@ -55,9 +55,11 @@ config:
   # local vLLM is preferred over Anthropic/OpenAI for every role. The base
   # URL points to the nginx proxy on the host, which routes by URL path
   # (/v1/embeddings -> vllm-embed, everything else -> vllm-llm). We target
-  # @HOST_IP@ because k3s pods do NOT resolve `.local` mDNS (host-side
-  # resolution only).
-  VLLM_BASE_URL: "http://@HOST_IP@:@PROXY_PORT@/v1"
+  # @SUITE_IP@ (the stable internal IP on the dummy interface, reached via the
+  # node IP) instead of the LAN IP: pods keep reaching vLLM across DHCP/NIC
+  # changes and offline. `.local` mDNS is not usable here — pods don't resolve
+  # it (host-side resolution only).
+  VLLM_BASE_URL: "http://@SUITE_IP@:@PROXY_PORT@/v1"
   VLLM_MODEL_HIGH: "@LLM_MODEL@"
   VLLM_MODEL_LIGHT: "@LLM_MODEL@"
   VLLM_MODEL_VISION: "@LLM_MODEL@"
@@ -135,6 +137,15 @@ onlyoffice:
     host: office.@DOMAIN@
     clusterIssuer: suite366-local-ca
 
+# NOTE (network-independence): livekit is the ONE workload that genuinely
+# needs the CURRENT LAN IP, not the stable internal IP. It runs hostNetwork,
+# so its pod IP is now the node IP (SUITE_IP, 10.99.0.1) — unreachable by LAN
+# browsers for WebRTC media. For LAN clients, livekit must ADVERTISE the LAN IP
+# (rtc.node_ip = LAN IP, use_external_ip=false — STUN returns the WAN IP, wrong
+# for a LAN/offline appliance). This requires a chart key to inject the LAN IP
+# and a restart on network change (parallel to the dynamic mDNS hook). Until
+# the chart exposes that, video calls assume a stable LAN IP. TODO: wire
+# livekit.rtc.nodeIp to the current LAN IP + refresh it via the dispatcher.
 livekit:
   enabled: true
   hostNetwork: true                        # UDP media on single-node k3s

@@ -36,6 +36,11 @@
 #   LICENSE_PUBLIC_KEY         Ed25519 SPKI PEM the app uses to VERIFY signed
 #                              license tokens (default: shipped public key).
 #                              Verification-only — cannot sign/forge licenses.
+#   SUITE_IP                   stable internal IP the cluster is pinned to,
+#                              carried by an always-up dummy interface so k3s +
+#                              vLLM + the app survive LAN changes/offline
+#                              (default 10.99.0.1; outside pod/service CIDRs)
+#   SUITE_IFACE                name of that dummy interface (default suite0)
 #   ASSUME_YES=1               don't prompt, accept defaults
 #
 # Test / non-Spark hosts (relax hardware checks — see README "Running without
@@ -99,12 +104,13 @@ load_module() { # load_module NAME  (=> sources lib/NAME.sh)
 
 # Load order matters: config (defaults) and common (helpers) first, then each
 # deploy step in the order main() calls it.
-MODULES=(config common preflight k3s vllm cert-manager suite mdns updater summary)
+MODULES=(config common preflight network k3s vllm cert-manager suite mdns updater summary)
 for _m in "${MODULES[@]}"; do load_module "$_m"; done
 
 main() {
   preflight
   gather_inputs
+  setup_stable_ip
   install_k3s
   if [[ "$SKIP_VLLM" == "1" ]]; then warn "vLLM stack not deployed (SKIP_VLLM)."; else deploy_vllm; fi
   install_cert_manager
