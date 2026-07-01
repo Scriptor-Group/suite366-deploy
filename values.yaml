@@ -18,9 +18,19 @@
 # ============================================================================
 appName: drive-app
 
-# image.repository is left at the chart default (ghcr.io/scriptor-group/suite-366).
-# Override here only if you mirror the image to another registry. The GHCR
-# packages are public so no imagePullSecrets are needed (chart default = []).
+# --- Image pinning + offline safety (appliance) ------------------------------
+# Every image is pinned to a fixed version tag (NO :latest) for reproducibility
+# and offline restarts. global.imagePullPolicy makes k8s reuse the locally
+# present image instead of re-pulling (which fails offline). See the pins in the
+# redis/postgres/minio/onlyoffice/livekit/sandbox blocks below.
+global:
+  imagePullPolicy: IfNotPresent
+
+# App + sandbox share the release train; 1.8.7 is the current published version.
+# image.repository stays at the chart default (ghcr.io/scriptor-group/suite-366);
+# the GHCR packages are public so no imagePullSecrets are needed.
+image:
+  tag: "1.8.7"
 
 replicas: 1
 podAntiAffinity:
@@ -120,6 +130,7 @@ postgres:
 
 minio:
   enabled: true
+  image: minio/minio:RELEASE.2025-09-07T16-13-09Z   # pinned (chart default is :latest)
   persistence:
     enabled: true
     size: 50Gi
@@ -127,6 +138,7 @@ minio:
 
 onlyoffice:
   enabled: true
+  image: onlyoffice/documentserver:9.4.0   # pinned (chart default is :latest)
   persistence:
     enabled: true
     size: 10Gi
@@ -137,18 +149,20 @@ onlyoffice:
     host: office.@DOMAIN@
     clusterIssuer: suite366-local-ca
 
-# NOTE (network-independence): livekit is the ONE workload that genuinely
-# needs the CURRENT LAN IP, not the stable internal IP. It runs hostNetwork,
-# so its pod IP is now the node IP (SUITE_IP, 10.99.0.1) — unreachable by LAN
-# browsers for WebRTC media. For LAN clients, livekit must ADVERTISE the LAN IP
-# (rtc.node_ip = LAN IP, use_external_ip=false — STUN returns the WAN IP, wrong
-# for a LAN/offline appliance). This requires a chart key to inject the LAN IP
-# and a restart on network change (parallel to the dynamic mDNS hook). Until
-# the chart exposes that, video calls assume a stable LAN IP. TODO: wire
-# livekit.rtc.nodeIp to the current LAN IP + refresh it via the dispatcher.
+# livekit is the ONE workload that needs the CURRENT LAN IP (not the stable
+# internal IP): hostNetwork media must be reachable by LAN browsers. With
+# rtc.dynamicNodeIp the chart's render-node-ip initContainer detects the LAN IP
+# at pod start (no STUN — that returns the WAN IP, wrong for LAN/offline) and
+# writes it as rtc.node_ip. The network-change dispatcher hook (lib/mdns.sh)
+# does a `rollout restart` so it re-detects when the connection switches.
 livekit:
   enabled: true
   hostNetwork: true                        # UDP media on single-node k3s
+  image: livekit/livekit-server:v1.13.2    # pinned (chart default is :latest)
+  initImage: busybox:1.37                   # for the render-node-ip initContainer
+  rtc:
+    dynamicNodeIp: true                     # advertise the current LAN IP, no STUN
+    useExternalIp: false
   ingress:
     enabled: true
     className: traefik
@@ -175,6 +189,11 @@ sandbox:
   # install.sh creates the namespace + applies PSS labels, so the chart skips
   # its own Namespace template (avoids ownership conflict with our pre-create).
   createNamespace: false
-  # Default api/runner images come from the chart (ghcr.io/scriptor-group/
-  # suite-366-sandbox-{api,runner}:latest, arm64). Tune sessions/limits if the
-  # GB10 unified memory budget is tight — defaults aim at 20 pods × 512 MB.
+  # Pinned to the current release (chart defaults are :latest). pullPolicy
+  # IfNotPresent overrides the chart's Always so runner/api restart offline.
+  api:
+    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.8.7
+    pullPolicy: IfNotPresent
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.7
+  # Tune sessions/limits if the GB10 unified memory budget is tight — defaults
+  # aim at 20 pods × 512 MB.

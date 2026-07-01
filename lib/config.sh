@@ -11,7 +11,7 @@ DOMAIN="${DOMAIN:-suite366.local}"
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
-CHART_VERSION="${CHART_VERSION:-0.7.1}"
+CHART_VERSION="${CHART_VERSION:-0.8.0}"
 # Channel manifest polled daily by the update timer (see setup_update_timer).
 # Publishing a new chart_version/vllm_image here rolls the fleet forward;
 # appliances NOTIFY only (no auto-apply). Override to pin a box to a private
@@ -34,7 +34,7 @@ VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}"
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,
 # no Python, no startup overhead) over heavier alternatives like LiteLLM.
-PROXY_IMAGE="${PROXY_IMAGE:-nginx:alpine}"
+PROXY_IMAGE="${PROXY_IMAGE:-nginx:1.31-alpine}"
 LLM_PORT="${LLM_PORT:-8001}"
 EMBED_PORT="${EMBED_PORT:-8002}"
 PROXY_PORT="${PROXY_PORT:-8000}"
