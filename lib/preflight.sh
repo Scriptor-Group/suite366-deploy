@@ -124,18 +124,29 @@ gather_inputs() {
   ask DOMAIN       "Local domain" "$DOMAIN"
   ask ADMIN_EMAIL  "Admin email"  "admin@$DOMAIN"
   echo
-  info "HuggingFace token (optional) — needed for 'gated' models."
-  ask_secret HF_TOKEN "  HF token (leave empty if not required)"
-  echo
+  # Model ids are still written into values.yaml (the app advertises them, even
+  # when the local vLLM backend isn't deployed), so we ask for them regardless.
   ask LLM_MODEL   "Generative model (HF id)" "$LLM_MODEL"
   ask EMBED_MODEL "Embeddings model (HF id)" "$EMBED_MODEL"
-  ask VLLM_IMAGE  "vLLM image (arm64/Blackwell)" "$VLLM_IMAGE"
+
+  # The HF token (gates model downloads) and the vLLM image are used ONLY by the
+  # vLLM stack. When it isn't deployed (SKIP_VLLM / SKIP_GPU), skip these prompts
+  # entirely — they'd have no effect.
+  if [[ "$SKIP_VLLM" == "1" ]]; then
+    info "vLLM stack skipped — not asking for HF token / vLLM image."
+  else
+    echo
+    info "HuggingFace token (optional) — needed for 'gated' models."
+    ask_secret HF_TOKEN "  HF token (leave empty if not required)"
+    echo
+    ask VLLM_IMAGE  "vLLM image (arm64/Blackwell)" "$VLLM_IMAGE"
+  fi
 
   VLLM_API_KEY="${VLLM_API_KEY:-sk-$(head -c24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c32)}"
   # Bash `set -e` + `[[ test ]] && cmd` as the last statement of a function
   # propagates the exit code of `[[ test ]]`: if false, the function returns 1
   # and the script dies silently. We use `if/fi` (plus a final `:`).
-  if [[ "$VLLM_IMAGE" == "vllm/vllm-openai:latest" ]]; then
+  if [[ "$SKIP_VLLM" != "1" && "$VLLM_IMAGE" == "vllm/vllm-openai:latest" ]]; then
     warn "vllm/vllm-openai:latest is NOT validated arm64/Blackwell. Prefer vllm/vllm-openai:cu130-nightly (default)."
   fi
   :
