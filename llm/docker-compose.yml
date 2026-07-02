@@ -157,7 +157,9 @@ services:
         condition: service_healthy
     healthcheck:
       # nginx:alpine ships wget (busybox); /health is served by our own conf.
-      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      # Use 127.0.0.1 (not localhost): busybox wget resolves localhost to ::1
+      # first, but nginx only listens on IPv4 0.0.0.0:8000 -> "connection refused".
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 10
