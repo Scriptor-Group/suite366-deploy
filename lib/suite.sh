@@ -36,6 +36,7 @@ deploy_suite() {
     fetch "values.yaml" \
       | sed -e "s|@DOMAIN@|$DOMAIN|g" \
             -e "s|@HOST_IP@|$HOST_IP|g" \
+            -e "s|@SUITE_IP@|$SUITE_IP|g" \
             -e "s|@PROXY_PORT@|$PROXY_PORT|g" \
             -e "s|@LLM_MODEL@|$LLM_MODEL|g" \
             -e "s|@EMBED_MODEL@|$EMBED_MODEL|g" \
@@ -65,6 +66,26 @@ deploy_suite() {
     helm upgrade --install "$RELEASE" "$CHART_REF" \
       --version "$CHART_VERSION" --namespace "$NAMESPACE" \
       -f "$vals" "${ca_args[@]}" --wait --timeout 15m
+  prepull_images
+}
+
+# Pre-pull every referenced image into containerd so a later restart works
+# OFFLINE (combined with imagePullPolicy: IfNotPresent). Images used on demand
+# — the livekit initContainer (busybox) and the sandbox runner (spawned by
+# sandbox-api, not by Helm) — are added explicitly since Helm won't fetch them.
+# Best-effort: a failed pull only warns (the image may already be present).
+prepull_images() {
+  log "Pre-pulling images (offline resilience)"
+  local imgs extra i
+  imgs="$(kc get deploy,statefulset,daemonset,job -A \
+    -o jsonpath='{range .items[*]}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{end}' \
+    2>/dev/null | sort -u)"
+  extra="busybox:1.37
+ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.7"
+  for i in $imgs $extra; do
+    [[ -z "$i" ]] && continue
+    if k3s crictl pull "$i" >/dev/null 2>&1; then info "  ✓ $i"; else warn "  ✗ $i (pull failed — offline restart may miss it)"; fi
+  done
 }
 
 # Workaround for server-to-server fetches between drive-app and OnlyOffice:

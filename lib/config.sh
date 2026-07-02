@@ -11,7 +11,7 @@ DOMAIN="${DOMAIN:-suite366.local}"
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
-CHART_VERSION="${CHART_VERSION:-0.7.1}"
+CHART_VERSION="${CHART_VERSION:-0.8.0}"
 # Channel manifest polled daily by the update timer (see setup_update_timer).
 # Publishing a new chart_version/vllm_image here rolls the fleet forward;
 # appliances NOTIFY only (no auto-apply). Override to pin a box to a private
@@ -34,7 +34,7 @@ VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}"
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,
 # no Python, no startup overhead) over heavier alternatives like LiteLLM.
-PROXY_IMAGE="${PROXY_IMAGE:-nginx:alpine}"
+PROXY_IMAGE="${PROXY_IMAGE:-nginx:1.31-alpine}"
 LLM_PORT="${LLM_PORT:-8001}"
 EMBED_PORT="${EMBED_PORT:-8002}"
 PROXY_PORT="${PROXY_PORT:-8000}"
@@ -92,3 +92,15 @@ SKIP_VLLM="${SKIP_VLLM:-0}"
 [[ "$SKIP_GPU" == "1" ]] && SKIP_VLLM=1
 
 KUBECONFIG_PATH=/etc/rancher/k3s/k3s.yaml
+
+# --- Stable internal identity (network-independent) --------------------------
+# The whole cluster is pinned to a FIXED private IP carried by an always-up
+# `dummy` interface, NOT the LAN IP. This decouples k3s + vLLM + the app's
+# internal wiring from whatever the physical network does: a DHCP lease change,
+# a WiFi<->Ethernet switch, or going fully offline no longer breaks anything
+# (the LAN IP used to be baked into k3s node-ip, the vLLM port bind, and
+# VLLM_BASE_URL). External reachability (browsers) still follows the current
+# LAN IP via Traefik/ServiceLB (0.0.0.0) + dynamic mDNS — see lib/mdns.sh.
+# 10.99.0.0/16 is outside k3s' pod CIDR (10.42/16) and service CIDR (10.43/16).
+SUITE_IP="${SUITE_IP:-10.99.0.1}"
+SUITE_IFACE="${SUITE_IFACE:-suite0}"
