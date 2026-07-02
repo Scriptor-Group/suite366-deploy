@@ -1,6 +1,6 @@
 {
   "channel": "stable",
-  "chart_version": "0.7.2",
+  "chart_version": "0.8.0",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
-  "notes": "Initial stable channel. Bump chart_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply)."
+  "notes": "0.8.0: offline-safe imagePullPolicy + dynamic livekit node_ip; appliance pins all image versions and pins the cluster to a stable internal IP. Bump chart_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply)."
 }
