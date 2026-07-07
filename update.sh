@@ -172,11 +172,18 @@ read_current_state() {
   cur_vllm=""
   [[ -f "$DATA_DIR/llm/.env" ]] && cur_vllm="$(sed -n 's/^VLLM_IMAGE=//p' "$DATA_DIR/llm/.env" | head -1)"
 
-  # App release train = the image tag pinned in values.yaml at install time
-  # (the appliance pins every image for offline safety, so a bare helm upgrade
-  # would NOT move the app — `apply` rewrites the pins when app_version bumps).
-  cur_app=""
-  [[ -f "$DATA_DIR/values.yaml" ]] && cur_app="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  # App release train = the image tag of the RUNNING drive-app deployment.
+  # Do NOT read it from the values.yaml pins: apply rewrites those BEFORE the
+  # helm upgrade, so if the upgrade fails the pins are ahead of reality and a
+  # re-run would wrongly conclude "up to date". Fall back to the pin only when
+  # the cluster is unreadable.
+  cur_app="$(kc -n "$NAMESPACE" get deploy \
+    -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null \
+    | sed -n 's|.*/suite-366:||p' | head -1)"
+  if [[ -z "$cur_app" && -f "$DATA_DIR/values.yaml" ]]; then
+    cur_app="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+    [[ -n "$cur_app" ]] && warn "App version read from values.yaml pin (cluster unreadable) — may be ahead of the running pod."
+  fi
 }
 
 # --- Target state from the manifest -------------------------------------------
