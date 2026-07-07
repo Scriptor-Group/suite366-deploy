@@ -1,7 +1,7 @@
 {
   "channel": "stable",
   "chart_version": "0.8.0",
-  "app_version": "1.8.7",
+  "app_version": "1.8.10",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
-  "notes": "0.8.0: offline-safe imagePullPolicy + dynamic livekit node_ip; appliance pins all image versions and pins the cluster to a stable internal IP. app_version drives the app/sandbox image pins in values.yaml (the appliance pins them for offline safety, update.sh rewrites the pins on apply). Bump chart_version / app_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply) — admins can apply from the app UI."
+  "notes": "app 1.8.10: in-app appliance updates — org admins see available updates on the dashboard and can apply them from Settings -> Organization -> System update (state.json bridge + systemd path triggers, see README). app_version drives the app/sandbox image pins in values.yaml (the appliance pins them for offline safety, update.sh rewrites the pins on apply). Bump chart_version / app_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply)."
 }
