@@ -60,4 +60,15 @@ EOF
   systemctl daemon-reload
   systemctl enable --now suite366-update.timer
   info "Timer armed. Check now: sudo $DATA_DIR/update.sh check ; apply: … apply"
+
+  # App <-> host update bridge: $DATA_DIR/updates is hostPath-mounted into the
+  # drive-app pod (see values.yaml extraVolumes). update.sh prepares the dir
+  # (root:1001 0770 — the pod runs as 1001 and k8s does not fsGroup-chown
+  # hostPath volumes) and installs the .path units that fire check/apply when
+  # the app drops a trigger file. DATA_DIR is passed explicitly: update.sh
+  # would otherwise fall back to its default when the install overrides it.
+  DATA_DIR="$DATA_DIR" "$DATA_DIR/update.sh" install-units
+  # First state.json so the app UI has something to show before the first
+  # daily tick (non-blocking — the box may be offline right after install).
+  DATA_DIR="$DATA_DIR" "$DATA_DIR/update.sh" check || warn "initial update check failed (non-blocking)."
 }

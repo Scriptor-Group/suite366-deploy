@@ -178,6 +178,26 @@ livekit:
       issuerName: suite366-local-ca
       issuerKind: ClusterIssuer
 
+# --- Appliance update bridge (host <-> app) ----------------------------------
+# @DATA_DIR@/updates on the host is shared with the drive-app pod: update.sh
+# publishes state.json / apply.json there, and the app drops trigger files
+# (check-requested / apply-requested) that systemd .path units pick up to run
+# update.sh — this powers the "update available" banner + the update button in
+# the admin UI. Uses the chart's generic extraEnv/extraVolumes (no chart
+# change). install.sh creates the dir root:1001 mode 0770 (the app container
+# runs as uid/gid 1001; k8s does not fsGroup-chown hostPath volumes).
+extraEnv:
+  - name: APPLIANCE_UPDATE_DIR
+    value: /appliance-update
+extraVolumeMounts:
+  - name: appliance-update
+    mountPath: /appliance-update
+extraVolumes:
+  - name: appliance-update
+    hostPath:
+      path: @DATA_DIR@/updates
+      type: DirectoryOrCreate
+
 # Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,
 # pre-created by install.sh so the GHCR pull secret lands BEFORE sandbox-api
 # / sandbox-runner pods schedule. The chart wires SANDBOX_API_URL into the

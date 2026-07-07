@@ -241,8 +241,8 @@ lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
 lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
-update.sh                             update checker/applier (check | apply); run by the daily timer
-channel.json                          fleet release manifest (chart_version / vllm_image) polled by update.sh
+update.sh                             update checker/applier (check | apply | install-units); run by the daily timer + app triggers
+channel.json                          fleet release manifest (chart_version / app_version / vllm_image) polled by update.sh
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
 llm/tool_chat_template_gemma4.jinja   chat template required by --tool-call-parser=gemma4
@@ -264,16 +264,36 @@ systemctl status suite366-avahi-aliases        # mDNS aliases
 
 The installer arms a **daily systemd timer** (`suite366-update.timer`) that
 polls a **channel manifest** ([`channel.json`](channel.json) in this repo) and
-**notifies** when a newer chart or vLLM image is published. It never applies an
-upgrade on its own.
+**notifies** when a newer chart, app release or vLLM image is published. It
+never applies an upgrade on its own — an **org admin applies it from the app
+UI** (Settings → Organization → System update), or over SSH:
 
 ```bash
 sudo /opt/suite366/update.sh check    # what the timer runs: compare + notify
-sudo /opt/suite366/update.sh apply    # actually upgrade (helm + vLLM image)
+sudo /opt/suite366/update.sh apply    # actually upgrade (helm + app pins + vLLM image)
 systemctl list-timers suite366-update.timer
 journalctl -u suite366-update.service # past check results
 cat /opt/suite366/update-available    # marker file, present only when one is pending
 ```
+
+**App <-> host bridge**: `/opt/suite366/updates` is hostPath-mounted into the
+drive-app pod (`/appliance-update`, wired by the `extraVolumes` block in
+[`values.yaml`](values.yaml)). `update.sh check` publishes `state.json` there
+(versions, diff, channel notes) and `update.sh apply` tracks progress in
+`apply.json` — that's what the admin UI banner reads. The app requests a check
+or an apply by dropping a `check-requested` / `apply-requested` trigger file,
+picked up by systemd `.path` units (`suite366-update-check.path`,
+`suite366-update-apply.path`, installed by `update.sh install-units`). The
+apply reuses the box's install-time parameters (`values.yaml`, `llm/.env`,
+`update.env`) — nothing is re-asked. After each apply, `update.sh` refreshes
+itself from the repo and re-installs the trigger units, so the update
+mechanism itself rolls forward with regular updates (disable with
+`SELF_UPDATE=0` in `update.env`).
+
+**App version pinning**: the appliance pins the app + sandbox image tags in
+`values.yaml` (offline safety), so a bare `helm upgrade` never moves the app.
+`channel.json`'s `app_version` is what rolls the app forward: on apply,
+`update.sh` rewrites the pins to the new tag before upgrading.
 
 By default each box polls the `channel.json` shipped in this repo, so it tracks
 the releases published here. Point a box at a manifest you control with
@@ -283,7 +303,7 @@ the releases published here. Point a box at a manifest you control with
 **Running your own fleet?** Host a `channel.json` anywhere reachable over HTTPS
 (a fork's raw URL, an object store, an internal web server) and set
 `MANIFEST_URL` to it on each box. Rolling everything forward is then a single
-edit: bump `chart_version` (and/or `vllm_image`) in your manifest, and every
+edit: bump `chart_version` (and/or `app_version` / `vllm_image`) in your manifest, and every
 appliance picks it up within a day (no per-box changes). If you also mirror the
 chart and images, point `CHART_REF` (and, at install time, `BASE_URL`) at your
 own registry.

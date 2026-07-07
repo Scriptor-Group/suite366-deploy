@@ -45,8 +45,17 @@ deploy_suite() {
             -e "s|@VLLM_MAX_CONTEXT_WINDOW@|$VLLM_MAX_CONTEXT_WINDOW|g" \
             -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
+            -e "s|@DATA_DIR@|$DATA_DIR|g" \
         > "$vals" )
   chmod 0600 "$vals"
+
+  # App <-> host update bridge dir, hostPath-mounted into drive-app (see the
+  # extraVolumes block in values.yaml). Created BEFORE helm so kubelet's
+  # DirectoryOrCreate doesn't make it root:root 0755 (the pod, uid/gid 1001,
+  # must be able to drop trigger files — k8s does not fsGroup-chown hostPath).
+  mkdir -p "$DATA_DIR/updates"
+  chown root:1001 "$DATA_DIR/updates"
+  chmod 0770 "$DATA_DIR/updates"
 
   patch_coredns_for_local_domain
   # CA locale auto-générée par cert-manager : la passer au chart pour qu'il
