@@ -14,8 +14,10 @@ deploy_vllm() {
   fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
   # nginx proxy config (static URL-path routing, no templating needed).
   fetch "llm/nginx.conf"                        > "$DATA_DIR/llm/nginx.conf"
-  umask 077
-  cat > "$DATA_DIR/llm/.env" <<EOF
+  local env_file="$DATA_DIR/llm/.env" env_old=""
+  [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"
+  local env_new
+  env_new="$(cat <<EOF
 VLLM_IMAGE=$VLLM_IMAGE
 PROXY_IMAGE=$PROXY_IMAGE
 HF_TOKEN=${HF_TOKEN:-}
@@ -33,7 +35,8 @@ LLM_MAX_NUM_SEQS=$LLM_MAX_NUM_SEQS
 LLM_MAX_MODEL_LEN=$LLM_MAX_MODEL_LEN
 EMBED_MAX_MODEL_LEN=$EMBED_MAX_MODEL_LEN
 EOF
-  umask 022
+)"
+  ( umask 077; printf '%s\n' "$env_new" > "$env_file" )
 
   cat > /etc/systemd/system/suite366-vllm.service <<EOF
 [Unit]
@@ -54,7 +57,20 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now suite366-vllm.service
+  systemctl enable suite366-vllm.service >/dev/null 2>&1 || true
+  # The unit is oneshot + RemainAfterExit: once active, `start` is a no-op, so a
+  # re-run that changed .env (e.g. a new VLLM_API_KEY) would leave the running
+  # containers on the stale config. Recreate them only when the config actually
+  # changed; otherwise leave the stack up (avoids a needless multi-minute model
+  # reload on an unchanged re-run).
+  if ! systemctl is-active --quiet suite366-vllm.service; then
+    systemctl start suite366-vllm.service
+  elif [[ "$env_new" != "$env_old" ]]; then
+    info "vLLM config changed — restarting the stack to apply it (models reload)."
+    systemctl restart suite366-vllm.service
+  else
+    info "vLLM config unchanged — leaving the running stack in place."
+  fi
   info "Downloading + loading models (may take several minutes)…"
   # Health-check on the stable internal IP: local, always reachable, offline-safe.
   if wait_http "http://$SUITE_IP:$LLM_PORT/health" "vLLM generative"; then

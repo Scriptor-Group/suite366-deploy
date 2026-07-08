@@ -142,6 +142,14 @@ gather_inputs() {
     ask VLLM_IMAGE  "vLLM image (arm64/Blackwell)" "$VLLM_IMAGE"
   fi
 
+  # Reuse the key provisioned on a previous run so re-installs stay idempotent.
+  # Without this, each run draws a fresh key: helm hands the app the new one
+  # while the already-running vLLM containers keep the old one -> 401s. values.yaml
+  # is the source of truth (always written, even under SKIP_VLLM where llm/.env
+  # doesn't exist). An explicit VLLM_API_KEY in the env still wins.
+  if [[ -z "${VLLM_API_KEY:-}" && -f "$DATA_DIR/values.yaml" ]]; then
+    VLLM_API_KEY="$(sed -n 's/.*VLLM_API_KEY: *"\(sk-[^"]*\)".*/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  fi
   VLLM_API_KEY="${VLLM_API_KEY:-sk-$(head -c24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c32)}"
   # Bash `set -e` + `[[ test ]] && cmd` as the last statement of a function
   # propagates the exit code of `[[ test ]]`: if false, the function returns 1
