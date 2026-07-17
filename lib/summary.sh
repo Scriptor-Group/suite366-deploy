@@ -54,6 +54,7 @@ $ai
                    Apply     : sudo $DATA_DIR/update.sh apply
                    A pending update drops a marker at $DATA_DIR/update-available.
  Diagnostics     : sudo k3s kubectl -n $NAMESPACE get pods
+ Uninstall       : sudo $DATA_DIR/uninstall.sh   (KEEP_MODELS=1 to keep models)
  Security        : $DATA_DIR is 0700 (root-only); the kubeconfig at
                    $KUBECONFIG_PATH is 0600 — use sudo to inspect.
 
