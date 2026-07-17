@@ -242,6 +242,7 @@ lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
 update.sh                             update checker/applier (check | apply | install-units); run by the daily timer + app triggers
+uninstall.sh                          clean uninstaller — reverses install.sh (systemd units, vLLM stack, k3s, DATA_DIR, …)
 channel.json                          fleet release manifest (chart_version / app_version / vllm_image) polled by update.sh
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
@@ -319,6 +320,39 @@ sudo helm upgrade drive oci://ghcr.io/scriptor-group/chart/drive \
 
 **Note on `nvidia-smi` on GB10**: with unified memory, the `memory.used/free`
 fields return `N/A`. To monitor memory pressure, use `free -h` on the host.
+
+### Uninstall
+
+[`uninstall.sh`](uninstall.sh) reverses everything `install.sh` created, in the
+opposite order: the systemd units, the two generated `/usr/local/bin` helper
+scripts, the vLLM Docker stack, the k3s cluster (via `k3s-uninstall.sh` — which
+takes the app, cert-manager, the sandbox namespace and all PVCs with it), the
+`suite0` stable-IP interface, the CA copy, and `/opt/suite366` **including the
+downloaded models**. It is idempotent and best-effort, so re-running it (or
+running it on a partial install) is safe.
+
+```bash
+curl -fsSL https://get.suite366.ai/uninstall.sh | sudo ASSUME_YES=1 bash
+# or, from a checkout:
+sudo ./uninstall.sh          # prompts for confirmation (type 'yes')
+```
+
+Options (environment variables, like the installer):
+
+| Var | Effect |
+| --- | --- |
+| `ASSUME_YES=1`  | skip the confirmation prompt (**required** for `curl \| bash`, which has no TTY) |
+| `KEEP_MODELS=1` | remove `/opt/suite366` but keep the model cache (`…/models`), so a re-install doesn't re-download 15+ GiB |
+| `KEEP_DATA=1`   | leave `/opt/suite366` entirely untouched (models + config + certs) |
+| `KEEP_K3S=1`    | keep k3s + Helm; remove only the Suite 366 workloads (helm release, namespaces, cert-manager) |
+| `PRUNE_IMAGES=1`| also remove the vLLM + nginx Docker images (several GiB) |
+
+It deliberately leaves shared/system-level things alone (Docker, the NVIDIA
+container toolkit, `/etc/cdi/nvidia.yaml`, the `avahi-daemon` package, the Helm
+client); the run ends with a summary listing how to remove those by hand. If
+you installed with non-default values (`DATA_DIR`, `NAMESPACE`, `SUITE_IFACE`,
+…), pass the same overrides to `uninstall.sh` — it also reads the install-time
+identity recorded in `/opt/suite366/update.env`.
 
 ## Survival across reboots
 

@@ -14,6 +14,12 @@ setup_update_timer() {
   fetch "update.sh" > "$DATA_DIR/update.sh"
   chmod 0700 "$DATA_DIR/update.sh"
 
+  # Stage the uninstaller alongside update.sh so the box can be cleanly torn
+  # down offline + interactively (`sudo $DATA_DIR/uninstall.sh`), without
+  # re-fetching. 0700 — it's destructive and lives in the root-only $DATA_DIR.
+  fetch "uninstall.sh" > "$DATA_DIR/uninstall.sh"
+  chmod 0700 "$DATA_DIR/uninstall.sh"
+
   # Config consumed by update.sh both on manual runs (sourced) and via the
   # systemd unit (EnvironmentFile). 0600 — it just carries non-secret config,
   # but lives in the root-only $DATA_DIR anyway.
