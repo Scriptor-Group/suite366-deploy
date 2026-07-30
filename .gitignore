@@ -3,6 +3,15 @@
 .env.*
 !.env.example
 
+# Package signing keys. tools/gen-package-key.sh writes <basename>.key/.pub and
+# is easy to run in the checkout by accident; this repo is PUBLIC and the private
+# half is the root of trust for every appliance, so neither belongs here. The
+# private key lives in the vault and in CI as a secret, the public half is a repo
+# VARIABLE and is deployed to appliances — never a tracked file.
+*.key
+*.pem
+package-release*.pub
+
 # Install directory created by install.sh when run in-place
 /suite366/
 
