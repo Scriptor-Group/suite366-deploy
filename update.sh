@@ -222,8 +222,14 @@ EOF
 read_current_state() {
   # helm list reports the chart as "<chart-name>-<version>" (e.g. drive-0.7.0);
   # grab the trailing version (first char a digit) regardless of the chart name.
+  # `|| true` is load-bearing, not defensive noise: under `set -euo pipefail` an
+  # assignment takes the pipeline's status, so a `helm list` that cannot reach the
+  # cluster killed this script HERE — silently, exit 1, no output — and the warn
+  # below plus the values.yaml fallback further down were unreachable code. That
+  # is the degraded box this whole offline path exists for: k3s down, a verified
+  # USB package waiting, and `check` dying before it can report it.
   cur_chart="$(helm list -n "$NAMESPACE" --filter "^${RELEASE}$" -o json 2>/dev/null \
-    | sed -n 's/.*"chart":"[^"]*-\([0-9][^"]*\)".*/\1/p' | head -1)"
+    | sed -n 's/.*"chart":"[^"]*-\([0-9][^"]*\)".*/\1/p' | head -1 || true)"
   [[ -n "$cur_chart" ]] || warn "Could not read current chart version (release '$RELEASE' in ns '$NAMESPACE')."
 
   cur_vllm=""
@@ -236,7 +242,7 @@ read_current_state() {
   # the cluster is unreadable.
   cur_app="$(kc -n "$NAMESPACE" get deploy \
     -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null \
-    | sed -n 's|.*/suite-366:||p' | head -1)"
+    | sed -n 's|.*/suite-366:||p' | head -1 || true)"
   if [[ -z "$cur_app" && -f "$DATA_DIR/values.yaml" ]]; then
     cur_app="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" | head -1)"
     [[ -n "$cur_app" ]] && warn "App version read from values.yaml pin (cluster unreadable) — may be ahead of the running pod."
