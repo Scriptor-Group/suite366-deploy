@@ -178,24 +178,43 @@ livekit:
       issuerName: suite366-local-ca
       issuerKind: ClusterIssuer
 
-# --- Appliance update bridge (host <-> app) ----------------------------------
-# @DATA_DIR@/updates on the host is shared with the drive-app pod: update.sh
-# publishes state.json / apply.json there, and the app drops trigger files
-# (check-requested / apply-requested) that systemd .path units pick up to run
-# update.sh — this powers the "update available" banner + the update button in
-# the admin UI. Uses the chart's generic extraEnv/extraVolumes (no chart
-# change). install.sh creates the dir root:1001 mode 0770 (the app container
-# runs as uid/gid 1001; k8s does not fsGroup-chown hostPath volumes).
+# --- Appliance host <-> app bridges ------------------------------------------
+# Two hostPath dirs are shared with the drive-app pod:
+#
+#  @DATA_DIR@/updates  -> /appliance-update  (APPLIANCE_UPDATE_DIR)
+#    update.sh publishes state.json / apply.json there, and the app drops
+#    trigger files (check-requested / apply-requested) that systemd .path units
+#    pick up to run update.sh — this powers the "update available" banner + the
+#    update button in the admin UI.
+#
+#  @DATA_DIR@/support  -> /support-access    (SUPPORT_ACCESS_DIR)
+#    Remote-support access toggle, used on RENTED fleet appliances only. The
+#    host agent publishes state.json (grant + pre-arm state) and the app drops
+#    grant-requested / revoke-requested / prearm-requested. On a customer-run
+#    appliance the dir stays empty, state.json never appears, and the app hides
+#    the feature entirely — so this single values.yaml serves both products.
+#
+# Both use the chart's generic extraEnv/extraVolumes (no chart change).
+# install.sh creates the dirs root:1001 mode 0770 (the app container runs as
+# uid/gid 1001; k8s does not fsGroup-chown hostPath volumes).
 extraEnv:
   - name: APPLIANCE_UPDATE_DIR
     value: /appliance-update
+  - name: SUPPORT_ACCESS_DIR
+    value: /support-access
 extraVolumeMounts:
   - name: appliance-update
     mountPath: /appliance-update
+  - name: support-access
+    mountPath: /support-access
 extraVolumes:
   - name: appliance-update
     hostPath:
       path: @DATA_DIR@/updates
+      type: DirectoryOrCreate
+  - name: support-access
+    hostPath:
+      path: @DATA_DIR@/support
       type: DirectoryOrCreate
 
 # Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,
