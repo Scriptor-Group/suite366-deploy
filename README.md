@@ -241,9 +241,14 @@ lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
 lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
-update.sh                             update checker/applier (check | apply | install-units); run by the daily timer + app triggers
+update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
+tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
+tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
+tools/gen-package-key.sh              generate the Ed25519 keypair that signs packages AND channels
+tools/test-package-verify.sh          self-test: real signatures, real tampering, no hardware
 uninstall.sh                          clean uninstaller — reverses install.sh (systemd units, vLLM stack, k3s, DATA_DIR, …)
-channel.json                          fleet release manifest (chart_version / app_version / vllm_image) polled by update.sh
+channel.json                          fleet release manifest (chart_version / app_version / vllm_image / updater_sha256) polled by update.sh
+channel.json.sig                      Ed25519 signature over channel.json — required by any appliance holding the public key
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
 llm/tool_chat_template_gemma4.jinja   chat template required by --tool-call-parser=gemma4
@@ -287,14 +292,90 @@ picked up by systemd `.path` units (`suite366-update-check.path`,
 `suite366-update-apply.path`, installed by `update.sh install-units`). The
 apply reuses the box's install-time parameters (`values.yaml`, `llm/.env`,
 `update.env`) — nothing is re-asked. After each apply, `update.sh` refreshes
-itself from the repo and re-installs the trigger units, so the update
-mechanism itself rolls forward with regular updates (disable with
-`SELF_UPDATE=0` in `update.env`).
+itself from the repo and re-installs the trigger units, so the update mechanism
+itself rolls forward with regular updates. That refresh is signature-verified on
+any appliance holding the package public key (see *Signed channels* below);
+disable it entirely with `SELF_UPDATE=0` in `update.env`.
 
 **App version pinning**: the appliance pins the app + sandbox image tags in
 `values.yaml` (offline safety), so a bare `helm upgrade` never moves the app.
 `channel.json`'s `app_version` is what rolls the app forward: on apply,
 `update.sh` rewrites the pins to the new tag before upgrading.
+
+### Offline updates from a USB drive
+
+A site with no outbound access updates from a **signed package** instead. The
+online check is unchanged and still primary — USB is an *additional* source, and
+the two coexist: `check` tries the network and never fails fatally when it is
+unreachable, so a verified package still produces an "update available" prompt,
+and a reachable network never invalidates a staged one. `state.json` carries both
+sources plus the resolved best target (highest app version wins; online wins a tie
+since it needs no image import).
+
+Build one (needs docker + helm + the signing key):
+
+```bash
+tools/gen-package-key.sh ~/.secrets/package-release      # once, ever
+PACKAGE_PRIVATE_KEY=~/.secrets/package-release.key \
+  tools/build-offline-package.sh --arch arm64 --min-from 1.8.0
+```
+
+Copy the resulting `suite366-update-<version>/` directory to the **root** of a USB
+drive, then on the appliance:
+
+```bash
+sudo /opt/suite366/update.sh scan-usb /media/usb   # verify + stage; applies nothing
+```
+
+The admin then confirms in the app exactly as if the box were online. Deploy the
+**public** half of the key to each appliance as
+`/opt/suite366/package-release.pub` (`PACKAGE_PUBLIC_KEY`); with no key installed
+every package is refused, which is the right default.
+
+Verification is **all-or-nothing**: one Ed25519 signature over a `SHA256SUMS` that
+covers every file in the package, `manifest.json` included. One bad byte anywhere,
+a foreign signature, a downgrade, or an unmet `min_from_version` and the whole
+package is refused — and the refusal is shown in the admin UI, not just written to
+the journal. A verified package is copied off the drive before use, so the key can
+be unplugged and a mid-copy removal cannot truncate an image tar.
+
+```bash
+tools/test-package-verify.sh   # 18 assertions against real signatures + tampering
+```
+
+### Signed channels
+
+TLS proves you reached the right host. It says nothing about who wrote the file —
+and `channel.json` decides which chart version and which vLLM image every
+appliance is told to run, while `update.sh` is fetched over the same channel and
+then runs **as root** on the next apply.
+
+So the channel is signed, and one signature covers both: `channel.json` carries
+`updater_sha256`, which the signature protects, so verifying the manifest
+transitively verifies the updater.
+
+```bash
+PACKAGE_PRIVATE_KEY=~/.secrets/package-release.key tools/sign-channel.sh
+# -> recomputes updater_sha256 from update.sh, signs channel.json,
+#    and verifies its own output the way an appliance will
+git add channel.json channel.json.sig && git commit
+```
+
+Behaviour on the appliance is **graduated**, so the public one-command install is
+unchanged:
+
+| `package-release.pub` on the box | Channel manifest | `update.sh` refresh |
+|---|---|---|
+| present (fleet) | must be signed by our key, else **refused** | must match the signed `updater_sha256`, else **refused** |
+| absent (default) | TLS-only, as before | TLS-only, as before |
+
+Both strict paths **fail closed**: a bad signature makes the manifest unusable
+rather than merely suspicious, and a verified USB package can still carry the box
+forward. The practical consequence is that forgetting to re-sign does not break the
+fleet, it *stops* it — every box keeps its current version silently. The
+`channel-signature` workflow exists to catch that before it ships, and
+`tools/test-package-verify.sh` covers the refusal paths (23 assertions: foreign
+key, tampering after signing, missing signature, stale hash).
 
 By default each box polls the `channel.json` shipped in this repo, so it tracks
 the releases published here. Point a box at a manifest you control with

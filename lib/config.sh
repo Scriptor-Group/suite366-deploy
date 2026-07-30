@@ -79,6 +79,14 @@ EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"
 MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
+# Ed25519 PUBLIC key that signs OFFLINE update packages (built by
+# tools/build-offline-package.sh). Path to a PEM file — when the file is
+# ABSENT, `update.sh scan-usb` refuses every package, which is the correct
+# default for a box with no offline-update entitlement. Deployments that want
+# USB updates drop the key there (suite366-fleet does it at install time).
+# Separate keypair from the LICENSE key: different lifecycle, different blast
+# radius, and a license key must never acquire code-execution meaning.
+PACKAGE_PUBLIC_KEY="${PACKAGE_PUBLIC_KEY:-$DATA_DIR/package-release.pub}"
 ASSUME_YES="${ASSUME_YES:-0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 

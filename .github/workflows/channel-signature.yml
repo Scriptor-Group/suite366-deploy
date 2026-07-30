@@ -1,0 +1,73 @@
+name: Channel signature
+
+# An appliance holding our public key REFUSES a channel manifest that is not
+# signed by it, and refuses an update.sh whose hash does not match the
+# `updater_sha256` inside that signed manifest. Both are fail-closed, which is the
+# right behaviour — and it means a forgotten `tools/sign-channel.sh` does not break
+# the fleet, it STOPS it: every box quietly keeps its current version and nobody
+# notices for weeks.
+#
+# So the two things that must never diverge are checked here, on every change:
+#   1. channel.json.sig actually verifies against channel.json
+#   2. channel.json's updater_sha256 matches the update.sh in this tree
+#
+# Needs only the PUBLIC key, so it lives in a repo variable rather than a secret:
+#   Settings > Secrets and variables > Actions > Variables > PACKAGE_PUBLIC_KEY_PEM
+on:
+  push:
+    paths: ['channel.json', 'channel.json.sig', 'update.sh']
+  pull_request:
+    paths: ['channel.json', 'channel.json.sig', 'update.sh']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: updater_sha256 matches update.sh
+        run: |
+          set -euo pipefail
+          bash -n update.sh
+          want="$(sed -n 's/.*"updater_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' channel.json | head -1)"
+          got="$(sha256sum update.sh | awk '{print $1}')"
+          if [[ -z "$want" ]]; then
+            echo "::error::channel.json has an empty updater_sha256 — run tools/sign-channel.sh"
+            exit 1
+          fi
+          if [[ "$want" != "$got" ]]; then
+            echo "::error::updater_sha256 is stale. channel.json pins $want but update.sh hashes to $got."
+            echo "::error::Run: PACKAGE_PRIVATE_KEY=… tools/sign-channel.sh   and commit both files."
+            exit 1
+          fi
+          echo "updater_sha256 matches ($got)"
+
+      - name: channel.json.sig verifies
+        env:
+          PACKAGE_PUBLIC_KEY_PEM: ${{ vars.PACKAGE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PACKAGE_PUBLIC_KEY_PEM:-}" ]]; then
+            echo "::warning::PACKAGE_PUBLIC_KEY_PEM variable not set — signature not verified."
+            echo "::warning::Set it so a stale signature cannot reach the fleet."
+            exit 0
+          fi
+          if [[ ! -f channel.json.sig ]]; then
+            echo "::error::channel.json.sig is missing. Appliances holding the key will refuse this channel."
+            exit 1
+          fi
+          printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > /tmp/package.pub
+          if ! openssl pkeyutl -verify -rawin -pubin -inkey /tmp/package.pub \
+                 -sigfile channel.json.sig -in channel.json >/dev/null 2>&1; then
+            echo "::error::channel.json.sig does NOT verify against channel.json."
+            echo "::error::Every appliance with the key would refuse this channel. Re-sign before merging."
+            exit 1
+          fi
+          echo "signature verifies"
+
+      - name: verifier self-test
+        run: tools/test-package-verify.sh

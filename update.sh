@@ -15,11 +15,27 @@
 # the fleet should run": you push channel.json -> the fleet rolls out. No
 # per-box edits, no in-the-blind tracking of `latest`.
 #
+# TWO SOURCES, never exclusive:
+#   • ONLINE — the channel manifest over HTTPS. The normal path.
+#   • USB    — a signed offline package (built by tools/build-offline-package.sh)
+#     found on a removable drive. For boxes whose owner cut outbound access.
+# `check` tries the network and NEVER dies when it is unreachable: a verified
+# USB package still produces an "update available" state, and conversely a
+# reachable network never invalidates a staged package. state.json carries both
+# sources plus the resolved best target (highest app version wins; online wins a
+# tie since it needs no image import).
+#
 # Modes:
-#   check         (default) fetch manifest, compare, write marker + state.json.
-#                 No changes.
+#   check         (default) fetch manifest, load any staged offline package,
+#                 compare, write marker + state.json. No changes.
 #   apply         helm upgrade (+ vLLM image / app image pin updates), then a
-#                 health check. Idempotent (no-op if already up to date).
+#                 health check. Idempotent (no-op if already up to date). Uses
+#                 the resolved source: OCI chart pull, or the staged package's
+#                 local chart + image tars when that is the better target.
+#   scan-usb DIR  verify a signed offline package under DIR, stage it into
+#                 $DATA_DIR/offline/pkg, then refresh state.json so the app
+#                 shows the same "update available" prompt as when online.
+#                 Applies NOTHING (an admin still confirms in the UI).
 #   install-units (re)install the systemd .path units that let the app UI
 #                 trigger check/apply, and prepare $DATA_DIR/updates. Called by
 #                 install.sh and after every apply (fleet convergence).
@@ -40,7 +56,11 @@
 #   KUBECONFIG_PATH /etc/rancher/k3s/k3s.yaml
 #   UPDATE_WEBHOOK  optional URL — POSTed {"text":"…"} on update-available
 #   SELF_URL        where to refresh update.sh from after an apply (default:
-#                   sibling of MANIFEST_URL). Set SELF_UPDATE=0 to disable.
+#                   sibling of MANIFEST_URL). Set SELF_UPDATE=0 to disable
+#                   (fleet boxes do: their updater only moves with a SIGNED
+#                   package, never with an unauthenticated HTTPS fetch).
+#   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying offline packages.
+#                   Absent file => every offline package is refused.
 # =============================================================================
 set -euo pipefail
 
@@ -52,6 +72,9 @@ DATA_DIR="${DATA_DIR:-/opt/suite366}"
 [[ -f "$DATA_DIR/update.env" ]] && . "$DATA_DIR/update.env"
 
 MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/channel.json}"
+# Detached Ed25519 signature over channel.json, published beside it. Required on
+# any appliance that holds PACKAGE_PUBLIC_KEY; ignored on one that does not.
+MANIFEST_SIG_URL="${MANIFEST_SIG_URL:-$MANIFEST_URL.sig}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 NAMESPACE="${NAMESPACE:-suite366}"
 RELEASE="${RELEASE:-drive}"
@@ -60,6 +83,17 @@ UPDATE_WEBHOOK="${UPDATE_WEBHOOK:-}"
 SELF_UPDATE="${SELF_UPDATE:-1}"
 SELF_URL="${SELF_URL:-${MANIFEST_URL%/*}/update.sh}"
 MARKER="$DATA_DIR/update-available"
+
+# --- Offline (USB) package source ---------------------------------------------
+# A verified package is COPIED off the removable drive into $OFFLINE_PKG so the
+# key can be pulled out before an admin confirms the update in the UI, and so a
+# mid-apply unplug cannot truncate an image tar. $OFFLINE_SRC records the
+# outcome (including rejections, which have no staged content to speak for
+# them) and is the only thing `check` needs to read.
+PACKAGE_PUBLIC_KEY="${PACKAGE_PUBLIC_KEY:-$DATA_DIR/package-release.pub}"
+OFFLINE_DIR="$DATA_DIR/offline"
+OFFLINE_PKG="$OFFLINE_DIR/pkg"
+OFFLINE_SRC="$OFFLINE_DIR/source.json"
 
 # Shared dir with the drive-app pod (hostPath). uid/gid 1001 = runAsUser of
 # the drive-app container in the chart.
@@ -118,15 +152,20 @@ consume_trigger() { # consume_trigger FILENAME
 write_state_json() { # write_state_json AVAILABLE(0|1)
   ensure_updates_dir
   local avail=false; [[ "$1" == "1" ]] && avail=true
+  local reachable=false; [[ "${online_reachable:-0}" == "1" ]] && reachable=true
   local tmp="$STATE_JSON.tmp"
+  # schema 2 adds `source` + `sources` (online / usb). Readers tolerating only
+  # schema 1 keep working: every field they know is unchanged and still carries
+  # the RESOLVED best-of-both target, not just the online one.
   cat > "$tmp" <<EOF
 {
-  "schema": 1,
+  "schema": 2,
   "channel": "$(json_esc "${channel:-}")",
   "checked_at": "$(now_utc)",
   "update_available": $avail,
   "summary": "$(json_esc "${summary_line:-}")",
   "notes": "$(json_esc "${notes:-}")",
+  "source": "$(json_esc "${UPDATE_SOURCE:-none}")",
   "current": {
     "chart": "$(json_esc "${cur_chart:-}")",
     "app": "$(json_esc "${cur_app:-}")",
@@ -136,6 +175,24 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
     "chart": "$(json_esc "${want_chart:-}")",
     "app": "$(json_esc "${want_app:-}")",
     "vllm": "$(json_esc "${want_vllm:-}")"
+  },
+  "sources": {
+    "online": {
+      "reachable": $reachable,
+      "error": "$(json_esc "${online_error:-}")",
+      "chart": "$(json_esc "${online_chart:-}")",
+      "app": "$(json_esc "${online_app:-}")",
+      "vllm": "$(json_esc "${online_vllm:-}")"
+    },
+    "usb": {
+      "status": "$(json_esc "${usb_status:-none}")",
+      "error": "$(json_esc "${usb_error:-}")",
+      "label": "$(json_esc "${usb_label:-}")",
+      "chart": "$(json_esc "${usb_chart:-}")",
+      "app": "$(json_esc "${usb_app:-}")",
+      "vllm": "$(json_esc "${usb_vllm:-}")",
+      "verified_at": "$(json_esc "${usb_verified_at:-}")"
+    }
   }
 }
 EOF
@@ -186,25 +243,184 @@ read_current_state() {
   fi
 }
 
-# --- Target state from the manifest -------------------------------------------
-fetch_manifest() {
+# --- Version comparison --------------------------------------------------------
+# True when A is strictly newer than B (dotted numeric versions; `sort -V`
+# handles 1.8.9 < 1.8.10 correctly, which a string compare does not).
+ver_gt() { # ver_gt A B
+  [[ -n "$1" ]] || return 1
+  [[ -n "$2" ]] || return 0
+  [[ "$1" != "$2" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+}
+
+# --- Target state: source 1, the online channel manifest ------------------------
+# Soft failure by design: a box whose owner cut outbound access must still be
+# able to update from a signed USB package, so an unreachable manifest is
+# RECORDED, not fatal.
+fetch_manifest_online() {
+  online_reachable=0; online_error=""; online_signed=0
+  online_chart=""; online_app=""; online_vllm=""; online_channel=""; online_notes=""
+  online_updater_sha=""
   log "Fetching channel manifest"
   info "$MANIFEST_URL"
-  manifest="$(curl -fsSL -m 20 "$MANIFEST_URL")" || die "Manifest unreachable: $MANIFEST_URL"
-  channel="$(json_get channel        <<<"$manifest")"
-  want_chart="$(json_get chart_version <<<"$manifest")"
-  want_vllm="$(json_get vllm_image     <<<"$manifest")"
-  want_app="$(json_get app_version     <<<"$manifest")"
-  notes="$(json_get notes              <<<"$manifest")"
-  [[ -n "$want_chart" ]] || die "Manifest has no chart_version: $MANIFEST_URL"
 
+  # To a file, not a variable: a signature is over exact bytes, and command
+  # substitution strips trailing newlines.
+  local tmp; tmp="$(mktemp)"
+  if ! curl -fsSL -m 20 "$MANIFEST_URL" -o "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    online_error="manifest unreachable ($MANIFEST_URL)"
+    warn "$online_error — offline package (if any) still applies."
+    return 1
+  fi
+
+  if ! verify_manifest_signature "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local manifest; manifest="$(cat "$tmp")"
+  rm -f "$tmp"
+  online_channel="$(json_get channel        <<<"$manifest")"
+  online_chart="$(json_get chart_version    <<<"$manifest")"
+  online_vllm="$(json_get vllm_image        <<<"$manifest")"
+  online_app="$(json_get app_version        <<<"$manifest")"
+  online_notes="$(json_get notes            <<<"$manifest")"
+  online_updater_sha="$(json_get updater_sha256 <<<"$manifest")"
+  if [[ -z "$online_chart" ]]; then
+    online_error="manifest has no chart_version"
+    warn "$online_error ($MANIFEST_URL)"
+    return 1
+  fi
+  online_reachable=1
+  return 0
+}
+
+# Whoever controls MANIFEST_URL decides which chart version and which vLLM image
+# every appliance is told to run. TLS proves we reached the right HOST; it says
+# nothing about whether the file is ours. So when the appliance holds our public
+# key, the manifest must be signed by it — and a bad signature makes the manifest
+# UNUSABLE rather than merely suspicious (fail closed; a verified USB package can
+# still carry the box forward).
+#
+# Graduated on purpose: an appliance with no key installed keeps the old
+# TLS-only behaviour, so the public one-command install is unchanged. Fleet boxes
+# always have the key, so they are always strict.
+verify_manifest_signature() { # verify_manifest_signature FILE
+  local f="$1"
+  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
+    # Said once, not per-run-per-line: this is the documented posture of the
+    # public product, not a misconfiguration.
+    info "manifest       : unsigned (no $PACKAGE_PUBLIC_KEY — TLS-only trust)"
+    return 0
+  fi
+  have openssl || { online_error="openssl missing, cannot verify the manifest signature"; warn "$online_error"; return 1; }
+
+  local sig; sig="$(mktemp)"
+  if ! curl -fsSL -m 20 "$MANIFEST_SIG_URL" -o "$sig" 2>/dev/null || [[ ! -s "$sig" ]]; then
+    rm -f "$sig"
+    online_error="manifest signature unavailable ($MANIFEST_SIG_URL)"
+    warn "$online_error — refusing the manifest (this appliance requires signed channels)."
+    return 1
+  fi
+  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
+        -sigfile "$sig" -in "$f" >/dev/null 2>&1; then
+    rm -f "$sig"
+    online_error="manifest signature INVALID — not signed by this appliance's key"
+    warn "$online_error"
+    warn "  Refusing it. Either the channel was tampered with, or it was published without signing."
+    return 1
+  fi
+  rm -f "$sig"
+  online_signed=1
+  info "manifest       : signature verified"
+  return 0
+}
+
+# --- Target state: source 2, a staged offline package --------------------------
+load_offline_source() {
+  usb_status=none; usb_error=""; usb_label=""
+  usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_channel=""; usb_verified_at=""
+  [[ -f "$OFFLINE_SRC" ]] || return 0
+  local src; src="$(cat "$OFFLINE_SRC" 2>/dev/null)" || return 0
+  usb_status="$(json_get status      <<<"$src")"
+  usb_error="$(json_get error        <<<"$src")"
+  usb_label="$(json_get label        <<<"$src")"
+  usb_channel="$(json_get channel    <<<"$src")"
+  usb_chart="$(json_get chart_version <<<"$src")"
+  usb_app="$(json_get app_version    <<<"$src")"
+  usb_vllm="$(json_get vllm_image    <<<"$src")"
+  usb_notes="$(json_get notes        <<<"$src")"
+  usb_verified_at="$(json_get verified_at <<<"$src")"
+  usb_status="${usb_status:-none}"
+  # A staged package whose content vanished (manual cleanup, disk wipe) must not
+  # keep advertising itself.
+  if [[ "$usb_status" == "ready" && ! -f "$OFFLINE_PKG/manifest.json" ]]; then
+    usb_status=none; usb_error="staged package missing"
+  fi
+}
+
+write_offline_source() { # write_offline_source STATUS ERROR
+  mkdir -p "$OFFLINE_DIR"; chmod 0700 "$OFFLINE_DIR"
+  local tmp="$OFFLINE_SRC.tmp"
+  cat > "$tmp" <<EOF
+{
+  "schema": 1,
+  "status": "$(json_esc "$1")",
+  "error": "$(json_esc "$2")",
+  "label": "$(json_esc "${usb_label:-}")",
+  "channel": "$(json_esc "${usb_channel:-}")",
+  "chart_version": "$(json_esc "${usb_chart:-}")",
+  "app_version": "$(json_esc "${usb_app:-}")",
+  "vllm_image": "$(json_esc "${usb_vllm:-}")",
+  "notes": "$(json_esc "${usb_notes:-}")",
+  "verified_at": "$(json_esc "${usb_verified_at:-}")"
+}
+EOF
+  chmod 0600 "$tmp"; mv -f "$tmp" "$OFFLINE_SRC"
+  usb_status="$1"; usb_error="$2"
+}
+
+# --- Resolve the best target across both sources -------------------------------
+# Highest app version wins. On a tie the ONLINE source wins: same result, no
+# multi-GB image import. A source is only a candidate if it is actually newer
+# than what runs — so an online apply that overtakes a staged USB package
+# silently retires it instead of proposing a downgrade.
+resolve_target() {
+  local online_ok=0 usb_ok=0
+  [[ "${online_reachable:-0}" == "1" ]] && online_ok=1
+  [[ "${usb_status:-none}" == "ready" ]] && usb_ok=1
+
+  UPDATE_SOURCE=none
+  channel=""; want_chart=""; want_app=""; want_vllm=""; notes=""
+
+  if [[ "$online_ok" == 1 && "$usb_ok" == 1 ]]; then
+    if ver_gt "$usb_app" "$online_app"; then UPDATE_SOURCE=usb; else UPDATE_SOURCE=online; fi
+  elif [[ "$online_ok" == 1 ]]; then UPDATE_SOURCE=online
+  elif [[ "$usb_ok" == 1 ]]; then UPDATE_SOURCE=usb
+  fi
+
+  case "$UPDATE_SOURCE" in
+    online) channel="$online_channel"; want_chart="$online_chart"
+            want_app="$online_app";    want_vllm="$online_vllm"; notes="$online_notes" ;;
+    usb)    channel="${usb_channel:-offline}"; want_chart="$usb_chart"
+            want_app="$usb_app";       want_vllm="$usb_vllm";    notes="$usb_notes" ;;
+  esac
+}
+
+compute_diffs() {
+  chart_diff=0; vllm_diff=0; app_diff=0; summary_line=""
+  if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
+    warn "No usable update source (network unreachable, no verified offline package)."
+    return 0
+  fi
+  info "source         : $UPDATE_SOURCE"
   info "channel        : ${channel:-?}"
-  info "chart  running : ${cur_chart:-unknown}    target : $want_chart"
+  info "chart  running : ${cur_chart:-unknown}    target : ${want_chart:-?}"
   info "app    running : ${cur_app:-unknown}    target : ${want_app:-unchanged}"
   info "vLLM   running : ${cur_vllm:-unknown}    target : ${want_vllm:-unchanged}"
 
-  chart_diff=0; vllm_diff=0; app_diff=0
-  [[ -n "$cur_chart" && "$cur_chart" != "$want_chart" ]] && chart_diff=1
+  [[ -n "$cur_chart" && -n "$want_chart" && "$cur_chart" != "$want_chart" ]] && chart_diff=1
   [[ -n "$want_vllm" && -n "$cur_vllm" && "$cur_vllm" != "$want_vllm" ]] && vllm_diff=1
   [[ -n "$want_app"  && -n "$cur_app"  && "$cur_app"  != "$want_app"  ]] && app_diff=1
 
@@ -213,14 +429,183 @@ fetch_manifest() {
   [[ "$chart_diff" == 1 ]] && parts+=("chart ${cur_chart:-?} -> $want_chart")
   [[ "$app_diff"   == 1 ]] && parts+=("app ${cur_app:-?} -> $want_app")
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
+  [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
+}
+
+# Full pipeline shared by check / apply / scan-usb.
+survey() {
+  read_current_state
+  fetch_manifest_online || true
+  load_offline_source
+  resolve_target
+  compute_diffs
 }
 
 up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 ]]; }
 
+# --- Offline package: verification + staging -----------------------------------
+# Layout produced by tools/build-offline-package.sh:
+#   manifest.json          flat JSON, same keys as channel.json + min_from_version
+#   SHA256SUMS             covers EVERY other file, manifest.json included
+#   SHA256SUMS.sig         raw Ed25519 signature over SHA256SUMS
+#   chart/<name>-<ver>.tgz
+#   images/*.tar           containerd/docker image exports
+#   scripts/update.sh      the updater this package expects (see self_update)
+#
+# ONE signature, over SHA256SUMS. Everything else derives its authenticity from
+# a checksum line in that signed file — so there is never a question of which
+# signature is authoritative, and a file the builder forgot to list simply is
+# not trusted. Verification is all-or-nothing: one bad byte anywhere and the
+# whole package is refused.
+pkg_error=""
+
+# Accept either a package root or a drive whose top level holds exactly one
+# (the "plug the key in and we find it" case: `./` on the drive).
+pkg_root() { # pkg_root MOUNT  -> prints the package root
+  local m="$1" d
+  [[ -f "$m/manifest.json" ]] && { printf '%s' "$m"; return 0; }
+  for d in "$m"/suite366-update-*/; do
+    [[ -f "$d/manifest.json" ]] && { printf '%s' "${d%/}"; return 0; }
+  done
+  return 1
+}
+
+pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
+  local root="$1" f
+  pkg_error=""
+  pkg_chart=""; pkg_app=""; pkg_vllm=""; pkg_channel=""; pkg_notes=""; pkg_min_from=""
+
+  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
+    pkg_error="no package signing key on this appliance ($PACKAGE_PUBLIC_KEY)"; return 1
+  fi
+  for f in manifest.json SHA256SUMS SHA256SUMS.sig; do
+    [[ -s "$root/$f" ]] || { pkg_error="incomplete package: $f missing"; return 1; }
+  done
+
+  # 1. Is the checksum list itself authentic?
+  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
+        -sigfile "$root/SHA256SUMS.sig" -in "$root/SHA256SUMS" >/dev/null 2>&1; then
+    pkg_error="signature check failed — package not signed by this appliance's key"; return 1
+  fi
+  # 2. Is the manifest actually covered by it? (a manifest outside SHA256SUMS
+  #    would be attacker-controlled while everything else verified fine)
+  if ! grep -qE '[[:space:]]\*?\./?manifest\.json$' "$root/SHA256SUMS"; then
+    pkg_error="manifest.json is not covered by the signed SHA256SUMS"; return 1
+  fi
+  # 3. Does every listed file match?
+  if ! ( cd "$root" && sha256sum -c --strict --quiet SHA256SUMS ) >/dev/null 2>&1; then
+    pkg_error="checksum mismatch — package corrupt or truncated"; return 1
+  fi
+
+  local mf; mf="$(cat "$root/manifest.json")"
+  pkg_channel="$(json_get channel        <<<"$mf")"
+  pkg_chart="$(json_get chart_version    <<<"$mf")"
+  pkg_app="$(json_get app_version        <<<"$mf")"
+  pkg_vllm="$(json_get vllm_image        <<<"$mf")"
+  pkg_notes="$(json_get notes            <<<"$mf")"
+  pkg_min_from="$(json_get min_from_version <<<"$mf")"
+  [[ -n "$pkg_chart" && -n "$pkg_app" ]] \
+    || { pkg_error="manifest lacks chart_version / app_version"; return 1; }
+
+  # Exactly one chart archive, or `helm upgrade` would be ambiguous.
+  local charts=( "$root"/chart/*.tgz )
+  [[ -f "${charts[0]:-}" ]] || { pkg_error="no chart archive under chart/"; return 1; }
+  [[ ${#charts[@]} -eq 1 ]] || { pkg_error="${#charts[@]} chart archives found, expected 1"; return 1; }
+
+  # 4. Version policy. A strict downgrade is refused outright: rolling the app
+  #    backwards past a Prisma migration is not recoverable from the UI.
+  if [[ -n "$cur_app" ]] && ver_gt "$cur_app" "$pkg_app"; then
+    pkg_error="package targets app $pkg_app but $cur_app is installed (downgrade refused)"; return 1
+  fi
+  if [[ -n "$pkg_min_from" && -n "$cur_app" ]] && ver_gt "$pkg_min_from" "$cur_app"; then
+    pkg_error="package requires app >= $pkg_min_from first (installed: $cur_app)"; return 1
+  fi
+  return 0
+}
+
+# Copy a verified package off the removable drive, then re-verify the COPY: a
+# key pulled mid-copy, or a drive that lies about writes, both show up here.
+pkg_stage() { # pkg_stage ROOT
+  local root="$1" need avail
+  # `|| true` guards: a failing pipeline inside an assignment would abort the
+  # whole script under `set -e` (see the same note in lib/preflight.sh).
+  need="$(du -sk "$root" 2>/dev/null | cut -f1 || true)"; need="${need:-0}"
+  avail="$(df -Pk "$DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)"; avail="${avail:-0}"
+  if (( avail < need * 12 / 10 )); then
+    pkg_error="not enough free space in $DATA_DIR ($((need/1024)) MiB needed, $((avail/1024)) MiB free)"
+    return 1
+  fi
+  mkdir -p "$OFFLINE_DIR"; chmod 0700 "$OFFLINE_DIR"
+  rm -rf "$OFFLINE_PKG.new"
+  log "Staging package into $OFFLINE_PKG ($((need/1024)) MiB)"
+  cp -a "$root/." "$OFFLINE_PKG.new/" || { pkg_error="copy from the drive failed"; return 1; }
+  if ! ( cd "$OFFLINE_PKG.new" && sha256sum -c --strict --quiet SHA256SUMS ) >/dev/null 2>&1; then
+    rm -rf "$OFFLINE_PKG.new"
+    pkg_error="staged copy failed verification — drive removed mid-copy?"; return 1
+  fi
+  rm -rf "$OFFLINE_PKG"
+  mv "$OFFLINE_PKG.new" "$OFFLINE_PKG"
+  return 0
+}
+
+do_scan_usb() { # do_scan_usb MOUNT
+  local mount="${1:-}"
+  [[ -n "$mount" ]] || die "scan-usb needs a directory (usage: update.sh scan-usb /mnt/key)"
+  [[ -d "$mount" ]] || die "not a directory: $mount"
+
+  read_current_state
+  load_offline_source
+
+  local root
+  if ! root="$(pkg_root "$mount")"; then
+    info "no offline package found under $mount — nothing to do."
+    return 0
+  fi
+  log "Offline package found: $root"
+  usb_label="$(basename "$root")"
+
+  if pkg_verify "$root"; then
+    usb_channel="$pkg_channel"; usb_chart="$pkg_chart"; usb_app="$pkg_app"
+    usb_vllm="$pkg_vllm";       usb_notes="$pkg_notes"
+    if pkg_stage "$root"; then
+      usb_verified_at="$(now_utc)"
+      write_offline_source ready ""
+      log "Package verified and staged: app $pkg_app, chart $pkg_chart"
+      logger -t suite366-update "offline package staged: $usb_label (app $pkg_app)" 2>/dev/null || true
+    else
+      write_offline_source rejected "$pkg_error"
+      warn "Package REJECTED: $pkg_error"
+      logger -t suite366-update "offline package rejected: $usb_label ($pkg_error)" 2>/dev/null || true
+    fi
+  else
+    # Keep the versions we could not trust out of state.json.
+    usb_channel=""; usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_verified_at=""
+    write_offline_source rejected "$pkg_error"
+    warn "Package REJECTED: $pkg_error"
+    logger -t suite366-update "offline package rejected: $usb_label ($pkg_error)" 2>/dev/null || true
+  fi
+
+  # Refresh the app-facing state either way: a rejection must be visible in the
+  # UI, not just in the journal.
+  fetch_manifest_online || true
+  load_offline_source
+  resolve_target
+  compute_diffs
+  if up_to_date; then write_state_json 0; else write_state_json 1; fi
+}
+
 # --- check (notify-only) -------------------------------------------------------
 notify() {
   consume_trigger check-requested
+  if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
+    # Neither source usable. Report it as a failed check rather than "up to
+    # date" — silently claiming health while blind is how a fleet drifts.
+    warn "Update check inconclusive: ${online_error:-no source}${usb_error:+ / USB: $usb_error}"
+    rm -f "$MARKER"
+    write_state_json 0
+    return 0
+  fi
   if up_to_date; then
     log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}, channel ${channel:-?})."
     rm -f "$MARKER"
@@ -288,6 +673,11 @@ do_apply() {
 
   consume_trigger apply-requested
 
+  if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
+    write_apply_json error "no usable update source: ${online_error:-network unreachable}${usb_error:+ / USB: $usb_error}"
+    die "Nothing to apply: no reachable channel and no verified offline package."
+  fi
+
   if up_to_date; then
     log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}) — nothing to apply."
     rm -f "$MARKER"
@@ -302,11 +692,25 @@ do_apply() {
   write_apply_json running "applying: $summary_line"
   trap apply_exit_trap EXIT
 
+  # Offline source: load every bundled image FIRST, so the helm upgrade and the
+  # compose recreate below find them locally and never reach for a registry.
+  if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+    import_package_images
+  fi
+
   if [[ "$vllm_diff" == 1 ]]; then
     log "vLLM image: $cur_vllm -> $want_vllm"
     [[ -f "$DATA_DIR/llm/.env" ]] || die "$DATA_DIR/llm/.env missing — cannot retarget vLLM image."
     sed -i "s|^VLLM_IMAGE=.*|VLLM_IMAGE=$want_vllm|" "$DATA_DIR/llm/.env"
-    if ( cd "$DATA_DIR/llm" && docker compose pull && docker compose up -d ); then
+    # Offline: the image is already loaded, so `pull` would only fail. Online:
+    # pull first so a bad tag surfaces before the containers are torn down.
+    local vllm_ok=0
+    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+      ( cd "$DATA_DIR/llm" && docker compose up -d ) && vllm_ok=1
+    else
+      ( cd "$DATA_DIR/llm" && docker compose pull && docker compose up -d ) && vllm_ok=1
+    fi
+    if [[ "$vllm_ok" == 1 ]]; then
       info "vLLM containers recreated."
     else
       warn "vLLM image update failed — check: docker logs suite366-vllm-llm"
@@ -325,8 +729,19 @@ do_apply() {
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 ]]; then
     ensure_appliance_values
     log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $want_chart, app ${cur_app:-?} -> ${want_app:-unchanged}"
-    helm upgrade "$RELEASE" "$CHART_REF" \
-      --version "$want_chart" -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
+    # Offline: the chart comes from the signed package as a local .tgz, so no
+    # `--version` (the archive IS the version) and no OCI pull.
+    local chart_args=()
+    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+      local pkg_charts=( "$OFFLINE_PKG"/chart/*.tgz )
+      [[ -f "${pkg_charts[0]:-}" ]] || die "staged package has no chart archive."
+      chart_args=( "${pkg_charts[0]}" )
+      info "chart from package: $(basename "${pkg_charts[0]}")"
+    else
+      chart_args=( "$CHART_REF" --version "$want_chart" )
+    fi
+    helm upgrade "$RELEASE" "${chart_args[@]}" \
+      -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
       --wait --timeout 15m \
       || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
   fi
@@ -335,9 +750,10 @@ do_apply() {
   kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
     || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
 
-  if [[ "$app_diff" == 1 ]]; then
+  if [[ "$app_diff" == 1 && "$UPDATE_SOURCE" != "usb" ]]; then
     # sandbox-runner is spawned on demand (not by Helm) — pre-pull it so the
-    # sandbox works offline after the upgrade. Best-effort.
+    # sandbox works offline after the upgrade. Best-effort. (An offline package
+    # ships it, so it was already imported above.)
     k3s crictl pull "ghcr.io/scriptor-group/suite-366-sandbox-runner:$want_app" >/dev/null 2>&1 \
       && info "sandbox-runner:$want_app pre-pulled." \
       || warn "sandbox-runner:$want_app pre-pull failed (offline restart may miss it)."
@@ -349,15 +765,67 @@ do_apply() {
   [[ "$app_diff"  == 1 ]] && cur_app="$want_app"
   [[ "$vllm_diff" == 1 ]] && cur_vllm="$want_vllm"
   chart_diff=0; vllm_diff=0; app_diff=0; summary_line=""
+
+  # Fleet convergence: make sure the app-trigger units exist / are current, and
+  # refresh this script for the next run. Ordered BEFORE write_state_json so the
+  # retired offline source is reflected in the state the app reads.
+  install_units
+  if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+    self_update_from_package
+    retire_staged_package
+    load_offline_source
+  else
+    self_update
+  fi
+
+  UPDATE_SOURCE=none
   write_state_json 0
   write_apply_json success "update complete (chart $want_chart, app ${cur_app:-?}, channel ${channel:-?})"
   trap - EXIT
   log "Update complete (now on chart $want_chart, channel ${channel:-?})."
+}
 
-  # Fleet convergence: make sure the app-trigger units exist / are current,
-  # and refresh this script from the channel repo for the next run.
-  install_units
-  self_update
+# --- Offline package: image import + retirement ---------------------------------
+# images/       -> containerd's k8s.io namespace (everything Helm schedules)
+# docker-images/ -> the Docker daemon (the vLLM stack runs on compose, not k8s)
+import_package_images() {
+  local tar n=0
+  for tar in "$OFFLINE_PKG"/images/*.tar; do
+    [[ -f "$tar" ]] || continue
+    log "Importing $(basename "$tar") into containerd"
+    k3s ctr -n k8s.io images import "$tar" >/dev/null \
+      || die "image import failed: $(basename "$tar")"
+    n=$((n+1))
+  done
+  for tar in "$OFFLINE_PKG"/docker-images/*.tar; do
+    [[ -f "$tar" ]] || continue
+    log "Loading $(basename "$tar") into Docker"
+    docker load -i "$tar" >/dev/null \
+      || die "docker load failed: $(basename "$tar")"
+    n=$((n+1))
+  done
+  info "$n image archive(s) imported from the offline package."
+}
+
+# A package that has been applied must stop advertising itself — and stop
+# occupying several GB. Keep the metadata (status `applied`) so the UI can still
+# say where the running version came from.
+retire_staged_package() {
+  rm -rf "$OFFLINE_PKG"
+  write_offline_source applied ""
+  info "Offline package retired (staged content removed)."
+}
+
+# The updater that a signed package ships is itself covered by SHA256SUMS, so
+# this is the ONLY trustworthy way to move update.sh forward on a box with no
+# outbound access (see self_update for the online counterpart and its caveat).
+self_update_from_package() {
+  local src="$OFFLINE_PKG/scripts/update.sh"
+  [[ -s "$src" ]] || return 0
+  if bash -n "$src" 2>/dev/null && ! cmp -s "$src" "$DATA_DIR/update.sh"; then
+    install -m 0700 "$src" "$DATA_DIR/update.sh"
+    info "update.sh refreshed from the signed package."
+  fi
 }
 
 # --- install-units -------------------------------------------------------------
@@ -414,16 +882,59 @@ EOF
 # Refresh this script from the channel repo after a successful apply, so
 # changes to the update mechanism itself roll out with regular updates (no
 # per-box SSH). Best-effort, syntax-checked before swapping in.
+#
+# Trust comes from the SIGNED manifest, not from TLS. channel.json carries
+# `updater_sha256`; the manifest's signature covers that field, so a hash match
+# means this exact script was published by whoever holds our private key. TLS
+# alone would only prove we reached the right host — it says nothing about who
+# wrote the file, and the file runs as root on the next apply.
+#
+# Graduated, same as the manifest check:
+#   key present + signed manifest + matching hash -> install
+#   key present, anything else                    -> REFUSE (fail closed)
+#   no key installed                              -> TLS-only, as before
 self_update() {
   [[ "$SELF_UPDATE" == "1" ]] || return 0
-  local tmp; tmp="$(mktemp)"
-  if curl -fsSL -m 20 "$SELF_URL" -o "$tmp" && [[ -s "$tmp" ]] && bash -n "$tmp" 2>/dev/null; then
-    if ! cmp -s "$tmp" "$DATA_DIR/update.sh"; then
-      install -m 0700 "$tmp" "$DATA_DIR/update.sh"
-      info "update.sh refreshed from $SELF_URL."
+  local strict=0
+  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+
+  if [[ "$strict" == 1 ]]; then
+    if [[ "${online_signed:-0}" != "1" ]]; then
+      warn "not refreshing update.sh: the channel manifest was not signature-verified."
+      return 0
     fi
-  else
-    warn "could not refresh update.sh from $SELF_URL (non-blocking)."
+    if [[ -z "${online_updater_sha:-}" ]]; then
+      warn "not refreshing update.sh: the signed manifest carries no updater_sha256."
+      warn "  Publish it with tools/sign-channel.sh, or the updater cannot roll forward."
+      return 0
+    fi
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  if ! curl -fsSL -m 20 "$SELF_URL" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+    warn "could not fetch update.sh from $SELF_URL (non-blocking)."
+    rm -f "$tmp"; return 0
+  fi
+
+  if [[ "$strict" == 1 ]]; then
+    local got
+    got="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ "$got" != "$online_updater_sha" ]]; then
+      warn "REFUSING update.sh from $SELF_URL — hash does not match the signed manifest."
+      warn "  expected $online_updater_sha"
+      warn "  got      $got"
+      warn "  Either the channel is mid-publish, or someone is serving a different script."
+      rm -f "$tmp"; return 0
+    fi
+  fi
+
+  if ! bash -n "$tmp" 2>/dev/null; then
+    warn "fetched update.sh does not parse — keeping the current one."
+    rm -f "$tmp"; return 0
+  fi
+  if ! cmp -s "$tmp" "$DATA_DIR/update.sh"; then
+    install -m 0700 "$tmp" "$DATA_DIR/update.sh"
+    info "update.sh refreshed from $SELF_URL$([[ "$strict" == 1 ]] && printf ' (signature-verified)')."
   fi
   rm -f "$tmp"
 }
@@ -438,20 +949,23 @@ require_cluster_tools() {
 case "$MODE" in
   check)
     require_cluster_tools
-    read_current_state
-    fetch_manifest
+    survey
     notify
     ;;
   apply)
     require_cluster_tools
-    read_current_state
-    fetch_manifest
+    survey
     do_apply
+    ;;
+  scan-usb)
+    have openssl || die "openssl required to verify offline packages."
+    require_cluster_tools
+    do_scan_usb "${2:-}"
     ;;
   install-units)
     install_units
     ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | install-units)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units)"
     ;;
 esac
