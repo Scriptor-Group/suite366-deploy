@@ -49,13 +49,20 @@ deploy_suite() {
         > "$vals" )
   chmod 0600 "$vals"
 
-  # App <-> host update bridge dir, hostPath-mounted into drive-app (see the
+  # App <-> host bridge dirs, hostPath-mounted into drive-app (see the
   # extraVolumes block in values.yaml). Created BEFORE helm so kubelet's
-  # DirectoryOrCreate doesn't make it root:root 0755 (the pod, uid/gid 1001,
+  # DirectoryOrCreate doesn't make them root:root 0755 (the pod, uid/gid 1001,
   # must be able to drop trigger files — k8s does not fsGroup-chown hostPath).
-  mkdir -p "$DATA_DIR/updates"
-  chown root:1001 "$DATA_DIR/updates"
-  chmod 0770 "$DATA_DIR/updates"
+  #
+  # `support` stays EMPTY here: the remote-support toggle is a fleet feature
+  # (suite366-fleet drops state.json in it). With no state.json the app hides
+  # the feature, so a customer-run appliance is unaffected by the mount.
+  local d
+  for d in updates support; do
+    mkdir -p "$DATA_DIR/$d"
+    chown root:1001 "$DATA_DIR/$d"
+    chmod 0770 "$DATA_DIR/$d"
+  done
 
   patch_coredns_for_local_domain
   # CA locale auto-générée par cert-manager : la passer au chart pour qu'il
