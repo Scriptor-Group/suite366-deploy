@@ -3,6 +3,6 @@
   "chart_version": "0.8.0",
   "app_version": "1.8.22",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
-  "updater_sha256": "",
+  "updater_sha256": "afb6eaffc14b66277e302df3171e910cebdaf88a2eb414d58d160f9474e0914d",
   "notes": "app 1.8.22: roll the stable channel to the latest published Suite 366 release (app + sandbox-api + sandbox-runner image pins bumped 1.8.10 -> 1.8.22; chart unchanged at 0.8.0). app_version drives the app/sandbox image pins in values.yaml (the appliance pins them for offline safety, update.sh rewrites the pins on apply). Bump chart_version / app_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply). updater_sha256 is filled in by tools/sign-channel.sh — never by hand; it is what lets an appliance trust the update.sh it fetches."
 }
