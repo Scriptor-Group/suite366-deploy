@@ -97,7 +97,8 @@ prepull_images() {
     -o jsonpath='{range .items[*]}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{end}' \
     2>/dev/null | sort -u)"
   extra="busybox:1.37
-ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22"
+ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22
+ghcr.io/scriptor-group/suite-366-workbench-runner:latest"
   for i in $imgs $extra; do
     [[ -z "$i" ]] && continue
     if k3s crictl pull "$i" >/dev/null 2>&1; then info "  ✓ $i"; else warn "  ✗ $i (pull failed — offline restart may miss it)"; fi
