@@ -258,6 +258,8 @@ sandbox:
     # latest jusqu'au premier release train qui publie l'image ; épingler
     # ensuite comme les images sandbox ci-dessus.
     runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:latest
+    # IfNotPresent : redémarrage offline (l'image est pré-pullée par install.sh)
+    pullPolicy: IfNotPresent
     storageClass: local-path
     resourceQuota:
       # Un seul GB10 : borné plus bas que les défauts du chart.
