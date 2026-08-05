@@ -105,6 +105,15 @@ ingress:
         - path: /socket.io/
           pathType: Prefix
           port: 3001
+        # Workbench : proxy bureau (KasmVNC) et Drive WebDAV, servis par le
+        # process ws — les Route Handlers Next ne relaient ni PROPFIND/MKCOL/
+        # MOVE ni l'upgrade WebSocket.
+        - path: /wb-desktop/
+          pathType: Prefix
+          port: 3001
+        - path: /dav/
+          pathType: Prefix
+          port: 3001
         - path: /
           pathType: Prefix
           port: 80
@@ -236,3 +245,26 @@ sandbox:
   runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22
   # Tune sessions/limits if the GB10 unified memory budget is tight — defaults
   # aim at 20 pods × 512 MB.
+
+  # Workbench — per-user persistent dev sandbox (terminal + opencode + Firefox
+  # desktop, cf. suite-366/documentation/34-workbench.md). One pod + one PVC
+  # (local-path) + one NetworkPolicy per workbench, in its own namespace. The
+  # chart wires WORKBENCH_ENABLED on both drive-app and sandbox-api sides, and
+  # the ingress below routes /wb-desktop/ + /dav/ to the ws port.
+  # FUSE (~/drive mount) stays off: it would require privileged pods.
+  # NOTE budget GB10 : chaque workbench actif = jusqu'à 4 Gi / 2 cpu.
+  workbench:
+    enabled: true
+    # latest jusqu'au premier release train qui publie l'image ; épingler
+    # ensuite comme les images sandbox ci-dessus.
+    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:latest
+    storageClass: local-path
+    resourceQuota:
+      # Un seul GB10 : borné plus bas que les défauts du chart.
+      pods: "10"
+      requestsCpu: "4"
+      requestsMemory: "4Gi"
+      limitsCpu: "20"
+      limitsMemory: "40Gi"
+      persistentVolumeClaims: "30"
+      requestsStorage: "300Gi"

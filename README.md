@@ -46,6 +46,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 | **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart |
 | **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
+| **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
 | **TLS** | self-signed local CA (cert-manager), `*.suite366.local` certificates automatic |
 | **DNS** | mDNS/Avahi: `*.suite366.local` resolved on the LAN without client-side config |
 
