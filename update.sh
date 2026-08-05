@@ -730,6 +730,7 @@ do_apply() {
     sed -i "s|^  tag: \".*\"|  tag: \"$want_app\"|" "$vals"
     sed -i "s|\(suite-366-sandbox-api:\)[^\"[:space:]]*|\1$want_app|" "$vals"
     sed -i "s|\(suite-366-sandbox-runner:\)[^\"[:space:]]*|\1$want_app|" "$vals"
+    sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$want_app|" "$vals"
   fi
 
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 ]]; then
