@@ -113,7 +113,9 @@ helm pull "$CHART_REF" --version "$CHART_VERSION" -d "$PKG/chart" \
 # `helm template` needs no cluster.
 log "Enumerating images from the rendered chart"
 rendered="$(mktemp)"
-trap 'rm -f "$rendered"' EXIT
+helm_out="$(mktemp)"
+helm_err="$(mktemp)"
+trap 'rm -f "$rendered" "$helm_out" "$helm_err"' EXIT
 # The repo's values.yaml carries @TOKEN@ placeholders that are not valid YAML
 # values for every field; substitute the few that matter for image resolution
 # and let the rest render as literals (we only read `image:` lines back out).
@@ -125,12 +127,23 @@ sed -e "s|@DOMAIN@|suite366.local|g" \
     -e "s|@SANDBOX_NAMESPACE@|sandbox|g" -e "s|@DATA_DIR@|/opt/suite366|g" \
     "$REPO_ROOT/values.yaml" > "$rendered"
 
+# Render first, read second. Piping helm straight into sed hides its exit status
+# behind the pipeline's last command, so a chart that fails to render used to
+# surface as "no images resolved" — a message that sends you off inspecting
+# values that were never the problem.
+helm template pkg "$PKG/chart"/*.tgz -f "$rendered" >"$helm_out" 2>"$helm_err" || {
+  warn "helm template failed:"
+  sed 's/^/      /' "$helm_err" >&2
+  die "the chart did not render — see helm's own message above."
+}
+
 mapfile -t images < <(
-  helm template pkg "$PKG/chart"/*.tgz -f "$rendered" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*image:[[:space:]]*"*\([^"[:space:]]*\)"*.*/\1/p' \
+  sed -n 's/^[[:space:]]*image:[[:space:]]*"*\([^"[:space:]]*\)"*.*/\1/p' "$helm_out" \
     | sort -u
 )
-[[ ${#images[@]} -gt 0 ]] || die "no images resolved from the chart — check values rendering."
+[[ ${#images[@]} -gt 0 ]] || die "the chart rendered ($(wc -l <"$helm_out") lines) but \
+carries no 'image:' field — either the chart layout changed or the values \
+substitution above produced nothing usable."
 
 # Images Helm never schedules but the box needs offline: the livekit
 # initContainer and the sandbox runner (spawned on demand by sandbox-api).
