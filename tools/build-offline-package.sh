@@ -127,7 +127,7 @@ sed -e "s|@DOMAIN@|suite366.local|g" \
 
 mapfile -t images < <(
   helm template pkg "$PKG/chart"/*.tgz -f "$rendered" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*image:[[:space:]]*"\?\([^"[:space:]]*\)"\?.*/\1/p' \
+    | sed -n 's/^[[:space:]]*image:[[:space:]]*"*\([^"[:space:]]*\)"*.*/\1/p' \
     | sort -u
 )
 [[ ${#images[@]} -gt 0 ]] || die "no images resolved from the chart — check values rendering."
