@@ -62,7 +62,13 @@ info "$(basename "$UPDATER") -> $sha"
 if grep -q '"updater_sha256"' "$CHANNEL"; then
   # In place, preserving the rest of the file byte for byte — the signature is
   # over exact bytes, so a reformat here is a needless churn in every diff.
-  sed -i -E "s|(\"updater_sha256\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")|\1$sha\2|" "$CHANNEL"
+  # Not `sed -i`: GNU sed takes no argument there, BSD sed (macOS) demands one,
+  # and a release can be cut from either. Rewrite through a temp file instead,
+  # then `cat` it back so $CHANNEL keeps its inode and mode.
+  tmp="$(mktemp)"
+  sed -E "s|(\"updater_sha256\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")|\1$sha\2|" \
+    "$CHANNEL" > "$tmp" && cat "$tmp" > "$CHANNEL"
+  rm -f "$tmp"
 else
   die "$CHANNEL has no updater_sha256 field — add \"updater_sha256\": \"\" first."
 fi

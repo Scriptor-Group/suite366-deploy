@@ -20,6 +20,16 @@ pass=0; fail=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
 ko()   { printf '  \033[31mFAIL\033[0m %s — %s\n' "$1" "${2:-}"; fail=$((fail+1)); }
 
+# Portable `sed -i`: GNU sed takes no argument there, BSD sed (macOS) demands
+# one, and this self-test is meant to run on whatever laptop is at hand.
+sed_i() { # sed_i EXPR FILE
+  local expr="$1" f="$2" t rc
+  t="$(mktemp)"
+  sed "$expr" "$f" > "$t" && cat "$t" > "$f"; rc=$?
+  rm -f "$t"
+  return $rc
+}
+
 # --- keys ---------------------------------------------------------------------
 openssl genpkey -algorithm ed25519 -out "$WORK/good.key" 2>/dev/null
 openssl pkey -in "$WORK/good.key" -pubout -out "$WORK/good.pub" 2>/dev/null
@@ -90,7 +100,7 @@ out="$(verify "$WORK/bitrot" "$WORK/good.pub" 1.8.22)"
 
 # manifest swapped after signing
 mkpkg "$WORK/swap" "$WORK/good.key" 1.8.23
-sed -i 's/"app_version": "1.8.23"/"app_version": "9.9.9"/' "$WORK/swap/manifest.json"
+sed_i 's/"app_version": "1.8.23"/"app_version": "9.9.9"/' "$WORK/swap/manifest.json"
 out="$(verify "$WORK/swap" "$WORK/good.pub" 1.8.22)"
 [[ $? -ne 0 && "$out" == *"checksum mismatch"* ]] \
   && ok "tampered manifest refused" || ko "tampered manifest refused" "$out"
@@ -235,7 +245,7 @@ out="$(verify_manifest "$WORK/evilch.json" "$WORK/good.pub")"
 
 # Tampered after signing — the chart_version an appliance would act on.
 mkchannel "$WORK/tamper.json" "$WORK/good.key"
-sed -i 's/"chart_version": "0.8.0"/"chart_version": "9.9.9"/' "$WORK/tamper.json"
+sed_i 's/"chart_version": "0.8.0"/"chart_version": "9.9.9"/' "$WORK/tamper.json"
 out="$(verify_manifest "$WORK/tamper.json" "$WORK/good.pub")"
 [[ $? -ne 0 && "$out" == *"signature INVALID"* ]] \
   && ok "manifest tampered after signing refused" || ko "manifest tampered after signing refused" "$out"
