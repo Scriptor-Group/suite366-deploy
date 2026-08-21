@@ -115,6 +115,15 @@ out="$(verify "$WORK/uncovered" "$WORK/good.pub" 1.8.22)"
 [[ $? -ne 0 && "$out" == *"not covered"* ]] \
   && ok "uncovered manifest refused" || ko "uncovered manifest refused" "$out"
 
+# an extra file slipped in beside the signed ones: the signature verifies, every
+# LISTED file matches, but sha256sum -c never notices the intruder — and
+# import_package_images would load it. pkg_verify must refuse the whole package.
+mkpkg "$WORK/extra" "$WORK/good.key" 1.8.23
+printf 'unsigned payload\n' > "$WORK/extra/images/evil.tar"
+out="$(verify "$WORK/extra" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"extra file"* ]] \
+  && ok "unlisted extra file refused" || ko "unlisted extra file refused" "$out"
+
 # missing signature entirely
 mkpkg "$WORK/nosig" "$WORK/good.key" 1.8.23
 rm -f "$WORK/nosig/SHA256SUMS.sig"

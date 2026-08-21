@@ -1,0 +1,7 @@
+# Suite 366's installer is a set of modules sourced together at runtime
+# (install.sh sources lib/*.sh; update.sh sources $DATA_DIR/update.env). Linting
+# each file standalone cannot see its siblings' definitions, and config.sh
+# deliberately defines many vars for other modules to consume. Silence only the
+# checks that fire because of that architecture — real quoting/logic bugs are
+# still reported.
+disable=SC1090,SC1091,SC2034,SC2154

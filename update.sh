@@ -504,6 +504,18 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
     pkg_error="checksum mismatch — package corrupt or truncated"; return 1
   fi
 
+  # 3b. sha256sum -c validates every file it LISTS, but is SILENT about files
+  #     that are present and NOT listed — and import_package_images globs
+  #     images/*.tar / docker-images/*.tar, so an unsigned tar dropped in beside
+  #     the real ones would be imported while every check above still passed.
+  #     Require the present set to equal the signed set exactly, nothing extra.
+  local listed present
+  listed="$(sed 's/^[0-9a-f]\{64\} [ *]//' "$root/SHA256SUMS" | sort)"
+  present="$( ( cd "$root" && find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.sig ) | sort )"
+  if [[ "$listed" != "$present" ]]; then
+    pkg_error="extra file(s) not covered by the signed SHA256SUMS"; return 1
+  fi
+
   local mf; mf="$(cat "$root/manifest.json")"
   pkg_channel="$(json_get channel        <<<"$mf")"
   pkg_chart="$(json_get chart_version    <<<"$mf")"
