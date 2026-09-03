@@ -3,8 +3,11 @@
 # Derived from charts/drive/values-client-autonome.yaml.
 #
 # DGX Spark specifics:
-#   • local domain *.suite366.local (resolved via mDNS/Avahi on the host);
-#   • TLS via self-signed local CA (ClusterIssuer "suite366-local-ca");
+#   • hostnames are NOT hardcoded: install.sh substitutes @APP_HOST@ /
+#     @OFFICE_HOST@ / @LIVEKIT_HOST@ / @TURN_HOST@ (defaults drive./office./
+#     livekit./turn. under *.suite366.local, resolved via mDNS/Avahi);
+#   • TLS from the self-signed local CA (ClusterIssuer "suite366-local-ca") or
+#     from customer-provided certificates — see TLS_MODE in lib/config.sh;
 #   • images pulled anonymously from ghcr.io/scriptor-group (chart defaults).
 #     The packages are public; no imagePullSecrets needed.
 #   • sandbox (code-exec) stack enabled — runs in the `@SANDBOX_NAMESPACE@`
@@ -54,12 +57,12 @@ config:
   PORT: "3000"
   HOSTNAME: "0.0.0.0"
   WS_PORT: "3001"
-  AUTH_URL: https://drive.@DOMAIN@
-  APP_URL: https://drive.@DOMAIN@
-  WS_URL: wss://drive.@DOMAIN@
+  AUTH_URL: https://@APP_HOST@
+  APP_URL: https://@APP_HOST@
+  WS_URL: wss://@APP_HOST@
   MINIO_BUCKET: suite-366
-  ONLYOFFICE_URL: https://office.@DOMAIN@
-  LIVEKIT_PUBLIC_URL: wss://livekit.@DOMAIN@
+  ONLYOFFICE_URL: https://@OFFICE_HOST@
+  LIVEKIT_PUBLIC_URL: wss://@LIVEKIT_HOST@
   # --- Local AI (vLLM host) — wired AUTOMATICALLY ---------------------------
   # Suite 366 PR #325 (chooseDefaultModel): when VLLM_BASE_URL is set, the
   # local vLLM is preferred over Anthropic/OpenAI for every role. The base
@@ -98,9 +101,14 @@ ingress:
   enabled: true
   className: traefik
   annotations:
-    cert-manager.io/cluster-issuer: suite366-local-ca
+    # One line, substituted by install.sh: either the cert-manager issuer
+    # (TLS_MODE=local-ca) or an inert marker annotation (TLS_MODE=provided,
+    # where install.sh creates the TLS Secrets itself and cert-manager is not
+    # deployed at all). Keeping it a single line keeps the YAML valid in both
+    # modes without conditional rendering.
+    @INGRESS_CERT_ANNOTATION@
   hosts:
-    - host: drive.@DOMAIN@
+    - host: @APP_HOST@
       paths:
         - path: /socket.io/
           pathType: Prefix
@@ -118,8 +126,8 @@ ingress:
           pathType: Prefix
           port: 80
   tls:
-    - secretName: drive-tls
-      hosts: [drive.@DOMAIN@]
+    - secretName: @APP_TLS_SECRET@
+      hosts: [@APP_HOST@]
 
 redis:
   enabled: true
@@ -155,8 +163,11 @@ onlyoffice:
   ingress:
     enabled: true
     className: traefik
-    host: office.@DOMAIN@
-    clusterIssuer: suite366-local-ca
+    host: @OFFICE_HOST@
+    # Empty in TLS_MODE=provided: the chart drops the cert-manager annotation
+    # but still renders the tls block, because tlsSecretName is set explicitly.
+    clusterIssuer: "@CLUSTER_ISSUER@"
+    tlsSecretName: @OFFICE_TLS_SECRET@
 
 # livekit is the ONE workload that needs the CURRENT LAN IP (not the stable
 # internal IP): hostNetwork media must be reachable by LAN browsers. With
@@ -175,16 +186,20 @@ livekit:
   ingress:
     enabled: true
     className: traefik
-    host: livekit.@DOMAIN@
-    clusterIssuer: suite366-local-ca
+    host: @LIVEKIT_HOST@
+    clusterIssuer: "@CLUSTER_ISSUER@"
+    tlsSecretName: @LIVEKIT_TLS_SECRET@
   turn:
     enabled: true
-    domain: turn.@DOMAIN@
+    domain: @TURN_HOST@
     tlsPort: 5349
-    tlsSecretName: drive-turn-tls
+    tlsSecretName: @TURN_TLS_SECRET@
+    # TURN is not HTTP, so cert-manager cannot issue through an Ingress: the
+    # chart asks for a Certificate explicitly. In TLS_MODE=provided that whole
+    # object is disabled and install.sh writes the Secret instead.
     certManager:
-      enabled: true
-      issuerName: suite366-local-ca
+      enabled: @TURN_CERT_MANAGER@
+      issuerName: "@CLUSTER_ISSUER@"
       issuerKind: ClusterIssuer
 
 # --- Appliance host <-> app bridges ------------------------------------------

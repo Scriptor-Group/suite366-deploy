@@ -1,7 +1,11 @@
 # shellcheck shell=bash
 # =============================================================================
-# lib/mdns.sh — Avahi/mDNS publishing of *.$DOMAIN so LAN clients resolve the
-# appliance without DNS config.
+# lib/mdns.sh — Avahi/mDNS publishing of the appliance hostnames so LAN clients
+# resolve them without any DNS configuration.
+#
+# Only ever used with HOST_MODE=mdns, which gather_hosts() ties to the `.local`
+# domain: nss-mdns routes only `.local` to mDNS, so publishing a routable name
+# here would advertise something no client ever asks us about.
 #
 # Design: a single self-contained WATCHER service. It polls the current LAN IP
 # every 5s and, only when it actually changes, (re)publishes the mDNS names and
@@ -16,7 +20,13 @@
 
 # --- 5. mDNS (Avahi) ---------------------------------------------------------
 setup_mdns() {
-  log "mDNS (Avahi) — *.$DOMAIN"
+  # HOST_MODE=dns: the customer's DNS is authoritative for these names, and a
+  # second answer published over multicast is a liability, not a fallback.
+  if [[ "$HOST_MODE" != "mdns" ]]; then
+    disable_mdns
+    return 0
+  fi
+  log "mDNS (Avahi) — $APP_HOST + 3 more"
   if ! have avahi-daemon; then
     apt-get update -y || warn "apt-get update failed (stale cache?) — install may fail."
     apt-get install -y avahi-daemon avahi-utils \
@@ -30,7 +40,7 @@ setup_mdns() {
 # CURRENT LAN IP and refreshes them (plus livekit's advertised media IP)
 # whenever the IP changes. See lib/mdns.sh for the design rationale.
 set -u
-NAMES="$DOMAIN drive.$DOMAIN office.$DOMAIN livekit.$DOMAIN turn.$DOMAIN"
+NAMES="$DOMAIN $APP_HOST $OFFICE_HOST $LIVEKIT_HOST $TURN_HOST"
 STATE=/run/suite366-mdns.ip   # survives service restarts, wiped at boot
 
 current_ip() { ip route get 1.1.1.1 2>/dev/null | awk '{print \$7; exit}'; }
@@ -45,7 +55,7 @@ while :; do
   if [ "\${IP:-}" != "\$PUBLISHED" ]; then
     unpublish
     if [ -n "\${IP:-}" ]; then
-      echo "suite366-mdns: publishing *.$DOMAIN -> \$IP"
+      echo "suite366-mdns: publishing \$NAMES -> \$IP"
       publish "\$IP"
       # livekit advertises the LAN IP for WebRTC media (rtc.node_ip, rendered
       # by its initContainer): recreate its pod when the LAN IP truly changed
@@ -82,4 +92,22 @@ EOF
   systemctl reset-failed suite366-avahi-aliases.service 2>/dev/null || true
   systemctl enable suite366-avahi-aliases.service
   systemctl restart suite366-avahi-aliases.service
+}
+
+
+# Remove a publisher installed by an earlier run. This is not defensive noise:
+# re-running install.sh to MOVE a box from `.local` to the customer's domain
+# would otherwise leave the old watcher alive, still answering on the LAN for
+# names the appliance no longer serves.
+disable_mdns() {
+  info "mDNS not used (HOST_MODE=$HOST_MODE) — the names are resolved by your DNS."
+  if [[ -e /etc/systemd/system/suite366-avahi-aliases.service ]]; then
+    log "Removing the mDNS publisher installed by a previous run"
+    systemctl disable --now suite366-avahi-aliases.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/suite366-avahi-aliases.service \
+          /usr/local/bin/suite366-avahi-aliases.sh \
+          /run/suite366-mdns.ip
+    systemctl daemon-reload
+    info "suite366-avahi-aliases removed (the avahi-daemon package is left alone)."
+  fi
 }

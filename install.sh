@@ -9,12 +9,28 @@
 #   • vLLM ×2 (generative + embeddings) on Docker host, on the Blackwell GPU;
 #   • the full Suite 366 (drive + Postgres + Redis + MinIO + OnlyOffice +
 #     LiveKit/TURN) via the `drive` Helm chart;
-#   • local TLS (self-signed CA) + mDNS *.suite366.local (Avahi).
+#   • local TLS (self-signed CA, or your own certificates) + mDNS on
+#     *.suite366.local (Avahi) — or your own DNS, see HOST_MODE below.
 #
 # Idempotent. Interactive prompts via /dev/tty (compatible with curl|bash), OR
 # via environment variables (non-interactive mode):
 #   HF_TOKEN                   HuggingFace token (optional, gated models)
+#   HOST_MODE                  mdns (default) | dns — how clients RESOLVE the
+#                              appliance. mdns is tied to `.local`; use dns for
+#                              a routable domain served by your own DNS.
 #   DOMAIN                     default: suite366.local
+#   APP_HOST, OFFICE_HOST,     the four public names. Default to
+#   LIVEKIT_HOST, TURN_HOST    drive./office./livekit./turn.<DOMAIN>; override
+#                              individually for non-uniform naming.
+#   TLS_MODE                   local-ca (default, self-signed CA via
+#                              cert-manager) | provided (you supply the
+#                              certificates; cert-manager is not deployed).
+#                              acme is refused — see lib/preflight.sh.
+#   TLS_CERT_FILE,             TLS_MODE=provided: PEM cert + key covering all
+#   TLS_KEY_FILE               four names (multi-SAN or wildcard). Per-service
+#                              overrides: {APP,OFFICE,LIVEKIT,TURN}_TLS_*_FILE
+#   TLS_CA_FILE                TLS_MODE=provided: the issuing CA, mounted into
+#                              drive-app so it trusts OnlyOffice server-side
 #   ADMIN_EMAIL                default: admin@<DOMAIN>
 #   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve (defaults validated
 #                              on Spark: Gemma-4-26B-A4B-NVFP4 + Qwen3-VL-Embedding-8B)

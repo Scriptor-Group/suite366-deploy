@@ -23,9 +23,21 @@ setup_update_timer() {
   # Config consumed by update.sh both on manual runs (sourced) and via the
   # systemd unit (EnvironmentFile). 0600 — it just carries non-secret config,
   # but lives in the root-only $DATA_DIR anyway.
+  #
+  # The hostname/TLS identity is recorded here too, because it is the box's
+  # install-time identity and three other things need it later without asking
+  # anyone: uninstall.sh (to find its own CoreDNS entries), the fleet inventory,
+  # and any future re-render of values.yaml.
   ( umask 077
     cat > "$DATA_DIR/update.env" <<EOF
 MANIFEST_URL=$MANIFEST_URL
+DOMAIN=$DOMAIN
+HOST_MODE=$HOST_MODE
+APP_HOST=$APP_HOST
+OFFICE_HOST=$OFFICE_HOST
+LIVEKIT_HOST=$LIVEKIT_HOST
+TURN_HOST=$TURN_HOST
+TLS_MODE=$TLS_MODE
 CHART_REF=$CHART_REF
 NAMESPACE=$NAMESPACE
 RELEASE=$RELEASE

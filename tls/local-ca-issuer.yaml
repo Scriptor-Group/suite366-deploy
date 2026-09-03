@@ -1,4 +1,6 @@
-# Self-signed local CA to issue *.suite366.local certificates.
+# Self-signed local CA issuing the appliance's certificates (the four hostnames
+# chosen at install time — by default *.suite366.local). Used when
+# TLS_MODE=local-ca; a box with TLS_MODE=provided never applies this file.
 #
 # Chain: selfsigned ClusterIssuer -> root CA Certificate (secret in
 # cert-manager) -> "suite366-local-ca" ClusterIssuer. The drive chart's
