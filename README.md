@@ -32,6 +32,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 - [Wiring the AI](#wiring-the-ai-automatic)
 - [Repository layout](#repository-layout)
 - [Operations](#operations)
+- [Backups](#backups)
 - [Survival across reboots](#survival-across-reboots)
 - [Security posture](#security-posture)
 - [TLS / browser trust](#tls--browser-trust)
@@ -49,6 +50,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
 | **TLS** | self-signed local CA (cert-manager) by default, or **your own certificates** (`TLS_MODE=provided`) |
+| **Backups** | nightly `restic` to an S3 destination, encrypted with a key held only on the box |
 | **DNS** | mDNS/Avahi by default (`*.suite366.local`, no client config), or **your own DNS** (`HOST_MODE=dns`) |
 
 Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
@@ -345,6 +347,9 @@ lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
 lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
+backup.sh                             backup agent (run | test | status | snapshots | prune | restore | install-units); run by suite366-backup.timer
+lib/backup.sh                         installs the pinned restic, the repository key, backup.sh and its timer
+tools/test-backup.sh                  self-test: stubbed restic + cluster, plus a real restic round trip when one is on PATH
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
@@ -365,10 +370,99 @@ dns/avahi-aliases.service             systemd unit publishing mDNS names
 
 ```bash
 sudo k3s kubectl -n suite366 get pods          # kubeconfig is 0600 (root only)
+sudo /opt/suite366/backup.sh status            # last backup, snapshots, key fingerprint
 docker logs -f suite366-vllm-llm               # generative model logs
 systemctl status suite366-vllm                 # vLLM stack
 systemctl status suite366-avahi-aliases        # mDNS aliases
 ```
+
+## Backups
+
+The appliance ships with the backup **mechanism** installed and a nightly timer
+armed. It does **not** ship with a destination: where a customer's data is
+copied is their decision, so `BACKUP_REPO` is empty by default and a run reports
+`unconfigured` and exits 0 rather than failing every night until someone reads
+the journal.
+
+```bash
+sudo /opt/suite366/backup.sh status      # state.json: last run, snapshots, key fingerprint
+sudo /opt/suite366/backup.sh run         # now, instead of waiting for 02:40
+sudo /opt/suite366/backup.sh snapshots   # what is in the repository
+sudo /opt/suite366/backup.sh test        # destination reachable + key correct?
+systemctl list-timers suite366-backup.timer
+```
+
+Turn it on at install time, or later by editing
+`/opt/suite366/backup/backup.env` (0600) and running `backup.sh init`:
+
+```bash
+curl -fsSL https://get.suite366.ai/install.sh | sudo env \
+  BACKUP_REPO=s3:s3.fr-par.scw.cloud/suite366-backups/spark-01 \
+  BACKUP_S3_ACCESS_KEY=… BACKUP_S3_SECRET_KEY=… BACKUP_S3_REGION=fr-par bash
+```
+
+Any restic backend works (S3, SFTP, a local path on a USB disk — useful on an
+air-gapped site). Retention defaults to 7 daily / 4 weekly / 6 monthly and is
+applied with `restic forget --prune` at the end of every run.
+
+### What is in a snapshot
+
+| Tag | Content | Why |
+|---|---|---|
+| `postgres` | `pg_dump -Fc` streamed into restic | a *logical* dump, so it restores into a fresh Postgres whose password differs — the normal case after a reinstall |
+| `minio` | the MinIO PVC directory, **`.minio.sys` excluded** | objects are whole files; MinIO's own IAM is not, and restoring one install's `.minio.sys` over another's root credentials locks you out of the data you just restored |
+| `config` | `/opt/suite366` minus `models/` | `values.yaml`, `llm/.env`, `update.env`, the local CA. The 33+ GiB of model weights re-download |
+| `secrets` | `secret-<app>` and the cert-manager CA secret | see below — this is what decides whether a restore works at all |
+
+Not backed up, deliberately: Redis (sessions and queues), the OnlyOffice PVC
+(cache), workbench PVCs (per-user scratch, potentially hundreds of GiB).
+
+The database dump is checked on **both** sides of the pipe. A `pg_dump` that
+dies mid-stream still hands restic a perfectly storable *truncated* dump — the
+worst outcome available, because it looks like a successful backup until the day
+someone restores it. Such a run is reported as `partial`, not success.
+
+### The one secret that matters: `AUTH_SECRET`
+
+The app derives its at-rest encryption key from `AUTH_SECRET`
+(`serveur/src/lib/encryption.ts`), and the chart **regenerates** any secret it
+cannot find. A restore that does not carry `AUTH_SECRET` over therefore produces
+a database that starts up perfectly and whose stored provider keys and OAuth
+tokens are permanently unreadable — with no error anywhere.
+
+Everything else in that secret (Postgres, MinIO, OnlyOffice JWT, LiveKit) is
+infrastructure credentials that regenerate harmlessly, and carrying *those* over
+actively conflicts with a fresh install (Postgres bakes its password into the
+data directory at init). So: one secret to preserve, the rest to let go.
+
+### Encryption key
+
+`restic` encrypts the repository with a key generated at install, stored
+**only** at `/opt/suite366/backup/repo.pass` (0600) and printed **once** while
+it is created. Lose it and the snapshots are unreadable — by anyone, including
+us. That is the property being bought, and it means the key must leave the
+machine by some deliberate route:
+
+- **sold** appliance: printed on the card that ships inside the crate;
+- **rented** appliance: escrowed by `suite366-fleet`, with the vault reference
+  recorded in the machine's inventory file.
+
+`backup.sh status` and the state file publish only a 12-character fingerprint of
+the key, never the key. `uninstall.sh` warns before deleting it, because the
+snapshots in the remote repository survive the uninstall and would outlive the
+only copy of their key.
+
+### Restore
+
+`backup.sh restore --target <empty dir>` **extracts** a snapshot and changes
+nothing on the appliance. The in-place sequence is manual and order-dependent
+(patch `AUTH_SECRET` first, then the database, then the objects with MinIO
+stopped) and is deliberately not automated yet: it has to be exercised on a real
+box before a recovery is allowed to become a second outage.
+
+Verify a restore **positively** — open a document *and* make one LLM call using
+a provider key stored in the database. A box that merely boots proves nothing
+about the step above.
 
 ### Updates
 

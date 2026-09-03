@@ -142,6 +142,42 @@ LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-262144}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"
+
+# --- Backup (restic) ---------------------------------------------------------
+# The destination is a CUSTOMER decision, so it is empty by default and the
+# appliance ships with the mechanism armed but idle: `backup.sh run` then
+# reports "unconfigured" and exits 0 rather than failing nightly. Set
+# BACKUP_REPO (any restic backend; S3 is the intended one) at install time, or
+# later in $DATA_DIR/backup/backup.env.
+#   BACKUP_REPO=s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>
+BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
+BACKUP_REPO="${BACKUP_REPO:-}"
+BACKUP_S3_ACCESS_KEY="${BACKUP_S3_ACCESS_KEY:-}"
+BACKUP_S3_SECRET_KEY="${BACKUP_S3_SECRET_KEY:-}"
+BACKUP_S3_REGION="${BACKUP_S3_REGION:-}"
+# Repository encryption key. Generated when empty; kept 0600 in
+# $BACKUP_DIR/repo.pass and printed ONCE at the end of the install. There is no
+# recovery path if it is lost — that is the property being bought, and the
+# reason a rented box escrows it (suite366-fleet) and a sold one ships it on a
+# card inside the crate.
+BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
+BACKUP_KEEP_DAILY="${BACKUP_KEEP_DAILY:-7}"
+BACKUP_KEEP_WEEKLY="${BACKUP_KEEP_WEEKLY:-4}"
+BACKUP_KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-6}"
+# HH:MM local. Off the hour on purpose: a fleet that all wakes at 02:00 hits
+# the same bucket in lockstep (the timer adds up to 15 min of jitter on top).
+BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-02:40}"
+# Pinned restic + its published checksums (github.com/restic/restic releases).
+# Ubuntu 22.04 ships 0.12, which is too old for this repository layout; and a
+# root-run binary fetched over TLS alone is exactly the kind of thing the
+# package-signing work exists to distrust, hence the hash.
+RESTIC_VERSION="${RESTIC_VERSION:-0.19.1}"
+RESTIC_SHA256_ARM64="${RESTIC_SHA256_ARM64:-a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465}"
+RESTIC_SHA256_AMD64="${RESTIC_SHA256_AMD64:-f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c}"
+RESTIC_URL_BASE="${RESTIC_URL_BASE:-https://github.com/restic/restic/releases/download}"
+RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
+# 1 = do not install the backup layer at all.
+SKIP_BACKUP="${SKIP_BACKUP:-0}"
 MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
 # Ed25519 PUBLIC key that signs OFFLINE update packages (built by
 # tools/build-offline-package.sh). Path to a PEM file — when the file is

@@ -95,7 +95,8 @@ confirm() {
   cat <<EOF
     This will remove the Suite 366 appliance from this host:
       • systemd units: suite366-net, suite366-vllm, suite366-avahi-aliases,
-        suite366-update(.timer/.service) + the app-trigger .path units
+        suite366-update(.timer/.service) + the app-trigger .path units,
+        suite366-backup(.timer/.service)
       • the vLLM Docker stack (containers$( [[ "$PRUNE_IMAGES" == "1" ]] && echo " + images"))
       • $( [[ "$KEEP_K3S" == "1" ]] \
              && echo "the Suite 366 workloads + cert-manager (k3s itself is KEPT)" \
@@ -111,6 +112,23 @@ EOF
     return 0
   fi
   tty_usable || die "No TTY for confirmation. Re-run with ASSUME_YES=1 to proceed non-interactively."
+  # Removing $DATA_DIR takes backup/repo.pass with it — and the snapshots in
+  # the remote repository stay exactly where they are, encrypted with a key
+  # that no longer exists anywhere. Nothing else in this teardown is
+  # irreversible in that particular way, so it gets its own warning.
+  if [[ "$KEEP_DATA" != "1" && -s "$DATA_DIR/backup/repo.pass" ]]; then
+    local repo=""
+    [[ -f "$DATA_DIR/backup/backup.env" ]] && \
+      repo="$(sed -n 's/^BACKUP_REPO=//p' "$DATA_DIR/backup/backup.env" | head -1)"
+    cat <<EOF
+    ${c_y}!! BACKUP ENCRYPTION KEY${c_0}
+      $DATA_DIR/backup/repo.pass is about to be deleted, and it is the only
+      copy. ${repo:+The snapshots in $repo }${repo:-Any existing snapshots }will
+      remain and become permanently unreadable.
+      Save the key first, or re-run with KEEP_DATA=1.
+
+EOF
+  fi
   local ans=""
   read -r -p "    Type 'yes' to proceed: " ans </dev/tty || true
   [[ "$ans" == "yes" ]] || die "Aborted — nothing was changed."
@@ -129,6 +147,8 @@ remove_systemd_units() {
     suite366-update-apply.service
     suite366-update.service
     suite366-avahi-aliases.service
+    suite366-backup.timer
+    suite366-backup.service
     suite366-vllm.service
     suite366-net.service
   )
@@ -311,6 +331,9 @@ summary() {
   [[ "$KEEP_K3S" == "1" ]]     && kept+=("k3s (kept: KEEP_K3S=1)")
   [[ "$PRUNE_IMAGES" != "1" ]] && kept+=("the vLLM + nginx Docker images (remove: docker rmi <image>)")
   [[ "$KEEP_DATA" == "1" ]]    && kept+=("$DATA_DIR (kept: KEEP_DATA=1)")
+  # Deliberate: deleting a customer's backups is not this script's call.
+  [[ -f "$DATA_DIR/backup/backup.env" ]] && \
+    kept+=("the remote backup repository and every snapshot in it (never touched)")
   [[ "$KEEP_MODELS" == "1" && "$KEEP_DATA" != "1" ]] && kept+=("$MODELS_DIR (kept: KEEP_MODELS=1)")
   local kept_lines="" k
   for k in "${kept[@]}"; do kept_lines+="   • $k"$'\n'; done
