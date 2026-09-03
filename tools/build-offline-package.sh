@@ -119,7 +119,21 @@ trap 'rm -f "$rendered" "$helm_out" "$helm_err"' EXIT
 # The repo's values.yaml carries @TOKEN@ placeholders that are not valid YAML
 # values for every field; substitute the few that matter for image resolution
 # and let the rest render as literals (we only read `image:` lines back out).
+# @INGRESS_CERT_ANNOTATION@ is NOT optional here: it stands alone on a line
+# inside `annotations:`, so leaving it as a literal makes the file a mapping
+# with a bare scalar in it and `helm template` refuses to render at all.
 sed -e "s|@DOMAIN@|suite366.local|g" \
+    -e "s|@APP_HOST@|drive.suite366.local|g" \
+    -e "s|@OFFICE_HOST@|office.suite366.local|g" \
+    -e "s|@LIVEKIT_HOST@|livekit.suite366.local|g" \
+    -e "s|@TURN_HOST@|turn.suite366.local|g" \
+    -e "s|@APP_TLS_SECRET@|drive-tls|g" \
+    -e "s|@OFFICE_TLS_SECRET@|drive-onlyoffice-tls|g" \
+    -e "s|@LIVEKIT_TLS_SECRET@|drive-livekit-tls|g" \
+    -e "s|@TURN_TLS_SECRET@|drive-turn-tls|g" \
+    -e "s|@CLUSTER_ISSUER@|suite366-local-ca|g" \
+    -e "s|@INGRESS_CERT_ANNOTATION@|cert-manager.io/cluster-issuer: x|g" \
+    -e "s|@TURN_CERT_MANAGER@|true|g" \
     -e "s|@HOST_IP@|127.0.0.1|g" -e "s|@SUITE_IP@|10.99.0.1|g" \
     -e "s|@PROXY_PORT@|8000|g" -e "s|@LLM_MODEL@|m|g" -e "s|@EMBED_MODEL@|m|g" \
     -e "s|@VLLM_API_KEY@|x|g" -e "s|@VLLM_EMBEDDING_DIMENSIONS@|4096|g" \

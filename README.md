@@ -26,6 +26,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 - [What gets installed](#what-gets-installed)
 - [Prerequisites](#prerequisites)
 - [Parameters](#parameters-env-vars-or-interactive-prompts)
+- [Custom hostnames and TLS](#custom-hostnames-and-tls)
 - [Running without a GPU](#running-without-a-gpu-test--non-spark-hosts)
 - [Measured GB10 realities](#measured-gb10-realities-read-before-tuning)
 - [Wiring the AI](#wiring-the-ai-automatic)
@@ -47,8 +48,8 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 | **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
-| **TLS** | self-signed local CA (cert-manager), `*.suite366.local` certificates automatic |
-| **DNS** | mDNS/Avahi: `*.suite366.local` resolved on the LAN without client-side config |
+| **TLS** | self-signed local CA (cert-manager) by default, or **your own certificates** (`TLS_MODE=provided`) |
+| **DNS** | mDNS/Avahi by default (`*.suite366.local`, no client config), or **your own DNS** (`HOST_MODE=dns`) |
 
 Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
 (weights for the two vLLM models are ~33 GiB combined).
@@ -86,7 +87,15 @@ The script is interactive (reads `/dev/tty`, so it works through
 | Variable | Default | Purpose |
 |---|---|---|
 | `HF_TOKEN` | empty | HuggingFace token (for *gated* models) |
-| `DOMAIN` | `suite366.local` | local domain (mDNS) |
+| `HOST_MODE` | `mdns` | `mdns` (names published on the LAN, `.local` only) or `dns` (your own DNS answers) — see below |
+| `DOMAIN` | `suite366.local` | base domain the four names derive from |
+| `APP_HOST` | `drive.<DOMAIN>` | application hostname |
+| `OFFICE_HOST` | `office.<DOMAIN>` | OnlyOffice hostname |
+| `LIVEKIT_HOST` | `livekit.<DOMAIN>` | LiveKit signalling hostname |
+| `TURN_HOST` | `turn.<DOMAIN>` | TURN/TLS hostname |
+| `TLS_MODE` | `local-ca` | `local-ca` (self-signed, cert-manager) or `provided` (you supply the certificates) |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
+| `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
 | `LLM_MODEL` | `nvidia/Gemma-4-26B-A4B-NVFP4` | generative model (HF id) |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
@@ -99,6 +108,100 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `EMBED_MAX_MODEL_LEN` | `8192` | max length for embeddings (enough for RAG chunks) |
 | `VLLM_EMBEDDING_DIMENSIONS` | `4096` | embedding vector dimension (Qwen3-VL-Embedding-8B) |
 | `ASSUME_YES` | `0` | accept defaults without prompting |
+
+## Custom hostnames and TLS
+
+By default the appliance serves `drive.suite366.local` and three sibling names,
+published over mDNS and secured by a self-signed CA. Both halves of that are
+replaceable, and they are **two separate decisions**: how clients *resolve* the
+box (`HOST_MODE`), and who *signs* its certificates (`TLS_MODE`).
+
+### Four names, not one
+
+The suite needs four DNS names, because OnlyOffice and LiveKit each own an
+ingress with its own host and TURN needs its own certificate name:
+
+| Name | Default | Used by |
+|---|---|---|
+| `APP_HOST` | `drive.<DOMAIN>` | the app itself (`AUTH_URL`, `APP_URL`, `WS_URL`) |
+| `OFFICE_HOST` | `office.<DOMAIN>` | the browser loading the OnlyOffice editor |
+| `LIVEKIT_HOST` | `livekit.<DOMAIN>` | WebRTC signalling (`wss://`) |
+| `TURN_HOST` | `turn.<DOMAIN>` | TURN/TLS relay on 5349 |
+
+A single wildcard record covers all four. There is no single-hostname mode:
+collapsing them onto one name means path-based routing for OnlyOffice and
+LiveKit, which is a chart change, not an installer flag.
+
+### `HOST_MODE=mdns` (default) — `.local` only
+
+Names are published by a host watcher (`suite366-avahi-aliases`) on the current
+LAN IP, and re-published when that IP changes. This **only works inside
+`.local`**: `nss-mdns` routes only the `.local` domain to mDNS, so a name like
+`drive.acme.internal` would be advertised on the wire and asked for by nobody.
+The installer therefore refuses a non-`.local` name in this mode instead of
+producing an appliance that installs cleanly and resolves nowhere.
+
+### `HOST_MODE=dns` — your own DNS
+
+No Avahi is installed at all. Create the four records (or one wildcard) pointing
+at the host's LAN IP; the installer checks them and prints the ones still
+missing — as a warning, not an error, since DNS is often set up after the box.
+
+```bash
+curl -fsSL https://get.suite366.ai/install.sh | sudo env \
+  HOST_MODE=dns DOMAIN=suite366.acme.fr bash
+```
+
+### `TLS_MODE=local-ca` (default)
+
+cert-manager issues everything from a CA generated on the box. Install
+`/usr/local/share/suite366-local-ca.crt` on each client to silence the browser
+warning.
+
+### `TLS_MODE=provided` — bring your own certificates
+
+The usual answer for a corporate LAN: the customer's PKI issues a certificate,
+and cert-manager is not deployed at all. Before anything is installed, the
+installer verifies that each file is readable, that the **key matches the
+certificate**, and that the certificate's SAN **covers the hostname** it will
+serve — a box shipped with a cert missing the OnlyOffice name looks perfectly
+healthy until the first document is opened.
+
+```bash
+curl -fsSL https://get.suite366.ai/install.sh | sudo env \
+  HOST_MODE=dns DOMAIN=suite366.acme.fr TLS_MODE=provided \
+  TLS_CERT_FILE=/root/tls/fullchain.pem \
+  TLS_KEY_FILE=/root/tls/privkey.pem \
+  TLS_CA_FILE=/root/tls/acme-root-ca.pem bash
+```
+
+`TLS_CA_FILE` matters more than it looks: drive-app calls OnlyOffice
+server-to-server over HTTPS, so the issuing CA has to be inside the container's
+trust store or saving a document fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+Passing it wires the chart's `customCA` (and `NODE_EXTRA_CA_CERTS`).
+
+Renewal in this mode is **yours**: replace `tls.crt`/`tls.key` in the four
+Secrets (`drive-tls`, `drive-onlyoffice-tls`, `drive-livekit-tls`,
+`drive-turn-tls`) in the `suite366` namespace and restart livekit for TURN.
+Nothing on the box watches their expiry.
+
+A PKI that only issues single-name certificates can supply one pair per
+service instead: `APP_TLS_CERT_FILE` / `APP_TLS_KEY_FILE`, and the same for
+`OFFICE_`, `LIVEKIT_`, `TURN_`.
+
+### `TLS_MODE=acme` is refused
+
+Deliberately, rather than half-working: HTTP-01 needs inbound `:80` from the
+internet to a box sitting on a customer LAN, and DNS-01 needs credentials for
+their DNS provider that this installer has no generic way to ask for. Use
+`provided` with a certificate from whoever controls the domain.
+
+### Changing the hostname after installation
+
+Not supported as a one-liner yet. It is a `helm upgrade` plus new certificates,
+new CoreDNS entries and an mDNS change — and, on the app side, everyone is
+signed out (cookies are bound to the domain) and links in already-sent emails
+stop working. Plan it as a maintenance window rather than a live edit.
 
 ### Running without a GPU (test / non-Spark hosts)
 
@@ -497,9 +600,12 @@ to suppress the HTTPS warning.
 ## Known limitations
 
 - **mDNS** doesn't traverse VPNs or networks that block multicast → fallback:
-  add entries to the clients' `/etc/hosts` (`<IP> drive.suite366.local …`).
-- The `.local` TLD is the standard mDNS space (intentional). On a routed
-  multi-subnet network, prefer a real internal DNS + a TLD like `.internal`.
+  add entries to the clients' `/etc/hosts` (`<IP> drive.suite366.local …`), or
+  switch to `HOST_MODE=dns` (see *[Custom hostnames and
+  TLS](#custom-hostnames-and-tls)*).
+- The `.local` TLD is the standard mDNS space (intentional), and mDNS is only
+  ever consulted for it. On a routed multi-subnet network, use `HOST_MODE=dns`
+  with a real internal domain.
 - **Very long context workloads (>200k tokens)**: prefill takes ~10 min on
   GB10 (cf. § GB10 realities). If your traffic exceeds 14% of >200k calls,
   consider RAG / app-side chunking to keep prompts under 100k.

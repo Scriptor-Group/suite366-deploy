@@ -7,6 +7,69 @@
 
 # --- Default settings --------------------------------------------------------
 DOMAIN="${DOMAIN:-suite366.local}"
+
+# --- Public identity: hostnames + TLS ----------------------------------------
+# HOST_MODE decides how LAN clients RESOLVE the appliance. It is not cosmetic:
+#   mdns : the names are published over mDNS/Avahi by a host watcher
+#          (lib/mdns.sh). This ONLY works inside `.local` — nss-mdns routes
+#          only `.local` to mDNS, so `drive.acme.internal` would be published
+#          and resolved by nobody. Hence the hard check in gather_hosts().
+#   dns  : the customer's own DNS answers for the names. Avahi is not installed
+#          at all; the installer verifies the names already point at this host
+#          and tells the operator exactly which records to create if not.
+HOST_MODE="${HOST_MODE:-mdns}"
+# The four public names. EMPTY here on purpose: they are derived from DOMAIN in
+# gather_hosts(), i.e. AFTER the interactive prompt, so a domain typed at the
+# prompt propagates into them. Setting one in the environment pins that name
+# and the derivation leaves it alone.
+APP_HOST="${APP_HOST:-}"
+OFFICE_HOST="${OFFICE_HOST:-}"
+LIVEKIT_HOST="${LIVEKIT_HOST:-}"
+TURN_HOST="${TURN_HOST:-}"
+
+# TLS_MODE:
+#   local-ca : self-signed CA created in-cluster by cert-manager (default,
+#              unchanged behaviour). Browsers need the CA installed once per
+#              client machine.
+#   provided : the customer hands us a certificate + key (their internal PKI,
+#              or a real public cert). cert-manager is NOT deployed; we create
+#              the TLS Secrets ourselves. Set TLS_CA_FILE to the issuing CA so
+#              drive-app trusts OnlyOffice server-side — without it, saving a
+#              document fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE (see the
+#              customCA wiring in lib/suite.sh).
+#   acme     : NOT implemented, and refused loudly rather than half-done — see
+#              check_tls_inputs() in lib/preflight.sh for the reasoning.
+TLS_MODE="${TLS_MODE:-local-ca}"
+# Default pair, expected to cover all four names (one multi-SAN certificate, or
+# a wildcard). The per-service overrides exist for a PKI that only issues
+# single-name certs; each falls back to the pair above.
+TLS_CERT_FILE="${TLS_CERT_FILE:-}"
+TLS_KEY_FILE="${TLS_KEY_FILE:-}"
+TLS_CA_FILE="${TLS_CA_FILE:-}"
+APP_TLS_CERT_FILE="${APP_TLS_CERT_FILE:-}"
+APP_TLS_KEY_FILE="${APP_TLS_KEY_FILE:-}"
+OFFICE_TLS_CERT_FILE="${OFFICE_TLS_CERT_FILE:-}"
+OFFICE_TLS_KEY_FILE="${OFFICE_TLS_KEY_FILE:-}"
+LIVEKIT_TLS_CERT_FILE="${LIVEKIT_TLS_CERT_FILE:-}"
+LIVEKIT_TLS_KEY_FILE="${LIVEKIT_TLS_KEY_FILE:-}"
+TURN_TLS_CERT_FILE="${TURN_TLS_CERT_FILE:-}"
+TURN_TLS_KEY_FILE="${TURN_TLS_KEY_FILE:-}"
+# ClusterIssuer the chart annotates its ingresses with. DERIVED, not an
+# override point: the name appears three times in tls/local-ca-issuer.yaml
+# (the CA Certificate, its Secret and the ClusterIssuer itself), so honouring an
+# environment override here would only annotate the ingresses with an issuer
+# that does not exist. check_tls_inputs() empties it in `provided` mode, which
+# is how the chart learns to drop the cert-manager annotations entirely.
+CLUSTER_ISSUER="suite366-local-ca"
+# Fixed Secret names: `provided` mode must know exactly what to create, and the
+# chart must never silently fall back to its own default names.
+APP_TLS_SECRET="${APP_TLS_SECRET:-drive-tls}"
+OFFICE_TLS_SECRET="${OFFICE_TLS_SECRET:-drive-onlyoffice-tls}"
+LIVEKIT_TLS_SECRET="${LIVEKIT_TLS_SECRET:-drive-livekit-tls}"
+TURN_TLS_SECRET="${TURN_TLS_SECRET:-drive-turn-tls}"
+# Filled by check_dns_records() (HOST_MODE=dns): names that do not resolve to
+# this host yet. Surfaced again by the final summary so it cannot be missed.
+DNS_TODO=()
 # Suite 366 drive chart + container images both live on GHCR under the
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.

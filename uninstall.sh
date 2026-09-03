@@ -71,6 +71,14 @@ NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
 DOMAIN="${DOMAIN:-suite366.local}"
+# Hostname identity, recorded in update.env by lib/updater.sh. The fallbacks
+# reproduce the pre-P2 layout so this script still cleans up a box installed
+# before hostnames became configurable.
+HOST_MODE="${HOST_MODE:-mdns}"
+APP_HOST="${APP_HOST:-drive.$DOMAIN}"
+OFFICE_HOST="${OFFICE_HOST:-office.$DOMAIN}"
+LIVEKIT_HOST="${LIVEKIT_HOST:-livekit.$DOMAIN}"
+TURN_HOST="${TURN_HOST:-turn.$DOMAIN}"
 MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
 SUITE_IFACE="${SUITE_IFACE:-suite0}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
@@ -205,25 +213,33 @@ remove_suite_workloads() {
   revert_coredns
 }
 
-# Best-effort: strip the *.$DOMAIN lines install.sh appended to CoreDNS'
+# Best-effort: strip the appliance hostname lines install.sh added to CoreDNS'
 # NodeHosts (only meaningful when the cluster is kept; a full uninstall takes
 # CoreDNS with it). Leaving them is harmless (they point at a deleted ClusterIP)
 # but tidy is better.
+#
+# Matched by exact hostname rather than by a "*.$DOMAIN" pattern: hostnames are
+# configurable now, they need not share a domain, and a pattern would either
+# miss them or take a customer's own NodeHosts entries with it.
 revert_coredns() {
   have k3s || return 0
-  local nh corefile new_nh
+  local nh corefile new_nh n
   nh="$(k3s kubectl -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null)" || return 0
   [[ -n "$nh" ]] || return 0
-  grep -q "\b\(drive\|office\|livekit\|turn\)\.$DOMAIN\b\|[[:space:]]$DOMAIN\$" <<<"$nh" || return 0
+  local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST" "$DOMAIN")
+  new_nh="$nh"
+  for n in "${names[@]}"; do
+    new_nh="$(awk -v name="$n" '$2 != name' <<<"$new_nh")"
+  done
+  [[ "$new_nh" != "$nh" ]] || return 0
   corefile="$(k3s kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
-  new_nh="$(grep -v -E "[[:space:]](drive\.|office\.|livekit\.|turn\.)?${DOMAIN//./\\.}\$" <<<"$nh")"
   printf '%s' "$new_nh" > /tmp/_corefile_nodehosts
   k3s kubectl -n kube-system create cm coredns \
     --from-file=NodeHosts=/tmp/_corefile_nodehosts \
     --from-literal=Corefile="$corefile" \
     --dry-run=client -o yaml | k3s kubectl apply -f - >/dev/null 2>&1 \
     && k3s kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
-    && info "reverted CoreDNS *.$DOMAIN entries" || true
+    && info "reverted CoreDNS entries for the appliance hostnames" || true
   rm -f /tmp/_corefile_nodehosts
 }
 
@@ -247,6 +263,7 @@ remove_host_files() {
     /usr/local/bin/suite366-net-up.sh \
     /usr/local/bin/suite366-avahi-aliases.sh \
     /usr/local/share/suite366-local-ca.crt \
+    /usr/local/share/suite366-issuing-ca.crt \
     /etc/NetworkManager/dispatcher.d/90-suite366-mdns \
     /etc/networkd-dispatcher/routable.d/90-suite366-mdns \
     /run/suite366-mdns.ip

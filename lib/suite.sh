@@ -2,7 +2,7 @@
 # =============================================================================
 # lib/suite.sh — deploy the Suite 366 `drive` Helm chart (app + Postgres +
 # Redis + MinIO + OnlyOffice + LiveKit/TURN) and the CoreDNS workaround that
-# resolves *.$DOMAIN in-cluster.
+# resolves the appliance hostnames in-cluster.
 # =============================================================================
 
 # --- 4. Deploy Suite 366 (drive chart) --------------------------------------
@@ -28,6 +28,18 @@ deploy_suite() {
   # The other tokens are alphanumeric / paths and need no escaping.
   local lpk_esc
   lpk_esc="$(printf '%s' "$LICENSE_PUBLIC_KEY" | sed -e 's/[&|\\]/\\&/g')"
+  # TLS_MODE decides two things inside values.yaml that cannot be expressed as
+  # a plain hostname: the ingress annotation line, and whether the chart asks
+  # cert-manager for the TURN Certificate. In `provided` mode both point
+  # nowhere, because install.sh has already created the four Secrets itself.
+  local cert_annotation turn_cert_manager
+  if [[ "$TLS_MODE" == "provided" ]]; then
+    cert_annotation="suite366.ai/tls-mode: \"provided\""
+    turn_cert_manager=false
+  else
+    cert_annotation="cert-manager.io/cluster-issuer: \"$CLUSTER_ISSUER\""
+    turn_cert_manager=true
+  fi
   # values.yaml carries `secrets.VLLM_API_KEY` in clear and feeds it
   # to Helm — write it under a restrictive umask so the rendered file lands
   # at 0600 (root-only), and follow with an explicit chmod as belt-and-braces
@@ -35,6 +47,17 @@ deploy_suite() {
   ( umask 077
     fetch "values.yaml" \
       | sed -e "s|@DOMAIN@|$DOMAIN|g" \
+            -e "s|@APP_HOST@|$APP_HOST|g" \
+            -e "s|@OFFICE_HOST@|$OFFICE_HOST|g" \
+            -e "s|@LIVEKIT_HOST@|$LIVEKIT_HOST|g" \
+            -e "s|@TURN_HOST@|$TURN_HOST|g" \
+            -e "s|@APP_TLS_SECRET@|$APP_TLS_SECRET|g" \
+            -e "s|@OFFICE_TLS_SECRET@|$OFFICE_TLS_SECRET|g" \
+            -e "s|@LIVEKIT_TLS_SECRET@|$LIVEKIT_TLS_SECRET|g" \
+            -e "s|@TURN_TLS_SECRET@|$TURN_TLS_SECRET|g" \
+            -e "s|@CLUSTER_ISSUER@|$CLUSTER_ISSUER|g" \
+            -e "s|@INGRESS_CERT_ANNOTATION@|$cert_annotation|g" \
+            -e "s|@TURN_CERT_MANAGER@|$turn_cert_manager|g" \
             -e "s|@HOST_IP@|$HOST_IP|g" \
             -e "s|@SUITE_IP@|$SUITE_IP|g" \
             -e "s|@PROXY_PORT@|$PROXY_PORT|g" \
@@ -64,25 +87,78 @@ deploy_suite() {
     chmod 0770 "$DATA_DIR/$d"
   done
 
-  patch_coredns_for_local_domain
-  # CA locale auto-générée par cert-manager : la passer au chart pour qu'il
-  # la monte dans drive-app via `customCA` + propage `NODE_EXTRA_CA_CERTS`.
-  # Sans ça, drive-app rejette le cert OnlyOffice à
-  # `https://office.$DOMAIN/coauthoring/CommandService.ashx` avec
+  patch_coredns_for_appliance_hosts
+  # CA à monter dans drive-app via `customCA` (+ `NODE_EXTRA_CA_CERTS`). Sans
+  # elle, drive-app rejette le cert OnlyOffice à
+  # `https://$OFFICE_HOST/coauthoring/CommandService.ashx` avec
   # `UNABLE_TO_VERIFY_LEAF_SIGNATURE` -> sauvegarde des docs cassée.
-  local ca_args=()
-  if [[ -f "$DATA_DIR/suite366-local-ca.crt" ]]; then
-    ca_args=(--set customCA.enabled=true \
-             --set-file "customCA.caCert=$DATA_DIR/suite366-local-ca.crt")
-  else
-    warn "Local CA not found at $DATA_DIR/suite366-local-ca.crt — drive-app may reject OnlyOffice's TLS cert."
-  fi
+  # local-ca : la CA auto-générée par cert-manager.
+  # provided : la CA émettrice fournie par le client (TLS_CA_FILE) — même
+  #            problème, même correctif, source différente.
+  local ca_file=""
+  case "$TLS_MODE" in
+    provided) ca_file="${TLS_CA_FILE:-}" ;;
+    *)        ca_file="$DATA_DIR/suite366-local-ca.crt" ;;
+  esac
+  write_custom_ca "$vals" "$ca_file"
+
   info "helm install $RELEASE (pulling chart + images, several minutes)…"
   KUBECONFIG="$KUBECONFIG_PATH" run_progress "Suite 366 deployment" \
     helm upgrade --install "$RELEASE" "$CHART_REF" \
       --version "$CHART_VERSION" --namespace "$NAMESPACE" \
-      -f "$vals" "${ca_args[@]}" --wait --timeout 15m
+      -f "$vals" --wait --timeout 15m
   prepull_images
+}
+
+# Write the CA INTO the generated values.yaml, replacing the template's
+# `customCA: {enabled: false}` placeholder with `enabled: true` + the PEM.
+#
+# It used to be passed on the command line (`--set customCA.enabled=true
+# --set-file customCA.caCert=…`), which worked exactly once: `update.sh apply`
+# upgrades with `-f values.yaml` alone, and the file pins `enabled: false`, so
+# the FIRST update silently dropped NODE_EXTRA_CA_CERTS from drive-app — and
+# with it the trust of OnlyOffice's certificate, i.e. "Failed to save
+# document" surfacing days after an unrelated version bump. Keeping the value
+# in the file makes it survive every later `helm upgrade`.
+write_custom_ca() { # write_custom_ca VALUES_FILE CA_FILE
+  local vals="$1" ca="$2"
+  if [[ -z "$ca" || ! -f "$ca" ]]; then
+    if [[ "$TLS_MODE" == "provided" ]]; then
+      warn "No TLS_CA_FILE given — drive-app will only reach OnlyOffice if the"
+      warn "  issuing CA is already trusted inside the container image."
+    else
+      warn "Local CA not found at ${ca:-<unset>} — drive-app may reject OnlyOffice's TLS cert."
+    fi
+    return 0
+  fi
+  local tmp="$vals.tmp"
+  # awk over sed: this injects a multi-line PEM as a YAML block scalar, which
+  # sed cannot do readably. Idempotent — the whole previous customCA mapping is
+  # replaced, so re-running install.sh cannot stack two `caCert:` keys.
+  ( umask 077
+    awk -v cafile="$ca" '
+      $0 == "customCA:" {
+        print "customCA:"
+        print "  enabled: true"
+        print "  caCert: |"
+        while ((getline line < cafile) > 0) print "    " line
+        close(cafile)
+        swallow = 1
+        next
+      }
+      # Drop EVERY indented line that belonged to the old customCA mapping,
+      # not just `enabled:` — on a re-run the block we injected last time is
+      # still there, and keeping its `caCert:` would emit a duplicate YAML key.
+      swallow {
+        if ($0 ~ /^[ \t]+[^ \t]/) next
+        swallow = 0
+      }
+      { print }
+    ' "$vals" > "$tmp" ) || { warn "could not inject the CA into $vals."; rm -f "$tmp"; return 0; }
+  mv -f "$tmp" "$vals"
+  chmod 0600 "$vals"
+  grep -q '^  caCert: |$' "$vals" || warn "customCA block not injected as expected — check $vals."
+  info "customCA: $ca (persisted in values.yaml)"
 }
 
 # Pre-pull every referenced image into containerd so a later restart works
@@ -106,40 +182,54 @@ ghcr.io/scriptor-group/suite-366-workbench-runner:latest"
 }
 
 # Workaround for server-to-server fetches between drive-app and OnlyOffice:
-# drive-app currently uses ONLYOFFICE_URL (https://office.$DOMAIN, mDNS) for
-# its forcesave callbacks, but k3s pods have no mDNS resolver — getaddrinfo()
-# returns ENOTFOUND and saving the document fails with
-# "Failed to save document".
+# drive-app currently uses ONLYOFFICE_URL (https://$OFFICE_HOST) for its
+# forcesave callbacks. Under mDNS, k3s pods have no mDNS resolver at all
+# (getaddrinfo() returns ENOTFOUND and saving the document fails with "Failed
+# to save document"); under real DNS it would resolve, but only by leaving the
+# node and hairpinning back in through the LAN IP.
 #
-# So we inject the 5 *.$DOMAIN names into CoreDNS's NodeHosts ConfigMap so they
-# resolve to Traefik's ClusterIP. Traffic stays in-cluster, Traefik terminates
-# TLS and routes to the right service.
+# So we map the appliance hostnames to Traefik's ClusterIP in CoreDNS's
+# NodeHosts ConfigMap. Traffic stays in-cluster, Traefik terminates TLS and
+# routes by host.
 #
 # ⚠️ TEMPORARY: remove once suite-366 uses ONLYOFFICE_INTERNAL_URL (already
 # provided by the chart) for its server-side fetches instead of ONLYOFFICE_URL.
 # See /etc/cm/coredns in the cluster for the current state.
-patch_coredns_for_local_domain() {
-  log "CoreDNS: *.$DOMAIN -> Traefik ClusterIP (in-cluster resolution)"
+patch_coredns_for_appliance_hosts() {
+  log "CoreDNS: appliance hostnames -> Traefik ClusterIP (in-cluster resolution)"
   local traefik_ip
   traefik_ip="$(kc -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
   [[ -n "$traefik_ip" ]] || { warn "Traefik ClusterIP not found — skipping CoreDNS patch."; return 0; }
   info "Traefik ClusterIP: $traefik_ip"
+
+  # The APEX domain is mapped only under mDNS. In `dns` mode the apex is the
+  # customer's real zone (their intranet, their mail); pointing it at Traefik
+  # for every pod in the cluster would break far more than it fixes.
+  local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST")
+  [[ "$HOST_MODE" == "mdns" ]] && names+=("$DOMAIN")
+
   local nh corefile
   nh="$(kc -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}')"
   corefile="$(kc -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')"
-  if grep -q "${traefik_ip}.*drive\.${DOMAIN}" <<<"$nh"; then
-    info "*.$DOMAIN entries already present — skipping."
+
+  # REBUILD rather than append: drop every line that already maps one of our
+  # names (whatever IP it carried), then add them back on the current
+  # ClusterIP. Appending left stale entries behind whenever the ClusterIP or a
+  # hostname changed, and a NodeHosts holding two IPs for one name resolves
+  # unpredictably.
+  local kept="$nh" n new_nh
+  for n in "${names[@]}"; do
+    kept="$(awk -v name="$n" '$2 != name' <<<"$kept")"
+  done
+  new_nh="$kept"
+  for n in "${names[@]}"; do
+    new_nh="$(printf '%s\n%s %s' "$new_nh" "$traefik_ip" "$n")"
+  done
+
+  if [[ "$new_nh" == "$nh" ]]; then
+    info "NodeHosts already maps ${#names[@]} names to $traefik_ip — skipping."
     return 0
   fi
-  # Append the 5 names to NodeHosts, then re-create the CM (kubectl create … --dry-run | apply)
-  local new_nh
-  new_nh="$(printf '%s\n%s drive.%s\n%s office.%s\n%s livekit.%s\n%s turn.%s\n%s %s\n' \
-    "$nh" \
-    "$traefik_ip" "$DOMAIN" \
-    "$traefik_ip" "$DOMAIN" \
-    "$traefik_ip" "$DOMAIN" \
-    "$traefik_ip" "$DOMAIN" \
-    "$traefik_ip" "$DOMAIN")"
   printf '%s' "$new_nh" > /tmp/_corefile_nodehosts
   kc -n kube-system create cm coredns \
     --from-file=NodeHosts=/tmp/_corefile_nodehosts \
@@ -149,5 +239,5 @@ patch_coredns_for_local_domain() {
   kc -n kube-system rollout restart deploy/coredns >/dev/null
   kc -n kube-system rollout status deploy/coredns --timeout=60s >/dev/null || \
     warn "CoreDNS rollout incomplete — DNS may take ~30s to settle."
-  info "CoreDNS NodeHosts updated."
+  info "CoreDNS NodeHosts updated (${#names[@]} names -> $traefik_ip)."
 }

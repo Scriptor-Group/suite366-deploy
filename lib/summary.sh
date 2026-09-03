@@ -26,29 +26,74 @@ summary() {
 AI
 )
   fi
+  # DNS / TLS guidance depends on the two choices made in gather_hosts(); a
+  # summary that told every box to install a local CA and wait for mDNS was
+  # actively misleading on a box using the customer's DNS and certificates.
+  local dns_block tls_block
+  if [[ "$HOST_MODE" == "mdns" ]]; then
+    dns_block=" DNS: these names are published via mDNS on the current LAN IP.
+      LAN machines with mDNS (macOS, Windows 10+, Linux+nss-mdns) resolve them
+      with no configuration. mDNS does not cross VPNs or multicast-blocking
+      networks — fallback: add the names to those clients' /etc/hosts."
+  else
+    local w=0 h
+    for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
+      (( ${#h} > w )) && w=${#h}
+    done
+    dns_block=" DNS: resolved by YOUR DNS servers (no mDNS is installed).
+      Required records, all pointing at this host:"
+    for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
+      dns_block+="
+        $(printf '%-*s' "$w" "$h")  A  $HOST_IP"
+    done
+    dns_block+="
+      A single wildcard (*.$DOMAIN A $HOST_IP) covers all four."
+    if (( ${#DNS_TODO[@]} )); then
+      dns_block+="
+   !! ${#DNS_TODO[@]} of these do NOT resolve to $HOST_IP yet — the appliance
+      is not reachable by name until they do:"
+      local todo
+      for todo in "${DNS_TODO[@]}"; do dns_block+="
+        $todo"; done
+    fi
+  fi
+
+  if [[ "$TLS_MODE" == "provided" ]]; then
+    tls_block=" TLS: your own certificates are installed (TLS_MODE=provided).
+      Nothing to deploy on client machines, as long as they already trust the
+      issuing CA.$( [[ -f "$DATA_DIR/suite366-issuing-ca.crt" ]] && printf '
+      A copy of the CA you supplied: /usr/local/share/suite366-issuing-ca.crt' )
+      Renewal is YOUR process: replace the certificate in the Secrets
+      $APP_TLS_SECRET / $OFFICE_TLS_SECRET / $LIVEKIT_TLS_SECRET /
+      $TURN_TLS_SECRET (namespace $NAMESPACE), then restart livekit for TURN.
+      Nothing on this box watches their expiry."
+  else
+    tls_block=" TLS trust: install the local CA on each client machine
+      /usr/local/share/suite366-local-ca.crt   (world-readable, ready to scp)
+      $DATA_DIR/suite366-local-ca.crt          (same file, root-only)"
+  fi
+
   cat <<EOF
 
 $(printf "${c_g}========================================================================${c_0}")
 $(printf "${c_b} Suite 366 installed on the DGX Spark${c_0}")
 $(printf "${c_g}========================================================================${c_0}")
 
- Application :   https://drive.$DOMAIN
- OnlyOffice  :   https://office.$DOMAIN
- LiveKit     :   wss://livekit.$DOMAIN
+ Application :   https://$APP_HOST
+ OnlyOffice  :   https://$OFFICE_HOST
+ LiveKit     :   wss://$LIVEKIT_HOST
+ TURN        :   $TURN_HOST:5349
 
 $ai
 
- TLS trust: install the CA on each client machine
-   /usr/local/share/suite366-local-ca.crt   (world-readable, ready to scp)
-   $DATA_DIR/suite366-local-ca.crt          (same file, root-only)
+$tls_block
 
- DNS: *.{$DOMAIN} is published via mDNS. LAN machines with mDNS support
-      (macOS, Windows 10+, Linux+nss-mdns) resolve it without config.
+$dns_block
 
  Network     : cluster pinned to $SUITE_IP on $SUITE_IFACE (stable, survives
                    LAN changes/offline). External access follows the current
-                   LAN IP via Traefik + dynamic mDNS.
- systemd services: suite366-net, suite366-vllm, suite366-avahi-aliases, k3s
+                   LAN IP via Traefik$( [[ "$HOST_MODE" == "mdns" ]] && printf ' + dynamic mDNS' ).
+ systemd services: suite366-net, suite366-vllm$( [[ "$HOST_MODE" == "mdns" ]] && printf ', suite366-avahi-aliases' ), k3s
  Updates         : checked daily (suite366-update.timer, notify-only).
                    Check now : sudo $DATA_DIR/update.sh check
                    Apply     : sudo $DATA_DIR/update.sh apply
