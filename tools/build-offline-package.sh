@@ -19,6 +19,9 @@
 #   --min-from VER  refuse to apply on appliances older than VER
 #   --no-vllm       skip the multi-GB vLLM image (box already runs the right one)
 #   --channel FILE  channel manifest to build from (default: ./channel.json)
+#   --no-restic     skip the restic binary (an air-gapped box then has a backup
+#                   agent it can never run — only pass this for a box you know
+#                   already has the right restic)
 #
 # Layout produced (see update.sh `pkg_verify` for the verifier):
 #   suite366-update-<app_version>/
@@ -28,7 +31,9 @@
 #   ├── chart/drive-<ver>.tgz
 #   ├── images/*.tar           imported into containerd's k8s.io namespace
 #   ├── docker-images/*.tar    loaded into the Docker daemon (vLLM/compose stack)
-#   └── scripts/update.sh      the updater this package expects
+#   ├── bin/restic             the pinned restic (an air-gapped box cannot fetch it)
+#   ├── scripts/update.sh      the updater this package expects
+#   └── scripts/backup.sh      the backup agent this package expects
 #
 # ONE signature, over SHA256SUMS. Every other file earns trust from a checksum
 # line inside that signed list, so there is no ambiguity about which signature
@@ -43,6 +48,7 @@ ARCH="arm64"
 OUT="$REPO_ROOT/dist"
 MIN_FROM=""
 WITH_VLLM=1
+WITH_RESTIC=1
 CHANNEL_FILE="$REPO_ROOT/channel.json"
 
 c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
@@ -60,7 +66,8 @@ while [[ $# -gt 0 ]]; do
     --min-from)  MIN_FROM="$2"; shift 2 ;;
     --channel)   CHANNEL_FILE="$2"; shift 2 ;;
     --no-vllm)   WITH_VLLM=0; shift ;;
-    -h|--help)   sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --no-restic) WITH_RESTIC=0; shift ;;
+    -h|--help)   sed -n '2,46p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)           die "unknown option: $1" ;;
   esac
 done
@@ -100,7 +107,7 @@ info "platform     : linux/$ARCH"
 
 # A stale directory would leave orphaned files that SHA256SUMS still covers.
 rm -rf "$PKG"
-mkdir -p "$PKG"/{chart,images,docker-images,scripts}
+mkdir -p "$PKG"/{chart,images,docker-images,scripts,bin}
 
 # --- Chart -------------------------------------------------------------------
 log "Pulling chart $CHART_VERSION"
@@ -189,11 +196,47 @@ else
   rmdir "$PKG/docker-images"
 fi
 
-# --- Updater -----------------------------------------------------------------
-# The appliance installs THIS update.sh after applying the package: it is the
-# only signed path to move the updater forward on an air-gapped box.
+# --- Updater + backup agent ---------------------------------------------------
+# The appliance installs THESE after applying the package: it is the only signed
+# path to move either script forward on an air-gapped box.
 install -m 0644 "$REPO_ROOT/update.sh" "$PKG/scripts/update.sh"
 bash -n "$PKG/scripts/update.sh" || die "bundled update.sh does not parse."
+install -m 0644 "$REPO_ROOT/backup.sh" "$PKG/scripts/backup.sh"
+bash -n "$PKG/scripts/backup.sh" || die "bundled backup.sh does not parse."
+
+# --- restic -------------------------------------------------------------------
+# Version and checksums come from lib/config.sh, so the package and a networked
+# install can never disagree about which restic an appliance runs. The checksum
+# is verified HERE, at build time, on a machine with a human present — a box in
+# a customer's building has no way to tell a corrupted download from a hostile
+# one, and by then the binary is already inside a signed package.
+if [[ "$WITH_RESTIC" == 1 ]]; then
+  # shellcheck source=../lib/config.sh disable=SC1091
+  RESTIC_VERSION="$(sed -n 's/^RESTIC_VERSION="\${RESTIC_VERSION:-\([^}]*\)}"/\1/p' "$REPO_ROOT/lib/config.sh")"
+  case "$ARCH" in
+    arm64) rsha="$(sed -n 's/^RESTIC_SHA256_ARM64="\${RESTIC_SHA256_ARM64:-\([^}]*\)}"/\1/p' "$REPO_ROOT/lib/config.sh")" ;;
+    amd64) rsha="$(sed -n 's/^RESTIC_SHA256_AMD64="\${RESTIC_SHA256_AMD64:-\([^}]*\)}"/\1/p' "$REPO_ROOT/lib/config.sh")" ;;
+  esac
+  [[ -n "$RESTIC_VERSION" && -n "${rsha:-}" ]] \
+    || die "could not read RESTIC_VERSION / RESTIC_SHA256_${ARCH^^} from lib/config.sh."
+  rurl="https://github.com/restic/restic/releases/download/v$RESTIC_VERSION/restic_${RESTIC_VERSION}_linux_${ARCH}.bz2"
+  log "Fetching restic $RESTIC_VERSION ($ARCH)"
+  rbz="$(mktemp)"
+  curl -fsSL -m 180 "$rurl" -o "$rbz" || die "could not download restic from $rurl"
+  rgot="$(sha256sum "$rbz" | awk '{print $1}')"
+  if [[ "$rgot" != "$rsha" ]]; then
+    rm -f "$rbz"
+    die "restic checksum mismatch (expected $rsha, got $rgot) — refusing to package it."
+  fi
+  have bunzip2 || die "bzip2 required to unpack restic (or pass --no-restic)."
+  bunzip2 -c "$rbz" > "$PKG/bin/restic" || { rm -f "$rbz"; die "could not unpack restic."; }
+  rm -f "$rbz"
+  chmod 0755 "$PKG/bin/restic"
+  info "  -> bin/restic ($RESTIC_VERSION, $(du -h "$PKG/bin/restic" | cut -f1))"
+else
+  rmdir "$PKG/bin"
+  warn "--no-restic: an air-gapped appliance without restic cannot run its backup agent."
+fi
 
 # --- Manifest ----------------------------------------------------------------
 cat > "$PKG/manifest.json" <<EOF

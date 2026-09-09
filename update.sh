@@ -59,6 +59,9 @@
 #                   sibling of MANIFEST_URL). Set SELF_UPDATE=0 to disable
 #                   (fleet boxes do: their updater only moves with a SIGNED
 #                   package, never with an unauthenticated HTTPS fetch).
+#   BACKUP_URL      same, for the backup agent (default: sibling of
+#                   MANIFEST_URL). Governed by the same SELF_UPDATE switch and
+#                   the same signature rules — see converge_backup.
 #   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying offline packages.
 #                   Absent file => every offline package is refused.
 # =============================================================================
@@ -83,6 +86,26 @@ UPDATE_WEBHOOK="${UPDATE_WEBHOOK:-}"
 SELF_UPDATE="${SELF_UPDATE:-1}"
 SELF_URL="${SELF_URL:-${MANIFEST_URL%/*}/update.sh}"
 MARKER="$DATA_DIR/update-available"
+
+# --- Backup agent ---------------------------------------------------------------
+# The updater refreshes itself on every apply. If the backup agent did not move
+# with it, a fleet would drift into new updaters running old backup agents — and
+# the nightly job would keep reporting success while backing up the wrong things
+# (or, on a box installed before the backup layer existed, nothing at all). So
+# backup.sh is converged here, under the same signature rules as update.sh.
+BACKUP_URL="${BACKUP_URL:-${MANIFEST_URL%/*}/backup.sh}"
+BACKUP_AGENT="$DATA_DIR/backup.sh"
+BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
+BACKUP_ENV="${BACKUP_ENV:-$BACKUP_DIR/backup.env}"
+RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
+# One line, read deliberately rather than sourcing the file: backup.env also
+# carries the destination's S3 credentials, and the updater has no business
+# holding them even briefly.
+if [[ -f "$BACKUP_ENV" ]]; then
+  _rb="$(sed -n 's/^RESTIC_BIN=//p' "$BACKUP_ENV" | head -1)"
+  [[ -n "$_rb" ]] && RESTIC_BIN="$_rb"
+  unset _rb
+fi
 
 # --- Offline (USB) package source ---------------------------------------------
 # A verified package is COPIED off the removable drive into $OFFLINE_PKG so the
@@ -266,7 +289,7 @@ ver_gt() { # ver_gt A B
 fetch_manifest_online() {
   online_reachable=0; online_error=""; online_signed=0
   online_chart=""; online_app=""; online_vllm=""; online_channel=""; online_notes=""
-  online_updater_sha=""
+  online_updater_sha=""; online_backup_sha=""
   log "Fetching channel manifest"
   info "$MANIFEST_URL"
 
@@ -293,6 +316,7 @@ fetch_manifest_online() {
   online_app="$(json_get app_version        <<<"$manifest")"
   online_notes="$(json_get notes            <<<"$manifest")"
   online_updater_sha="$(json_get updater_sha256 <<<"$manifest")"
+  online_backup_sha="$(json_get backup_sha256  <<<"$manifest")"
   if [[ -z "$online_chart" ]]; then
     online_error="manifest has no chart_version"
     warn "$online_error ($MANIFEST_URL)"
@@ -790,10 +814,14 @@ do_apply() {
   install_units
   if [[ "$UPDATE_SOURCE" == "usb" ]]; then
     self_update_from_package
+    # BEFORE retire_staged_package: retiring deletes the staged content, and the
+    # backup agent plus the restic binary live inside it.
+    converge_backup_from_package
     retire_staged_package
     load_offline_source
   else
     self_update
+    converge_backup
   fi
 
   UPDATE_SOURCE=none
@@ -955,6 +983,121 @@ self_update() {
     info "update.sh refreshed from $SELF_URL$([[ "$strict" == 1 ]] && printf ' (signature-verified)')."
   fi
   rm -f "$tmp"
+}
+
+# --- backup agent convergence -----------------------------------------------------
+# Same trust ladder as self_update, for the same reason: backup.sh runs as root,
+# nightly, holding the destination's credentials.
+#
+#   key present + signed manifest + matching hash -> install
+#   key present, anything else                    -> REFUSE (fail closed)
+#   no key installed                              -> TLS-only, as before
+#
+# Two things make this more than a copy of self_update:
+#
+#   • A box installed before the backup layer existed has NO agent. Refreshing
+#     it is not enough — the timer has to be armed too, or the file sits there
+#     doing nothing. So a first install also runs `install-units`.
+#   • Arming a timer is not the same as being backed up. Convergence deliberately
+#     does NOT invent a repository key or a destination: the key is shown exactly
+#     once, to a human, at install (see lib/backup.sh), and one silently
+#     generated here would exist on precisely one disk with nobody holding a
+#     copy. Instead the agent is asked to publish its state, so the box reports
+#     "unconfigured" to the UI rather than looking installed and being empty.
+converge_backup() {
+  [[ "$SELF_UPDATE" == "1" ]] || return 0
+  local strict=0 fresh=0
+  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  [[ -x "$BACKUP_AGENT" ]] || fresh=1
+
+  if [[ "$strict" == 1 ]]; then
+    if [[ "${online_signed:-0}" != "1" ]]; then
+      warn "not refreshing backup.sh: the channel manifest was not signature-verified."
+      return 0
+    fi
+    if [[ -z "${online_backup_sha:-}" ]]; then
+      warn "not refreshing backup.sh: the signed manifest carries no backup_sha256."
+      warn "  Publish it with tools/sign-channel.sh, or the backup agent cannot roll forward"
+      warn "  and this box keeps whatever agent it was installed with."
+      return 0
+    fi
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  if ! curl -fsSL -m 20 "$BACKUP_URL" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+    warn "could not fetch backup.sh from $BACKUP_URL (non-blocking)."
+    rm -f "$tmp"; return 0
+  fi
+
+  if [[ "$strict" == 1 ]]; then
+    local got; got="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ "$got" != "$online_backup_sha" ]]; then
+      warn "REFUSING backup.sh from $BACKUP_URL — hash does not match the signed manifest."
+      warn "  expected $online_backup_sha"
+      warn "  got      $got"
+      rm -f "$tmp"; return 0
+    fi
+  fi
+
+  if ! bash -n "$tmp" 2>/dev/null; then
+    warn "fetched backup.sh does not parse — keeping the current one."
+    rm -f "$tmp"; return 0
+  fi
+  if ! cmp -s "$tmp" "$BACKUP_AGENT" 2>/dev/null; then
+    install -m 0700 "$tmp" "$BACKUP_AGENT"
+    info "backup.sh refreshed from $BACKUP_URL$([[ "$strict" == 1 ]] && printf ' (signature-verified)')."
+  fi
+  rm -f "$tmp"
+  arm_backup_agent "$fresh"
+}
+
+# Shared by the online and offline paths.
+arm_backup_agent() { # arm_backup_agent FRESH(0|1)
+  local fresh="$1"
+  [[ -x "$BACKUP_AGENT" ]] || return 0
+  if [[ "$fresh" == 1 ]]; then
+    log "Backup agent installed on a box that had none — arming its timer"
+    DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" install-units \
+      || warn "could not arm the backup timer."
+  fi
+  # Publish state either way, so the UI can distinguish "armed and idle because
+  # nobody chose a destination" from "silently absent".
+  DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
+  if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
+    warn "backups are NOT configured on this appliance (no repository key)."
+    warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
+  fi
+}
+
+# The package ships both the agent and the restic binary, and both are covered
+# by the signed SHA256SUMS — the only trustworthy way to move them forward on a
+# box with no outbound access. Shipping restic matters more than it looks: an
+# air-gapped appliance cannot download it, so without this an offline fleet
+# would carry a backup agent it can never run.
+converge_backup_from_package() {
+  local src="$OFFLINE_PKG/scripts/backup.sh" fresh=0
+  [[ -x "$BACKUP_AGENT" ]] || fresh=1
+
+  if [[ -s "$src" ]] && bash -n "$src" 2>/dev/null; then
+    if ! cmp -s "$src" "$BACKUP_AGENT" 2>/dev/null; then
+      install -m 0700 "$src" "$BACKUP_AGENT"
+      info "backup.sh refreshed from the signed package."
+    fi
+  fi
+
+  local rsrc="$OFFLINE_PKG/bin/restic"
+  if [[ -s "$rsrc" ]]; then
+    # Replace only on a real difference: an identical copy every apply would
+    # churn a binary the nightly timer may be executing at that very moment.
+    if ! cmp -s "$rsrc" "$RESTIC_BIN" 2>/dev/null; then
+      mkdir -p "$(dirname "$RESTIC_BIN")"; chmod 0700 "$(dirname "$RESTIC_BIN")"
+      install -m 0700 "$rsrc" "$RESTIC_BIN" \
+        && info "restic installed from the signed package ($("$RESTIC_BIN" version 2>/dev/null | head -1))."
+    fi
+  fi
+
+  [[ -x "$BACKUP_AGENT" ]] && arm_backup_agent "$fresh"
+  return 0
 }
 
 # --- Mode dispatch ---------------------------------------------------------------

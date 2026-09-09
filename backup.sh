@@ -354,8 +354,11 @@ print(json.dumps(out[-40:], indent=2))
 }
 
 do_run() {
-  require_restic
   ensure_backup_dir
+  # Order matters: an appliance that has the agent but no destination is not
+  # broken, it is unconfigured, and it must be able to say so even with no
+  # restic on disk — which is exactly the state update.sh's converge_backup
+  # leaves a box that never had a backup layer.
   if ! configured; then
     # Deliberately exit 0: an unconfigured appliance has nothing to do, and a
     # timer that goes red every night on purpose is a timer nobody reads.
@@ -364,6 +367,15 @@ do_run() {
     write_state_json
     warn "backup not configured (no BACKUP_REPO) — nothing to do."
     return 0
+  fi
+  # Configured but unable to run: that IS broken, and it has to reach the UI.
+  # A missing restic used to only ever be a message on someone's terminal.
+  if [[ ! -x "$RESTIC_BIN" ]]; then
+    STATE_STATUS="error"
+    STATE_ERROR="restic missing at $RESTIC_BIN"
+    STATE_FINISHED="$(now_utc)"
+    write_state_json
+    die "restic not found at $RESTIC_BIN (re-run install.sh, or apply an offline package)."
   fi
   # One run at a time. The timer and an operator running this by hand would
   # otherwise fight over the repository lock, which restic resolves by making

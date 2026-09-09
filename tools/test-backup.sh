@@ -17,7 +17,10 @@
 #   • the secrets snapshot exists at all — it is what carries AUTH_SECRET;
 #   • credentials embedded in a repository URL never reach state.json;
 #   • restore refuses to extract into a directory that is not empty;
-#   • two runs cannot overlap.
+#   • two runs cannot overlap;
+#   • update.sh's convergence installs the agent on a box that never had one,
+#     arms its timer, and does NOT invent a repository key — a key generated
+#     with nobody watching exists on exactly one disk and is in nobody's hands.
 #
 # When a real `restic` is on PATH, it additionally does a genuine
 # init -> backup -> restore -> diff against a local repository.
@@ -94,6 +97,11 @@ printf '#!/usr/bin/env bash\nif [[ "${1:-}" == "-u" ]]; then echo 0; else exec /
 chmod +x "$BIN"/*
 ORIG_PATH="$PATH"          # kept so the real-restic section can bypass the stubs
 export PATH="$BIN:$PATH"
+
+# A public key file is all the strict-mode branches look at (they check that it
+# EXISTS, the signature itself having been verified earlier by update.sh).
+openssl genpkey -algorithm ed25519 -out "$WORK/conv.key" 2>/dev/null
+openssl pkey -in "$WORK/conv.key" -pubout -out "$WORK/good.pub" 2>/dev/null
 
 DATA="$WORK/opt/suite366"
 mkdir -p "$DATA/models" "$DATA/bin"
@@ -198,6 +206,110 @@ sleep 0.3
 bk run
 check "a second concurrent run is refused" "$?" "1"
 wait "$holder" 2>/dev/null
+
+echo "== update.sh converges the backup agent =="
+# The functions under test live in update.sh. Pull them out verbatim, the same
+# way test-package-verify.sh pulls out pkg_verify, so the test cannot drift from
+# the shipped code by copying it.
+CONV="$WORK/conv"; mkdir -p "$CONV"
+CDATA="$CONV/opt/suite366"; mkdir -p "$CDATA/backup"
+cp "$REPO/backup.sh" "$CONV/served-backup.sh"
+SERVED_SHA="$(sha256sum "$CONV/served-backup.sh" | awk '{print $1}')"
+
+# curl stub: serves the agent from a file:// style local path.
+cat > "$BIN/curl" <<EOF
+#!/usr/bin/env bash
+out=""; url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -*) shift ;;
+    *)  url="\$1"; shift ;;
+  esac
+done
+[[ -f "$CONV/serve/\$(basename "\$url")" ]] || exit 22
+cp "$CONV/serve/\$(basename "\$url")" "\$out"
+EOF
+chmod +x "$BIN/curl"
+mkdir -p "$CONV/serve"; cp "$CONV/served-backup.sh" "$CONV/serve/backup.sh"
+
+converge() { # converge FUNC EXTRA_ENV...
+  local fn="$1"; shift
+  env "$@" bash -c '
+    set -uo pipefail
+    c_b=""; c_g=""; c_y=""; c_r=""; c_0=""
+    log()  { printf "==> %s\n" "$*"; }
+    info() { printf "    %s\n" "$*"; }
+    warn() { printf "!!  %s\n" "$*"; }
+    eval "$(sed -n "/^converge_backup() {/,/^}/p"              "$1")"
+    eval "$(sed -n "/^arm_backup_agent() {/,/^}/p"             "$1")"
+    eval "$(sed -n "/^converge_backup_from_package() {/,/^}/p" "$1")"
+    "$2"
+  ' _ "$REPO/update.sh" "$fn" 2>&1
+}
+
+CENV=(DATA_DIR="$CDATA" BACKUP_AGENT="$CDATA/backup.sh" BACKUP_DIR="$CDATA/backup"
+      BACKUP_URL="http://x/backup.sh" RESTIC_BIN="$BIN/restic" SELF_UPDATE=1
+      PATH="$BIN:$PATH")
+
+# 1. A box that never had a backup layer: strict mode, signed manifest, right hash.
+rm -f "$CDATA/backup.sh"
+o="$(converge converge_backup "${CENV[@]}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
+[[ -x "$CDATA/backup.sh" ]] && ok "agent installed on a box that had none" \
+  || ko "agent installed on a box that had none" "$o"
+contains "it arms the timer on first install" "arming its timer" "$o"
+[[ ! -e "$CDATA/backup/repo.pass" ]] && ok "convergence does NOT invent a repository key" \
+  || ko "convergence does NOT invent a repository key" "a key appeared"
+contains "it says backups are not configured" "NOT configured" "$o"
+check "the installed agent is byte-identical to the served one" \
+  "$(sha256sum "$CDATA/backup.sh" | awk '{print $1}')" "$SERVED_SHA"
+
+# 2. Same box again: no reinstall churn, no second arming.
+o="$(converge converge_backup "${CENV[@]}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
+absent "a converged box is not re-armed every apply" "arming its timer" "$o"
+
+# 3. The hash in the signed manifest does not match what the server returned.
+printf '\n# tampered\n' >> "$CONV/serve/backup.sh"
+o="$(converge converge_backup "${CENV[@]}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
+contains "a mismatched hash is REFUSED" "REFUSING backup.sh" "$o"
+check "and the on-disk agent is untouched" \
+  "$(sha256sum "$CDATA/backup.sh" | awk '{print $1}')" "$SERVED_SHA"
+cp "$CONV/served-backup.sh" "$CONV/serve/backup.sh"
+
+# 4. Key present but the manifest carries no backup_sha256: fail closed. This is
+#    the case a forgotten tools/sign-channel.sh produces, and it must refuse
+#    rather than fall back to trusting TLS.
+o="$(converge converge_backup "${CENV[@]}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="")"
+contains "no backup_sha256 in a signed manifest => refuse" "carries no backup_sha256" "$o"
+
+# 5. Key present, manifest NOT signature-verified: refuse.
+o="$(converge converge_backup "${CENV[@]}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=0 online_backup_sha="$SERVED_SHA")"
+contains "an unverified manifest => refuse" "was not signature-verified" "$o"
+
+# 6. SELF_UPDATE=0 (a fleet box that only moves with signed packages).
+rm -f "$CDATA/backup.sh"
+o="$(converge converge_backup "${CENV[@]/SELF_UPDATE=1/SELF_UPDATE=0}" \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
+[[ ! -e "$CDATA/backup.sh" ]] && ok "SELF_UPDATE=0 installs nothing" \
+  || ko "SELF_UPDATE=0 installs nothing" "$o"
+
+# 7. The offline path: agent AND restic come out of the staged package.
+PKGD="$CONV/pkg"; mkdir -p "$PKGD/scripts" "$PKGD/bin"
+cp "$CONV/served-backup.sh" "$PKGD/scripts/backup.sh"
+printf '#!/usr/bin/env bash\necho "restic 0.19.1 from package"\n' > "$PKGD/bin/restic"
+chmod +x "$PKGD/bin/restic"
+RB="$CDATA/bin/restic"; rm -f "$RB" "$CDATA/backup.sh"
+o="$(converge converge_backup_from_package "${CENV[@]/RESTIC_BIN=$BIN\/restic/RESTIC_BIN=$RB}" \
+      OFFLINE_PKG="$PKGD")"
+[[ -x "$CDATA/backup.sh" ]] && ok "package installs the agent" || ko "package installs the agent" "$o"
+[[ -x "$RB" ]] && ok "package installs restic (an air-gapped box cannot fetch it)" \
+  || ko "package installs restic (an air-gapped box cannot fetch it)" "$o"
+contains "and arms the timer" "arming its timer" "$o"
 
 echo "== real restic round trip (skipped if restic is absent) =="
 if PATH="$ORIG_PATH" command -v restic >/dev/null 2>&1; then
