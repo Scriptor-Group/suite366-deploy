@@ -5,6 +5,10 @@
 #   backup.sh init | run | test | status | snapshots | prune | restore
 #             | install-units
 #
+# `restore` extracts, and nothing else. `restore --in-place` rebuilds this
+# appliance from a snapshot: see do_restore_in_place for the order the steps
+# have to happen in and why each guard is there.
+#
 # WHY THIS RUNS ON THE HOST, NOT AS A CronJob
 # The one moment a backup matters is the moment the appliance is broken — which
 # is exactly when an in-cluster CronJob is not running. This agent also reads
@@ -82,6 +86,10 @@ warn() { printf "${c_y}!!  %s${c_0}\n" "$*"; }
 die()  { printf "${c_r}xx  %s${c_0}\n" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 kc()   { k3s kubectl "$@"; }
+# Same definition as lib/common.sh. Duplicated rather than sourced: backup.sh is
+# fetched and run standalone, including from a signed package, and must not
+# depend on the installer's tree being present.
+tty_usable() { (exec </dev/tty) >/dev/null 2>&1; }
 now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 json_esc() {
@@ -442,24 +450,38 @@ do_snapshots() {
   res snapshots --tag suite366
 }
 
-# Lot B extracts; it does not overwrite. An in-place restore has to patch
-# AUTH_SECRET before the data lands, stop MinIO, and reinitialise Postgres —
-# a sequence that must be exercised on a real box before it is automated, and
-# automating it untested is how a recovery turns into a second outage. So this
-# gets the data OUT of the repository safely and prints what to do with it.
+# Two restore paths, and the difference matters.
+#
+#   restore --target DIR   extracts. Touches nothing on this appliance. This is
+#                          the right first move in almost every real incident:
+#                          get the bytes somewhere safe, look at them, then
+#                          decide.
+#   restore --in-place     rebuilds THIS appliance from a snapshot. Destructive,
+#                          ordered, and guarded — see do_restore_in_place.
 do_restore() {
   require_restic
   configured || die "no destination configured."
-  local snap="latest" target=""
+  local snap="latest" target="" in_place=0 assume_yes=0 force=0 dry=0
   shift || true
   while (( $# )); do
     case "$1" in
       --snapshot) snap="${2:-}"; shift 2 ;;
       --target)   target="${2:-}"; shift 2 ;;
-      *) die "unknown argument '$1' (use: restore [--snapshot ID] --target DIR)" ;;
+      --in-place) in_place=1; shift ;;
+      --dry-run)  dry=1; shift ;;
+      --yes)      assume_yes=1; shift ;;
+      --force)    force=1; shift ;;
+      *) die "unknown argument '$1' (use: restore [--snapshot ID] --target DIR | --in-place [--dry-run] [--yes] [--force])" ;;
     esac
   done
-  [[ -n "$target" ]] || die "restore needs --target DIR (an EMPTY directory to extract into)."
+
+  if (( in_place )); then
+    [[ -z "$target" ]] || die "--target and --in-place are mutually exclusive."
+    do_restore_in_place "$snap" "$assume_yes" "$force" "$dry"
+    return
+  fi
+
+  [[ -n "$target" ]] || die "restore needs --target DIR (an EMPTY directory to extract into), or --in-place."
   [[ -e "$target" && -n "$(ls -A "$target" 2>/dev/null)" ]] \
     && die "$target is not empty — extract into a fresh directory."
   mkdir -p "$target"; chmod 0700 "$target"
@@ -470,7 +492,10 @@ do_restore() {
 
 $(printf "${c_b}Extracted. Nothing on this appliance has been modified.${c_0}")
 
-  Next steps are MANUAL and order-dependent — see docs/restore.md:
+  To rebuild this appliance from the same snapshot:
+    sudo $DATA_DIR/backup.sh restore --in-place --snapshot $snap
+
+  To do it by hand instead, the order is not negotiable — see docs/restore.md:
     1. patch AUTH_SECRET from $target/…/app-secret.yaml into secret-<app>
        BEFORE loading any data, or every encrypted column in the database
        becomes unreadable while appearing to restore fine;
@@ -480,6 +505,237 @@ $(printf "${c_b}Extracted. Nothing on this appliance has been modified.${c_0}")
     5. verify POSITIVELY: open a document AND make one LLM call with a stored
        provider key. A box that merely boots proves nothing about step 1.
 EOF
+}
+
+# --- in-place restore -----------------------------------------------------------
+# The order below is the whole design, and every step is placed where it is
+# because putting it elsewhere breaks something quietly:
+#
+#   1. extract everything first. A restore that discovers a truncated dump
+#      halfway through has already stopped the app.
+#   2. take a pre-restore snapshot of what is here NOW. This is the only thing
+#      that makes the operation reversible, and it costs seconds.
+#   3. scale the app to 0 BEFORE touching data: a running app writing to a
+#      database that is being reloaded produces a mixture of both.
+#   4. patch AUTH_SECRET (and any legacy key the source box carried) BEFORE the
+#      data lands. Get this wrong and Postgres restores perfectly while every
+#      encrypted column — provider API keys, OAuth tokens — is permanently
+#      unreadable, with no error anywhere. suite-366's encryption.ts derives its
+#      AES key from AUTH_SECRET, and falls back to NEXTAUTH_SECRET /
+#      ENCRYPTION_KEY on decrypt, so all three are carried when present.
+#   5. pg_restore.
+#   6. MinIO objects, with MinIO stopped, .minio.sys left alone — that directory
+#      holds the FRESH install's root credentials, and overwriting it locks you
+#      out of the data you just restored.
+#   7. scale back up and prove it works.
+#
+# NOT restored, deliberately: POSTGRES_PASSWORD / DATABASE_URL / MINIO_* (the
+# fresh install generated its own and the dump is logical, so carrying the old
+# ones over breaks a working stack), values.yaml (the rebuilt box may legitimately
+# have different hostnames — it is extracted for reference instead) and the local
+# CA (restoring it is a deliberate choice, documented in docs/restore.md).
+#
+# ⚠️ HONEST STATUS: exercised against stubs and against a real restic repository,
+# but NOT yet against a live appliance — doing so means destroying a running
+# customer box. Read docs/restore.md before using it in an incident, and prefer
+# `--target` plus the manual sequence if you have never run this before.
+do_restore_in_place() { # do_restore_in_place SNAP ASSUME_YES FORCE DRY
+  local snap="$1" assume_yes="$2" force="$3" dry="$4"
+  # mktemp, not just a timestamp: two restores started in the same second would
+  # otherwise share a directory, and the second would happily find the first
+  # one's extracted dump — silently restoring the wrong snapshot.
+  local stage
+  stage="$(mktemp -d "$BACKUP_DIR/restore-$(date -u '+%Y%m%dT%H%M%SZ')-XXXXXX")"
+
+  have flock || die "flock required."
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "a backup run holds $LOCK_FILE — wait for it to finish."
+
+  local pg_deploy minio_pvc minio_path app_secret app_deploy minio_deploy
+  pg_deploy="$(discover_pg)"
+  [[ -n "$pg_deploy" ]] || die "no *-postgres deployment in ns/$NAMESPACE — is the chart installed?"
+  minio_pvc="$(discover_minio_pvc)" || true
+  [[ -n "$minio_pvc" ]] && minio_path="$(pvc_host_path "$minio_pvc" || true)"
+  app_secret="$(kc -n "$NAMESPACE" get secret -o name 2>/dev/null \
+    | sed -n 's|^secret/||p' | grep '^secret-' | head -1)"
+  [[ -n "$app_secret" ]] || die "no secret-* in ns/$NAMESPACE — refusing: AUTH_SECRET could not be patched."
+  app_deploy="$(kc -n "$NAMESPACE" get deploy -o name 2>/dev/null \
+    | sed -n 's|^deployment.apps/||p' | grep -v -- '-postgres$\|-minio$\|-redis$\|-onlyoffice$\|-livekit$' | head -1)"
+  minio_deploy="$(kc -n "$NAMESPACE" get deploy -o name 2>/dev/null \
+    | sed -n 's|^deployment.apps/||p' | grep -- '-minio$' | head -1)"
+
+  cat <<EOF
+
+$(printf "${c_r}────────────────────────────────────────────────────────────────${c_0}")
+$(printf "${c_b} IN-PLACE RESTORE — this OVERWRITES live data on this appliance${c_0}")
+$(printf "${c_r}────────────────────────────────────────────────────────────────${c_0}")
+
+  snapshot     : $snap
+  repository   : $(redact_repo "$BACKUP_REPO")
+  namespace    : $NAMESPACE
+
+  will be REPLACED:
+    database   : deploy/$pg_deploy (dropped and reloaded from the dump)
+    objects    : ${minio_path:-<no minio pvc found — objects NOT restored>}
+    AUTH_SECRET: $app_secret (patched from the snapshot, before the data)
+
+  will be STOPPED during the restore:
+    ${app_deploy:-<no app deployment found>}${minio_deploy:+, $minio_deploy}
+
+  NOT touched: values.yaml, the local CA, models/, this repository's key.
+  A pre-restore snapshot of the CURRENT database and secrets is taken first.
+
+EOF
+
+  if (( dry )); then
+    warn "--dry-run: stopping here. Nothing has been changed."
+    return 0
+  fi
+
+  # A populated database is the case where this command destroys real work. The
+  # expected use is a REBUILT box whose database is empty; anything else needs
+  # to be said out loud.
+  local rows
+  rows="$(pg_exec "$pg_deploy" 'psql -tAq -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select count(*) from information_schema.tables where table_schema='"'"'public'"'"'"' 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${rows:-0}" =~ ^[0-9]+$ ]] && (( rows > 0 )) && (( ! force )); then
+    die "the target database already has $rows table(s) — this is not a fresh box.
+    Restoring would destroy whatever is in it. Re-run with --force if that is
+    genuinely what you want, after taking your own copy."
+  fi
+
+  if (( ! assume_yes )); then
+    tty_usable || die "no TTY and no --yes: refusing to overwrite live data unattended."
+    local ack=""
+    read -r -p " Type RESTORE to proceed: " ack </dev/tty || true
+    [[ "$ack" == "RESTORE" ]] || die "not confirmed — nothing was changed."
+  fi
+
+  restic_env
+
+  # --- 1. extract ---------------------------------------------------------------
+  chmod 0700 "$stage"
+  log "1/7  Extracting snapshot '$snap'"
+  res restore "$snap" --target "$stage" || die "restic restore failed — nothing was changed."
+  local dump secret_yaml
+  dump="$(find "$stage" -name postgres.dump -type f | head -1)"
+  secret_yaml="$(find "$stage" -name app-secret.yaml -type f | head -1)"
+  [[ -s "$dump" ]] || die "the snapshot carries no postgres.dump — nothing was changed."
+  [[ -s "$secret_yaml" ]] || die "the snapshot carries no app-secret.yaml, so AUTH_SECRET cannot be
+    carried over. Restoring the data without it would produce a database whose
+    encrypted columns are permanently unreadable. Nothing was changed."
+  # A dump that was truncated at backup time is unusable, and finding that out
+  # after dropping the live database is the worst possible moment.
+  if have pg_restore; then
+    pg_restore --list "$dump" >/dev/null 2>&1 \
+      || die "the extracted dump is not a readable pg_dump archive — nothing was changed."
+  fi
+  info "extracted to $stage"
+
+  # --- 2. reversibility ---------------------------------------------------------
+  log "2/7  Snapshotting the CURRENT state first (tag pre-restore)"
+  kc -n "$NAMESPACE" get secret "$app_secret" -o yaml \
+    | res backup --stdin --stdin-filename pre-restore-app-secret.yaml \
+        --tag suite366 --tag pre-restore >/dev/null \
+    || warn "could not snapshot the current secret — continuing, but this restore is now one-way."
+  if kc -n "$NAMESPACE" exec "deploy/$pg_deploy" -- \
+       sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
+     | res backup --stdin --stdin-filename pre-restore-postgres.dump \
+         --tag suite366 --tag pre-restore >/dev/null
+  then info "pre-restore snapshot stored."
+  else warn "could not dump the current database — continuing, but this restore is now one-way."
+  fi
+
+  # --- 3. stop the writers ------------------------------------------------------
+  log "3/7  Stopping the app"
+  [[ -n "$app_deploy" ]] && kc -n "$NAMESPACE" scale "deploy/$app_deploy" --replicas=0 >/dev/null 2>&1
+  [[ -n "$app_deploy" ]] && kc -n "$NAMESPACE" rollout status "deploy/$app_deploy" --timeout=120s >/dev/null 2>&1
+  info "${app_deploy:-app} scaled to 0"
+
+  # --- 4. AUTH_SECRET, BEFORE the data ------------------------------------------
+  log "4/7  Carrying AUTH_SECRET over (before the data — see the header)"
+  local k patched=0
+  for k in AUTH_SECRET NEXTAUTH_SECRET ENCRYPTION_KEY; do
+    local v
+    v="$(sed -n "s/^  $k: //p" "$secret_yaml" | head -1 | tr -d '[:space:]')"
+    [[ -n "$v" ]] || continue
+    kc -n "$NAMESPACE" patch secret "$app_secret" --type merge \
+      -p "{\"data\":{\"$k\":\"$v\"}}" >/dev/null \
+      || die "could not patch $k into $app_secret — STOPPING before the data lands."
+    info "$k restored"
+    patched=$((patched+1))
+  done
+  (( patched > 0 )) || die "the snapshot's secret carries no AUTH_SECRET — STOPPING before the data lands."
+
+  # --- 5. database ----------------------------------------------------------------
+  log "5/7  Reloading the database"
+  # --clean --if-exists so a rebuilt-but-migrated schema is replaced rather than
+  # collided with; the dump is logical, so the fresh install's own password and
+  # role stay in force.
+  if kc -n "$NAMESPACE" exec -i "deploy/$pg_deploy" -- \
+       sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --no-privileges' \
+       < "$dump"
+  then info "database reloaded"
+  else warn "pg_restore reported errors — review them before declaring this restore good."
+  fi
+
+  # --- 6. objects -------------------------------------------------------------------
+  if [[ -n "${minio_path:-}" && -d "$minio_path" ]]; then
+    log "6/7  Restoring objects into $minio_path"
+    local src
+    src="$(find "$stage" -type d -name "$(basename "$minio_path")" | head -1)"
+    if [[ -n "$src" && -d "$src" ]]; then
+      [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" scale "deploy/$minio_deploy" --replicas=0 >/dev/null 2>&1
+      [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" rollout status "deploy/$minio_deploy" --timeout=120s >/dev/null 2>&1
+      # --exclude .minio.sys: that directory holds THIS install's root
+      # credentials and IAM. Overwriting it locks you out of the very objects
+      # being restored.
+      if have rsync; then
+        rsync -a --exclude '.minio.sys' "$src"/ "$minio_path"/ \
+          || warn "rsync reported errors while restoring objects."
+      else
+        ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name '.minio.sys' -exec cp -a {} "$minio_path"/ \; ) \
+          || warn "copy reported errors while restoring objects."
+      fi
+      [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" scale "deploy/$minio_deploy" --replicas=1 >/dev/null 2>&1
+      info "objects restored (.minio.sys left untouched)"
+    else
+      warn "the snapshot carries no object directory matching $(basename "$minio_path") — objects NOT restored."
+    fi
+  else
+    log "6/7  No MinIO PVC resolved — skipping objects"
+  fi
+
+  # --- 7. back up, and prove it -----------------------------------------------------
+  log "7/7  Restarting the app"
+  if [[ -n "$app_deploy" ]]; then
+    kc -n "$NAMESPACE" scale "deploy/$app_deploy" --replicas=1 >/dev/null 2>&1
+    if kc -n "$NAMESPACE" rollout status "deploy/$app_deploy" --timeout=300s >/dev/null 2>&1; then
+      info "$app_deploy is Ready"
+    else
+      warn "$app_deploy did not become Ready within 5 minutes — check its logs."
+    fi
+  fi
+
+  cat <<EOF
+
+$(printf "${c_b}Restore finished.${c_0}") Staged copy kept at $stage
+  (it holds the extracted secret — delete it once you are done: rm -rf $stage)
+
+$(printf "${c_y}It is not done until you have verified it POSITIVELY:${c_0}")
+  • open a document — proves the objects and the database agree;
+  • make one LLM call using a STORED provider key — this is the only check that
+    proves AUTH_SECRET was carried over correctly. A box that merely boots, and
+    a user who merely logs in, prove nothing about it.
+
+  If this went wrong, the state from before is in the repository:
+    $DATA_DIR/backup.sh snapshots        # look for the 'pre-restore' tag
+EOF
+}
+
+# Run a command inside the postgres pod. Kept separate because the in-place
+# restore probes the database before it is allowed to touch it.
+pg_exec() { # pg_exec DEPLOY SHELL_COMMAND
+  kc -n "$NAMESPACE" exec "deploy/$1" -- sh -c "$2" 2>/dev/null
 }
 
 do_status() {

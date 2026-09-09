@@ -64,18 +64,46 @@ case "\$1" in
   backup)    case "\$*" in *--stdin*) cat >/dev/null 2>&1 || true ;; esac; exit 0 ;;
   forget)    exit 0 ;;
   stats)     echo "Total Size: 1.234 GiB" ;;
-  restore)   mkdir -p "\${3:-$WORK/unused}"; echo restored > "\${3:-$WORK/unused}/postgres.dump"; exit 0 ;;
+  restore)
+    # Parse --target properly (the in-place restore reads what lands there) and
+    # lay out a tree shaped like a real snapshot.
+    tgt=""; while [[ \$# -gt 0 ]]; do [[ "\$1" == "--target" ]] && { tgt="\$2"; break; }; shift; done
+    tgt="\${tgt:-$WORK/unused}"; mkdir -p "\$tgt"
+    [[ -f "$WORK/no-dump" ]]   || printf 'PGDMP-fake-dump-content' > "\$tgt/postgres.dump"
+    [[ -f "$WORK/no-secret" ]] || cat > "\$tgt/app-secret.yaml" <<'YAML'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: secret-drive-app
+data:
+  AUTH_SECRET: b2xkLWF1dGgtc2VjcmV0
+  NEXTAUTH_SECRET: bGVnYWN5LWtleQ==
+  POSTGRES_PASSWORD: c2hvdWxkLW5vdC1iZS1yZXN0b3JlZA==
+YAML
+    mkdir -p "\$tgt/minio/suite-366/doc" "\$tgt/minio/.minio.sys"
+    echo restored-object > "\$tgt/minio/suite-366/doc/part.1"
+    echo snapshot-iam    > "\$tgt/minio/.minio.sys/iam.json"
+    exit 0 ;;
   *)         exit 0 ;;
 esac
 EOF
 
 # k3s kubectl: just enough cluster to exercise discovery + the dump pipe.
+KLOG="$WORK/k3s.log"; : > "$KLOG"
 cat > "$BIN/k3s" <<EOF
 #!/usr/bin/env bash
 shift   # drop "kubectl"
 args="\$*"
+echo "\$args" >> "$KLOG"
 case "\$args" in
-  *"get deploy -o name"*)  echo "deployment.apps/drive-postgres" ;;
+  *"get deploy -o name"*)
+    printf '%s\\n' deployment.apps/drive-app deployment.apps/drive-postgres \\
+                    deployment.apps/drive-minio deployment.apps/drive-redis \\
+                    deployment.apps/drive-onlyoffice ;;
+  *scale*|*"rollout status"*) exit 0 ;;
+  *"patch secret"*) exit 0 ;;
+  *pg_restore*)     cat >/dev/null 2>&1 || true; exit 0 ;;
+  *information_schema.tables*) cat "$WORK/pg-tables" 2>/dev/null || echo 0 ;;
   *"get pvc -o name"*)     echo "persistentvolumeclaim/drive-minio-pvc" ;;
   *"get pvc drive-minio-pvc -o jsonpath"*) echo "pvc-abc123" ;;
   *"get pv pvc-abc123 -o jsonpath={.spec.local.path}"*) echo "$MINIO_DATA" ;;
@@ -92,6 +120,12 @@ case "\$args" in
 esac
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/systemctl"
+# pg_restore --list is the pre-flight that refuses a truncated dump.
+cat > "$BIN/pg_restore" <<EOF
+#!/usr/bin/env bash
+[[ -f "$WORK/bad-dump" ]] && exit 1
+exit 0
+EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/chown"
 printf '#!/usr/bin/env bash\nif [[ "${1:-}" == "-u" ]]; then echo 0; else exec /usr/bin/id "$@"; fi\n' > "$BIN/id"
 chmod +x "$BIN"/*
@@ -198,6 +232,102 @@ bk restore --target "$WORK/fresh"; rc=$?
 check "restore into a fresh directory works" "$rc" "0"
 contains "it says nothing was modified" "Nothing on this appliance has been modified" "$(out)"
 contains "it points at the AUTH_SECRET step first" "patch AUTH_SECRET" "$(out)"
+
+echo "== in-place restore is guarded, ordered and reversible =="
+# This is the one command in the appliance that destroys data on purpose, so
+# what is tested here is mostly what it REFUSES to do.
+export MINIO_PVC=drive-minio-pvc
+
+bk restore --in-place --target "$WORK/x"
+check "--in-place and --target are mutually exclusive" "$?" "1"
+
+: > "$KLOG"
+bk restore --in-place --dry-run
+check "--dry-run exits 0" "$?" "0"
+contains "--dry-run names what would be replaced" "will be REPLACED" "$(out)"
+contains "--dry-run says nothing changed" "Nothing has been changed" "$(out)"
+absent  "--dry-run patches no secret" "patch secret" "$(cat "$KLOG")"
+absent  "--dry-run scales nothing down" "--replicas=0" "$(cat "$KLOG")"
+
+# No TTY and no --yes: refuse rather than overwrite live data unattended.
+bk restore --in-place
+check "unattended without --yes is refused" "$?" "1"
+contains "and says why" "refusing to overwrite live data unattended" "$(out)"
+
+# A populated database is not a fresh box.
+echo 42 > "$WORK/pg-tables"
+bk restore --in-place --yes
+check "a populated database is refused without --force" "$?" "1"
+contains "and says how many tables it found" "already has 42 table" "$(out)"
+echo 0 > "$WORK/pg-tables"
+
+# A snapshot with no secret cannot carry AUTH_SECRET: refuse BEFORE any data
+# lands, because the alternative is a database that restores perfectly and is
+# permanently unreadable.
+: > "$KLOG"; touch "$WORK/no-secret"
+bk restore --in-place --yes
+check "a snapshot without app-secret.yaml is refused" "$?" "1"
+contains "and explains the consequence" "permanently unreadable" "$(out)"
+absent  "nothing was reloaded" "pg_restore" "$(cat "$KLOG")"
+rm -f "$WORK/no-secret"
+
+: > "$KLOG"; touch "$WORK/no-dump"
+bk restore --in-place --yes
+check "a snapshot without postgres.dump is refused" "$?" "1"
+absent  "and the app was never stopped" "--replicas=0" "$(cat "$KLOG")"
+rm -f "$WORK/no-dump"
+
+# A dump that was truncated at backup time must be caught BEFORE the live
+# database is dropped — finding out afterwards is the worst possible moment.
+: > "$KLOG"; touch "$WORK/bad-dump"
+bk restore --in-place --yes
+check "an unreadable dump is refused" "$?" "1"
+contains "and says so" "not a readable pg_dump archive" "$(out)"
+absent  "and the app was never stopped" "--replicas=0" "$(cat "$KLOG")"
+rm -f "$WORK/bad-dump"
+
+# --- the happy path, and the ordering that is the whole design ----------------
+: > "$KLOG"; : > "$RLOG"
+bk restore --in-place --yes; rc=$?
+check "a valid in-place restore succeeds" "$rc" "0"
+
+klog="$(cat "$KLOG")"
+contains "it takes a pre-restore snapshot" "pre-restore" "$(cat "$RLOG")"
+contains "it patches AUTH_SECRET" "patch secret secret-drive-app" "$klog"
+contains "it carries the legacy key too" "NEXTAUTH_SECRET" "$klog"
+# Scoped to the patch calls: POSTGRES_PASSWORD legitimately appears in the
+# pg_restore command line (the pod reads it from its own environment).
+absent  "it does NOT restore POSTGRES_PASSWORD" "POSTGRES_PASSWORD" \
+        "$(grep 'patch secret' "$KLOG" || true)"
+absent  "it does NOT restore MinIO credentials" "MINIO" \
+        "$(grep 'patch secret' "$KLOG" || true)"
+contains "it reloads the database" "pg_restore" "$klog"
+contains "it stops the app first" "scale deploy/drive-app --replicas=0" "$klog"
+contains "it brings the app back" "scale deploy/drive-app --replicas=1" "$klog"
+
+# THE ordering guarantee: the secret has to be in place before the data is.
+patch_at=$(grep -n "patch secret" "$KLOG" | head -1 | cut -d: -f1)
+restore_at=$(grep -n "pg_restore" "$KLOG" | head -1 | cut -d: -f1)
+stop_at=$(grep -n -- "--replicas=0" "$KLOG" | head -1 | cut -d: -f1)
+if [[ -n "$patch_at" && -n "$restore_at" && "$patch_at" -lt "$restore_at" ]]; then
+  ok "AUTH_SECRET is patched BEFORE the data is reloaded"
+else
+  ko "AUTH_SECRET is patched BEFORE the data is reloaded" "patch@${patch_at:-none} restore@${restore_at:-none}"
+fi
+if [[ -n "$stop_at" && -n "$restore_at" && "$stop_at" -lt "$restore_at" ]]; then
+  ok "the app is stopped BEFORE the data is reloaded"
+else
+  ko "the app is stopped BEFORE the data is reloaded" "stop@${stop_at:-none} restore@${restore_at:-none}"
+fi
+
+# .minio.sys holds THIS install's root credentials. Restoring the snapshot's
+# copy over it locks you out of the objects you just restored.
+check "the live .minio.sys is untouched" "$(cat "$MINIO_DATA/.minio.sys/iam.json")" "iam"
+[[ -f "$MINIO_DATA/suite-366/doc/part.1" ]] \
+  && ok "objects from the snapshot are restored" || ko "objects from the snapshot are restored"
+contains "it demands a positive verification" "LLM call using a STORED provider key" "$(out)"
+contains "it points at the way back" "pre-restore" "$(out)"
+unset MINIO_PVC
 
 echo "== concurrent runs =="
 ( flock 9; sleep 3 ) 9>"$BACKUP_DIR/.lock" &
