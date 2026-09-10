@@ -428,9 +428,11 @@ do_test() {
     write_state_json
     return 0
   fi
-  STATE_ERROR="destination unreachable or wrong credentials/key"
+  STATE_ERROR="destination unreachable, or no repository there yet"
   write_state_json
-  die "cannot read $(redact_repo "$BACKUP_REPO") — wrong credentials, wrong key, or unreachable."
+  die "cannot read $(redact_repo "$BACKUP_REPO").
+    Either nothing has initialised a repository there yet (run: $0 init), or the
+    destination is unreachable, or the credentials or the repository key are wrong."
 }
 
 collect_snapshots() {
@@ -940,6 +942,13 @@ ENV
   . "$BACKUP_ENV"
   BACKUP_SCHEDULE="$sched"
   install_units
+
+  # Create the repository before testing it. A destination an admin has just
+  # chosen is almost always empty, and `test` on an empty one reports "wrong
+  # credentials, wrong key, or unreachable" — which is false on all three
+  # counts and sends them to re-check an S3 key that was correct. Failing here
+  # instead says "restic init failed", which is the true problem.
+  do_init
   do_test
 }
 
