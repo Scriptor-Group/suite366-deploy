@@ -97,6 +97,29 @@ log "Pinning the scripts an appliance fetches"
 pin_script updater_sha256 "$UPDATER"
 pin_script backup_sha256  "$BACKUP"
 
+# The restic pins ride along, read from lib/config.sh so there is exactly one
+# place in the repo that decides which restic an appliance runs. Signing them
+# is what lets a box fetch the binary online and still verify it against a hash
+# WE published, rather than against whatever the download served today.
+pin_value() { # pin_value FIELD VALUE
+  local field="$1" value="$2" tmp got
+  [[ -n "$value" ]] || die "empty value for $field — check lib/config.sh."
+  grep -q "\"$field\"" "$CHANNEL" \
+    || die "$CHANNEL has no $field field — add \"$field\": \"\" first."
+  tmp="$(mktemp)"
+  sed -E "s|(\"$field\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")|\\1$value\\2|" \
+    "$CHANNEL" > "$tmp" && cat "$tmp" > "$CHANNEL"
+  rm -f "$tmp"
+  got="$(sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$CHANNEL" | head -1)"
+  [[ "$got" == "$value" ]] || die "failed to write $field into $CHANNEL (got '$got')."
+  info "$field -> $value"
+}
+
+cfg() { sed -n "s/^$1=\"\\\${$1:-\([^}]*\)}\"/\1/p" "$REPO_ROOT/lib/config.sh" | head -1; }
+pin_value restic_version      "$(cfg RESTIC_VERSION)"
+pin_value restic_sha256_arm64 "$(cfg RESTIC_SHA256_ARM64)"
+pin_value restic_sha256_amd64 "$(cfg RESTIC_SHA256_AMD64)"
+
 # --- 2. Sign ------------------------------------------------------------------
 log "Signing $(basename "$CHANNEL")"
 openssl pkeyutl -sign -rawin -inkey "$KEY" \

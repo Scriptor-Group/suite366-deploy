@@ -290,6 +290,7 @@ fetch_manifest_online() {
   online_reachable=0; online_error=""; online_signed=0
   online_chart=""; online_app=""; online_vllm=""; online_channel=""; online_notes=""
   online_updater_sha=""; online_backup_sha=""
+  online_restic_ver=""; online_restic_sha=""
   log "Fetching channel manifest"
   info "$MANIFEST_URL"
 
@@ -317,6 +318,11 @@ fetch_manifest_online() {
   online_notes="$(json_get notes            <<<"$manifest")"
   online_updater_sha="$(json_get updater_sha256 <<<"$manifest")"
   online_backup_sha="$(json_get backup_sha256  <<<"$manifest")"
+  online_restic_ver="$(json_get restic_version <<<"$manifest")"
+  case "$(uname -m)" in
+    aarch64) online_restic_sha="$(json_get restic_sha256_arm64 <<<"$manifest")" ;;
+    x86_64)  online_restic_sha="$(json_get restic_sha256_amd64 <<<"$manifest")" ;;
+  esac
   if [[ -z "$online_chart" ]]; then
     online_error="manifest has no chart_version"
     warn "$online_error ($MANIFEST_URL)"
@@ -727,6 +733,7 @@ do_apply() {
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
     install_units
     self_update
+    converge_backup
     return 0
   fi
 
@@ -1048,6 +1055,9 @@ converge_backup() {
     info "backup.sh refreshed from $BACKUP_URL$([[ "$strict" == 1 ]] && printf ' (signature-verified)')."
   fi
   rm -f "$tmp"
+  # Before arming: a timer whose agent has no restic can only ever report an
+  # error, and it would do so nightly.
+  install_restic_online || true
   arm_backup_agent "$fresh"
 }
 
@@ -1060,13 +1070,65 @@ arm_backup_agent() { # arm_backup_agent FRESH(0|1)
     DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" install-units \
       || warn "could not arm the backup timer."
   fi
-  # Publish state either way, so the UI can distinguish "armed and idle because
-  # nobody chose a destination" from "silently absent".
-  DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
-  if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
-    warn "backups are NOT configured on this appliance (no repository key)."
-    warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
+  # Only on a first install, and only then. A box that had no agent has no
+  # destination either, so this is a cheap no-op that publishes `unconfigured`
+  # and lets the UI say so. On an already-converged box it would be a full
+  # backup on every daily check, on top of the nightly timer.
+  if [[ "$fresh" == 1 ]]; then
+    DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
+    if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
+      warn "backups are NOT configured on this appliance (no repository key)."
+      warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
+    fi
   fi
+}
+
+# An agent with no restic is an armed timer that can never run. The offline
+# package carries the binary; a networked box has to fetch it, and the version
+# and checksum come from the SIGNED manifest so the box verifies the download
+# against a hash we published rather than against whatever the server served.
+#
+# Best effort by design: no restic means backups do not work yet, which
+# `backup.sh run` reports as an error state the UI shows. It does not mean the
+# update failed.
+install_restic_online() {
+  [[ -x "$RESTIC_BIN" ]] && return 0
+  local ver="${online_restic_ver:-}" want="${online_restic_sha:-}" arch
+  if [[ -z "$ver" || -z "$want" ]]; then
+    warn "no restic pin in the channel manifest — the backup agent has no binary to run."
+    warn "  Publish restic_version + restic_sha256_* (tools/sign-channel.sh), or run install.sh."
+    return 1
+  fi
+  case "$(uname -m)" in
+    aarch64) arch=arm64 ;;
+    x86_64)  arch=amd64 ;;
+    *) warn "no pinned restic for $(uname -m)."; return 1 ;;
+  esac
+  have bunzip2 || { warn "bzip2 missing — cannot unpack restic."; return 1; }
+
+  local url="https://github.com/restic/restic/releases/download/v$ver/restic_${ver}_linux_${arch}.bz2"
+  local tmp; tmp="$(mktemp)"
+  info "Fetching restic $ver ($arch) for the backup agent…"
+  if ! curl -fsSL -m 180 "$url" -o "$tmp"; then
+    rm -f "$tmp"; warn "could not download restic (offline?) — backups stay unavailable."; return 1
+  fi
+  local got; got="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$got" != "$want" ]]; then
+    rm -f "$tmp"
+    # Fail closed: this binary runs as root, nightly, holding the destination's
+    # credentials and every document that goes into the repository.
+    warn "REFUSING restic — checksum does not match the signed manifest."
+    warn "  expected $want"
+    warn "  got      $got"
+    return 1
+  fi
+  mkdir -p "$(dirname "$RESTIC_BIN")"; chmod 0700 "$(dirname "$RESTIC_BIN")"
+  if ! bunzip2 -c "$tmp" > "$RESTIC_BIN"; then
+    rm -f "$tmp"; warn "could not unpack restic."; return 1
+  fi
+  rm -f "$tmp"; chmod 0700 "$RESTIC_BIN"
+  "$RESTIC_BIN" version >/dev/null 2>&1 || { warn "the restic binary does not run here."; return 1; }
+  info "restic installed: $RESTIC_BIN ($("$RESTIC_BIN" version 2>/dev/null | head -1))"
 }
 
 # The package ships both the agent and the restic binary, and both are covered
@@ -1112,6 +1174,12 @@ case "$MODE" in
     require_cluster_tools
     survey
     notify
+    # Convergence belongs here, not only in `apply`. `apply` runs when there is
+    # something to apply; a box sitting on the current version never triggers
+    # it, so putting convergence there alone means the appliances that need the
+    # backup agent most — the ones nobody has touched in months — are exactly
+    # the ones that never receive it.
+    converge_backup
     ;;
   apply)
     require_cluster_tools
