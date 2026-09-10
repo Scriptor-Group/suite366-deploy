@@ -57,6 +57,24 @@ jobs:
           }
           check updater_sha256 update.sh
           check backup_sha256  backup.sh
+          # The restic pins are signed too, and lib/config.sh is the single
+          # source of truth for them. A channel that disagrees with it means an
+          # online box fetches one restic while an install.sh box fetches
+          # another — and only one of the two hashes was ever signed.
+          cfg() { sed -n "s/^$1=\"\\\${$1:-\\([^}]*\\)}\"/\\1/p" lib/config.sh | head -1; }
+          for pair in "restic_version:RESTIC_VERSION" \
+                      "restic_sha256_arm64:RESTIC_SHA256_ARM64" \
+                      "restic_sha256_amd64:RESTIC_SHA256_AMD64"; do
+            field="${pair%%:*}"; var="${pair##*:}"
+            want="$(cfg "$var")"
+            got="$(sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" channel.json | head -1)"
+            if [[ "$got" != "$want" ]]; then
+              echo "::error::$field is '$got' but lib/config.sh says '$want' — re-run tools/sign-channel.sh"
+              rc=1
+            else
+              echo "$field matches lib/config.sh ($got)"
+            fi
+          done
           exit $rc
 
       - name: channel.json.sig verifies

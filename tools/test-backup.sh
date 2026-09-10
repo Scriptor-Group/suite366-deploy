@@ -453,16 +453,19 @@ converge() { # converge FUNC EXTRA_ENV...
     log()  { printf "==> %s\n" "$*"; }
     info() { printf "    %s\n" "$*"; }
     warn() { printf "!!  %s\n" "$*"; }
+    have() { command -v "$1" >/dev/null 2>&1; }
     eval "$(sed -n "/^converge_backup() {/,/^}/p"              "$1")"
+    eval "$(sed -n "/^install_restic_online() {/,/^}/p"        "$1")"
     eval "$(sed -n "/^arm_backup_agent() {/,/^}/p"             "$1")"
     eval "$(sed -n "/^converge_backup_from_package() {/,/^}/p" "$1")"
     "$2"
   ' _ "$REPO/update.sh" "$fn" 2>&1
 }
 
+CSYSD="$CONV/systemd"; mkdir -p "$CSYSD"
 CENV=(DATA_DIR="$CDATA" BACKUP_AGENT="$CDATA/backup.sh" BACKUP_DIR="$CDATA/backup"
       BACKUP_URL="http://x/backup.sh" RESTIC_BIN="$BIN/restic" SELF_UPDATE=1
-      PATH="$BIN:$PATH")
+      SYSTEMD_DIR="$CSYSD" PATH="$BIN:$PATH")
 
 # 1. A box that never had a backup layer: strict mode, signed manifest, right hash.
 rm -f "$CDATA/backup.sh"
@@ -471,6 +474,12 @@ o="$(converge converge_backup "${CENV[@]}" \
 [[ -x "$CDATA/backup.sh" ]] && ok "agent installed on a box that had none" \
   || ko "agent installed on a box that had none" "$o"
 contains "it arms the timer on first install" "arming its timer" "$o"
+# Assert the units, not the log line: the first version of this test checked
+# only the message and passed while install-units was failing on a permission
+# error nobody read.
+[[ -f "$CSYSD/suite366-backup.timer" && -f "$CSYSD/suite366-backup-run.path" ]] \
+  && ok "the timer and trigger units really exist" \
+  || ko "the timer and trigger units really exist"
 [[ ! -e "$CDATA/backup/repo.pass" ]] && ok "convergence does NOT invent a repository key" \
   || ko "convergence does NOT invent a repository key" "a key appeared"
 contains "it says backups are not configured" "NOT configured" "$o"
@@ -520,6 +529,44 @@ o="$(converge converge_backup "${CENV[@]/SELF_UPDATE=1/SELF_UPDATE=0}" \
       PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
 [[ ! -e "$CDATA/backup.sh" ]] && ok "SELF_UPDATE=0 installs nothing" \
   || ko "SELF_UPDATE=0 installs nothing" "$o"
+
+# 6b. An agent with no restic is an armed timer that can never run, so a
+#     networked box must be able to fetch the binary — verified against the
+#     hash in the SIGNED manifest, not against whatever the server returned.
+RB2="$CDATA/bin/restic"; command rm -f "$RB2" "$CDATA/backup.sh"
+printf 'fake restic payload\n' | bzip2 -c > "$CONV/serve/restic.bz2" 2>/dev/null || true
+if [[ -s "$CONV/serve/restic.bz2" ]]; then
+  RSHA="$(sha256sum "$CONV/serve/restic.bz2" | awk '{print $1}')"
+  # curl stub already serves anything under $CONV/serve by basename; point the
+  # download at it by giving the loop a matching name.
+  cp "$CONV/serve/restic.bz2" "$CONV/serve/restic_9.9.9_linux_$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').bz2"
+  o="$(converge converge_backup "${CENV[@]/RESTIC_BIN=$BIN\/restic/RESTIC_BIN=$RB2}" \
+        PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA" \
+        online_restic_ver=9.9.9 online_restic_sha="$RSHA")"
+  [[ -s "$RB2" ]] && ok "restic is fetched online when the agent has none" \
+    || ko "restic is fetched online when the agent has none" "$o"
+
+  # The whole point of pinning: a binary that does not match the signed hash
+  # runs nightly as root with the destination's credentials.
+  command rm -f "$RB2" "$CDATA/backup.sh"
+  o="$(converge converge_backup "${CENV[@]/RESTIC_BIN=$BIN\/restic/RESTIC_BIN=$RB2}" \
+        PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA" \
+        online_restic_ver=9.9.9 online_restic_sha="0000000000000000000000000000000000000000000000000000000000000000")"
+  [[ ! -e "$RB2" ]] && ok "a restic that does not match the signed hash is REFUSED" \
+    || ko "a restic that does not match the signed hash is REFUSED" "$o"
+  contains "and says why" "REFUSING restic" "$o"
+
+  # No pin published at all: say so rather than install something unverified.
+  command rm -f "$RB2" "$CDATA/backup.sh"
+  o="$(converge converge_backup "${CENV[@]/RESTIC_BIN=$BIN\/restic/RESTIC_BIN=$RB2}" \
+        PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA" \
+        online_restic_ver="" online_restic_sha="")"
+  contains "no restic pin in the manifest is reported, not guessed" "no restic pin" "$o"
+  # …and the agent still lands, so the box reports its state instead of nothing.
+  [[ -x "$CDATA/backup.sh" ]] && ok "the agent installs anyway" || ko "the agent installs anyway"
+else
+  printf '  \033[33mSKIP\033[0m online restic fetch (no bzip2)\n'
+fi
 
 # 7. The offline path: agent AND restic come out of the staged package.
 PKGD="$CONV/pkg"; mkdir -p "$PKGD/scripts" "$PKGD/bin"
