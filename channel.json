@@ -4,7 +4,7 @@
   "app_version": "1.8.22",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
   "updater_sha256": "fef81a15ef45e98ebf133517f445e93afb2292ce527ddadc9ab9df855a469234",
-  "backup_sha256": "2a25b429114ab252df5d7802ec6ea5eeba0ca06491b74868f1c6d4172a92cc42",
+  "backup_sha256": "0766733920d67e7eb498026d1ad5294b5c82197896fb234604843c1776568ffb",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",

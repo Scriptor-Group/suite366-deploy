@@ -82,6 +82,14 @@ SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 [[ -f "$BACKUP_ENV" ]] && source "$BACKUP_ENV"
 
 BACKUP_REPO="${BACKUP_REPO:-}"
+# These three were missing, and only the FIRST configuration from the UI hit
+# it: with no backup.env yet, nothing defines them, and `set -u` killed the
+# agent inside the systemd unit before it could write anything. Every test had
+# created backup.env first, so the one path a new box actually takes was the
+# one never exercised.
+BACKUP_S3_ACCESS_KEY="${BACKUP_S3_ACCESS_KEY:-}"
+BACKUP_S3_SECRET_KEY="${BACKUP_S3_SECRET_KEY:-}"
+BACKUP_S3_REGION="${BACKUP_S3_REGION:-}"
 BACKUP_KEEP_DAILY="${BACKUP_KEEP_DAILY:-7}"
 BACKUP_KEEP_WEEKLY="${BACKUP_KEEP_WEEKLY:-4}"
 BACKUP_KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-6}"

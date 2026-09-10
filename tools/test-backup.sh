@@ -366,6 +366,18 @@ cfg() { # cfg JSON -> runs the configure trigger
 }
 key_before="$(sha256sum "$BACKUP_DIR/repo.pass" | awk '{print $1}')"
 
+# THE path a new appliance actually takes: an admin configures a destination on
+# a box that has never had a backup.env. Every other test in this file writes
+# one first, which is exactly why this went unnoticed until it died inside a
+# systemd unit on real hardware.
+command rm -f "$BACKUP_DIR/backup.env"
+cfg '{"repository":"/var/tmp/first-run/repo","requested_by":"admin@acme.tld"}'
+check "the FIRST configuration, with no backup.env, succeeds" "$?" "0"
+contains "and writes the destination" "BACKUP_REPO=/var/tmp/first-run/repo" \
+  "$(cat "$BACKUP_DIR/backup.env" 2>/dev/null)"
+contains "with empty credentials rather than an unbound variable" \
+  "BACKUP_S3_ACCESS_KEY=" "$(cat "$BACKUP_DIR/backup.env" 2>/dev/null)"
+
 # A repository string that is not a restic backend must never reach
 # RESTIC_REPOSITORY: that variable is read by a process running as root.
 for bad in 'rm -rf /' 'file:///etc/passwd' 's3:bucket;curl evil' '$(id)' 'http://x/y'; do
