@@ -477,10 +477,21 @@ contains "it says backups are not configured" "NOT configured" "$o"
 check "the installed agent is byte-identical to the served one" \
   "$(sha256sum "$CDATA/backup.sh" | awk '{print $1}')" "$SERVED_SHA"
 
-# 2. Same box again: no reinstall churn, no second arming.
+# 2. Same box again: no reinstall churn, no second arming — and, the one that
+#    bites now that convergence runs on the DAILY check, no backup run. Doing
+#    that unconditionally meant a full backup every day at check time on top of
+#    the nightly timer.
+# `backup.sh run` is the only thing that writes state.json, so removing it and
+# checking it stays gone proves convergence did not invoke a run.
+command rm -f "$CDATA/backup/state.json"
 o="$(converge converge_backup "${CENV[@]}" \
       PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
 absent "a converged box is not re-armed every apply" "arming its timer" "$o"
+if [[ -e "$CDATA/backup/state.json" ]]; then
+  ko "converging an existing agent does not run a backup" "state.json was rewritten"
+else
+  ok "converging an existing agent does not run a backup"
+fi
 
 # 3. The hash in the signed manifest does not match what the server returned.
 printf '\n# tampered\n' >> "$CONV/serve/backup.sh"

@@ -727,6 +727,7 @@ do_apply() {
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
     install_units
     self_update
+    converge_backup
     return 0
   fi
 
@@ -1060,12 +1061,16 @@ arm_backup_agent() { # arm_backup_agent FRESH(0|1)
     DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" install-units \
       || warn "could not arm the backup timer."
   fi
-  # Publish state either way, so the UI can distinguish "armed and idle because
-  # nobody chose a destination" from "silently absent".
-  DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
-  if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
-    warn "backups are NOT configured on this appliance (no repository key)."
-    warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
+  # Only on a first install, and only then. A box that had no agent has no
+  # destination either, so this is a cheap no-op that publishes `unconfigured`
+  # and lets the UI say so. On an already-converged box it would be a full
+  # backup on every daily check, on top of the nightly timer.
+  if [[ "$fresh" == 1 ]]; then
+    DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
+    if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
+      warn "backups are NOT configured on this appliance (no repository key)."
+      warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
+    fi
   fi
 }
 
@@ -1112,6 +1117,12 @@ case "$MODE" in
     require_cluster_tools
     survey
     notify
+    # Convergence belongs here, not only in `apply`. `apply` runs when there is
+    # something to apply; a box sitting on the current version never triggers
+    # it, so putting convergence there alone means the appliances that need the
+    # backup agent most — the ones nobody has touched in months — are exactly
+    # the ones that never receive it.
+    converge_backup
     ;;
   apply)
     require_cluster_tools
