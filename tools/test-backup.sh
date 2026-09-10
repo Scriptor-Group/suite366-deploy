@@ -457,6 +457,16 @@ done
 contains "the configure unit runs the right verb" "handle-trigger configure" \
   "$(cat "$SYSTEMD_DIR/suite366-backup-configure.service")"
 
+# A destination an admin has just chosen is almost always EMPTY, and `test` on
+# an empty one used to report "wrong credentials, wrong key, or unreachable" —
+# false on all three counts, and it sends them to re-check a correct S3 key.
+touch "$WORK/no-repo"; : > "$RLOG"
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/fresh","requested_by":"admin@acme.tld"}'
+check "configuring an EMPTY destination succeeds" "$?" "0"
+contains "because it initialises the repository first" "init" "$(cat "$RLOG")"
+command rm -f "$WORK/no-repo"
+
+
 # Changing only the schedule must not require the UI to round-trip a secret.
 cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","access_key":"","secret_key":"","schedule":"04:05","requested_by":"admin@acme.tld"}'
 contains "an empty secret keeps the stored one" "BACKUP_S3_SECRET_KEY=SK" "$(cat "$env_file")"
