@@ -10,7 +10,10 @@
 #     box with no destination is not permanently red;
 #   • the MinIO snapshot EXCLUDES .minio.sys — restoring one install's IAM over
 #     another's root credentials locks you out of the data you just restored;
-#   • the config snapshot excludes models/, the cache and the key file itself;
+#   • the config snapshot excludes models/, bin/ and the WHOLE backup
+#     directory — naming its sensitive files one by one is how backup.env (S3
+#     credentials in clear) and the repository key ended up inside the
+#     repository they protect;
 #   • a pg_dump that dies mid-stream makes the run PARTIAL, never success (a
 #     truncated dump in a valid snapshot is the worst possible outcome: it
 #     looks like a backup until someone restores it);
@@ -193,7 +196,13 @@ contains "postgres arrives as a stdin snapshot"   "--stdin-filename postgres.dum
 contains "minio directory is backed up"           "backup $MINIO_DATA" "$log"
 contains "minio EXCLUDES .minio.sys"              "--exclude $MINIO_DATA/.minio.sys" "$log"
 contains "config snapshot excludes models/"       "--exclude $DATA/models" "$log"
-contains "config snapshot excludes the key file"  "--exclude $BACKUP_DIR/repo.pass" "$log"
+contains "config snapshot excludes the whole backup dir" "--exclude $BACKUP_DIR" "$log"
+# The three that were actually swept in on a real appliance. Asserted by name
+# rather than by the directory alone, so a future change that goes back to
+# per-file exclusions fails here instead of on someone's box.
+for secret in repo.pass backup.env .key-reveal; do
+  absent "  …so $secret is not in the snapshot" "$BACKUP_DIR/$secret " "$log"
+done
 contains "secrets snapshot carries the app secret" "--stdin-filename app-secret.yaml" "$log"
 contains "retention applied"                      "--keep-daily 7" "$log"
 contains "retention applied (weekly)"             "--keep-weekly 4" "$log"
