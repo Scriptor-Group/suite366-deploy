@@ -254,6 +254,54 @@ check "restore into a fresh directory works" "$rc" "0"
 contains "it says nothing was modified" "Nothing on this appliance has been modified" "$(out)"
 contains "it points at the AUTH_SECRET step first" "patch AUTH_SECRET" "$(out)"
 
+echo "== the repository key, when the UI is the only ceremony left =="
+# A box that grew its backup agent from the update channel never had an
+# install.sh moment, so nobody was ever offered a key. Configuring a
+# destination in the UI is the last chance to hand one over, and a key nobody
+# receives is a backup nobody can restore.
+KWORK="$WORK/keyui"; mkdir -p "$KWORK/opt/suite366/backup" "$KWORK/systemd"
+install -m 0700 "$REPO/backup.sh" "$KWORK/opt/suite366/backup.sh"
+kb() { DATA_DIR="$KWORK/opt/suite366" BACKUP_DIR="$KWORK/opt/suite366/backup" \
+       SYSTEMD_DIR="$KWORK/systemd" RESTIC_BIN="$BIN/restic" \
+       "$KWORK/opt/suite366/backup.sh" "$@" >"$WORK/kout" 2>&1 </dev/null; }
+kstate() { cat "$KWORK/opt/suite366/backup/state.json" 2>/dev/null; }
+
+# Before anything: no destination, no key. The message must name BOTH, because
+# "no destination configured" on a box whose destination is set sends whoever
+# reads it to fix the wrong thing.
+kb run; check "an empty box exits 0" "$?" "0"
+contains "and names both missing pieces" "no destination and no repository key" "$(kstate)"
+
+printf '%s\n' '{"repository":"/var/tmp/k/repo","requested_by":"admin@acme.tld"}' \
+  > "$KWORK/opt/suite366/backup/configure-requested"
+kb handle-trigger configure
+[[ -s "$KWORK/opt/suite366/backup/repo.pass" ]] \
+  && ok "configuring from the UI generates the repository key" \
+  || ko "configuring from the UI generates the repository key" "$(cat "$WORK/kout")"
+contains "the key is revealed to the UI exactly once" '"key_reveal": "' "$(kstate)"
+revealed="$(python3 -c "import json,sys;print(json.load(sys.stdin)['key_reveal'])" <<<"$(kstate)" 2>/dev/null)"
+[[ -n "$revealed" && "$revealed" == "$(cat "$KWORK/opt/suite366/backup/repo.pass")" ]] \
+  && ok "and it is the key actually in use" || ko "and it is the key actually in use"
+check "the reveal file is not world readable" \
+  "$(stat -c '%a' "$KWORK/opt/suite366/backup/.key-reveal")" "640"
+
+# Reconfiguring must NOT mint a second key: that silently orphans every
+# existing snapshot while the old key becomes the only way to read them.
+before="$(cat "$KWORK/opt/suite366/backup/repo.pass")"
+printf '%s\n' '{"repository":"/var/tmp/k/repo2","requested_by":"admin@acme.tld"}' \
+  > "$KWORK/opt/suite366/backup/configure-requested"
+kb handle-trigger configure
+check "reconfiguring does not mint a second key" \
+  "$(cat "$KWORK/opt/suite366/backup/repo.pass")" "$before"
+
+# Acknowledged = gone, and never shown again.
+: > "$KWORK/opt/suite366/backup/ack-key-requested"
+kb handle-trigger ack-key
+[[ ! -e "$KWORK/opt/suite366/backup/.key-reveal" ]] \
+  && ok "acknowledging clears the reveal" || ko "acknowledging clears the reveal"
+contains "state no longer carries it" '"key_reveal": ""' "$(kstate)"
+contains "but the fingerprint stays, to match against the vault" '"key_fingerprint": "' "$(kstate)"
+
 echo "== in-place restore is guarded, ordered and reversible =="
 # This is the one command in the appliance that destroys data on purpose, so
 # what is tested here is mostly what it REFUSES to do.
