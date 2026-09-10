@@ -185,8 +185,56 @@ require_restic() {
 # destination is a customer decision. Callers distinguish "nothing to do" from
 # "broken", because a timer that fails nightly on an unconfigured box trains
 # everyone to ignore it.
-configured() {
-  [[ -n "$BACKUP_REPO" && -s "$PASS_FILE" ]]
+has_destination() { [[ -n "$BACKUP_REPO" ]]; }
+has_key()         { [[ -s "$PASS_FILE" ]]; }
+configured()      { has_destination && has_key; }
+
+# Which of the two is missing, in words. Reporting "no destination configured"
+# on a box whose destination IS set — because the repository key was never
+# generated — sends whoever reads it to fix the wrong thing.
+unconfigured_reason() {
+  if ! has_destination && ! has_key; then printf 'no destination and no repository key'
+  elif ! has_destination;                then printf 'no destination configured'
+  else                                        printf 'no repository key on this appliance'
+  fi
+}
+
+# The key, and ONLY until the admin says they have stored it. Written into a
+# file the pod can read, because a key nobody ever sees is a backup nobody can
+# restore — the exact failure this whole feature exists to prevent. It is the
+# same ceremony install.sh performs on a terminal, performed in the browser
+# instead, because a box that grew its backup agent from the update channel has
+# no terminal moment left.
+REVEAL_FILE="${REVEAL_FILE:-$BACKUP_DIR/.key-reveal}"
+reveal_pending() { [[ -s "$REVEAL_FILE" ]] && cat "$REVEAL_FILE" || true; }
+
+# Generate the repository key if this appliance has none. Never regenerates:
+# a second key silently orphans every existing snapshot.
+ensure_key() { # ensure_key REQUESTED_BY
+  has_key && return 0
+  have openssl || { warn "openssl missing — cannot generate a repository key."; return 1; }
+  local key
+  key="$(openssl rand -base64 32)"
+  ( umask 077; printf '%s\n' "$key" > "$PASS_FILE" )
+  chmod 0600 "$PASS_FILE"
+  # 0640 root:app-group: readable by the pod that must display it, by nobody
+  # else, and only until it is acknowledged.
+  ( umask 027; printf '%s' "$key" > "$REVEAL_FILE" )
+  chown "root:$APP_GID" "$REVEAL_FILE" 2>/dev/null || true
+  chmod 0640 "$REVEAL_FILE"
+  log "Repository key generated (requested by ${1:-unknown})"
+  warn "It is shown ONCE, in the app, and stored nowhere else. Without it the"
+  warn "  backups cannot be read — not by the customer, not by us."
+  return 0
+}
+
+# The admin pressed "I have stored it".
+do_ack_key() {
+  ensure_backup_dir
+  rm -f "$REVEAL_FILE"
+  info "repository key acknowledged — it is not shown again."
+  load_previous_state
+  write_state_json
 }
 
 key_fingerprint() {
@@ -208,6 +256,7 @@ write_state_json() {
   "repository": "$(json_esc "$(redact_repo "$BACKUP_REPO")")",
   "key_fingerprint": "$(json_esc "$(key_fingerprint)")",
   "key_present": $([[ -s "$PASS_FILE" ]] && echo true || echo false),
+  "key_reveal": "$(json_esc "$(reveal_pending)")",
   "restic_present": $([[ -x "$RESTIC_BIN" ]] && echo true || echo false),
   "restic_version": "$(json_esc "$([[ -x "$RESTIC_BIN" ]] && "$RESTIC_BIN" version 2>/dev/null | awk '{print $2}' | head -1)")",
   "updated_at": "$(now_utc)",
@@ -411,9 +460,9 @@ do_run() {
     # Deliberately exit 0: an unconfigured appliance has nothing to do, and a
     # timer that goes red every night on purpose is a timer nobody reads.
     STATE_STATUS="unconfigured"
-    STATE_ERROR="no destination configured"
+    STATE_ERROR="$(unconfigured_reason)"
     write_state_json
-    warn "backup not configured (no BACKUP_REPO) — nothing to do."
+    warn "backup not configured ($(unconfigured_reason)) — nothing to do."
     return 0
   fi
   # Configured but unable to run: that IS broken, and it has to reach the UI.
@@ -853,6 +902,11 @@ do_configure() {
   [[ -z "$secret" ]] && secret="$BACKUP_S3_SECRET_KEY"
   [[ -z "$region" ]] && region="$BACKUP_S3_REGION"
 
+  # A destination with no key cannot back up anything, and the admin standing
+  # in front of the UI right now is the only person who will ever be offered
+  # this key.
+  ensure_key "$by" || warn "no repository key — backups will not run until one exists."
+
   local previous="$BACKUP_REPO"
   ( umask 077
     cat > "$BACKUP_ENV" <<ENV
@@ -897,7 +951,8 @@ handle_trigger() { # handle_trigger KIND
     run)       rm -f "$BACKUP_DIR/run-requested";  do_run ;;
     test)      rm -f "$BACKUP_DIR/test-requested"; do_test ;;
     configure) do_configure ;;
-    *) die "unknown trigger '$kind' (use: run | test | configure)" ;;
+    ack-key)   rm -f "$BACKUP_DIR/ack-key-requested"; do_ack_key ;;
+    *) die "unknown trigger '$kind' (use: run | test | configure | ack-key)" ;;
   esac
 }
 
@@ -942,7 +997,7 @@ EOF
   # than a generic "do what the payload says" unit, so the systemd unit name in
   # the journal says which privileged action was requested.
   local kind
-  for kind in run test configure; do
+  for kind in run test configure ack-key; do
     cat > "$SYSTEMD_DIR/suite366-backup-$kind.service" <<EOF
 [Unit]
 Description=Suite 366 — backup $kind (requested from the app)
@@ -973,7 +1028,7 @@ EOF
     || warn "could not enable suite366-backup.timer (systemd offline?)."
   systemctl start suite366-backup.timer >/dev/null 2>&1 || true
   systemctl enable --now suite366-backup-run.path suite366-backup-test.path \
-      suite366-backup-configure.path >/dev/null 2>&1 \
+      suite366-backup-configure.path suite366-backup-ack-key.path >/dev/null 2>&1 \
     || warn "could not enable the backup trigger units (systemd offline?)."
   info "backup timer armed (daily at $BACKUP_SCHEDULE, +up to 15 min jitter)."
   info "app triggers armed (watching $BACKUP_DIR)."
@@ -987,8 +1042,9 @@ case "$MODE" in
   snapshots)     do_snapshots ;;
   restore)       do_restore "$@" ;;
   configure)     do_configure ;;
+  ack-key)       do_ack_key ;;
   handle-trigger) handle_trigger "${2:-}" ;;
   status)        do_status ;;
   install-units) install_units ;;
-  *) die "Unknown mode '$MODE' (use: init | run | test | prune | snapshots | restore | configure | handle-trigger KIND | status | install-units)" ;;
+  *) die "Unknown mode '$MODE' (use: init | run | test | prune | snapshots | restore | configure | ack-key | handle-trigger KIND | status | install-units)" ;;
 esac
