@@ -211,6 +211,13 @@ livekit:
 #    pick up to run update.sh — this powers the "update available" banner + the
 #    update button in the admin UI.
 #
+#  @DATA_DIR@/backup   -> /appliance-backup  (APPLIANCE_BACKUP_DIR)
+#    backup.sh publishes state.json there (last run, snapshots, destination,
+#    key fingerprint) and the app drops run-/test-/configure-requested triggers.
+#    The credentials themselves live in backup.env inside that directory at
+#    0600, so the pod can ASK for a destination but can never read back the
+#    secret it set.
+#
 #  @DATA_DIR@/support  -> /support-access    (SUPPORT_ACCESS_DIR)
 #    Remote-support access toggle, used on RENTED fleet appliances only. The
 #    host agent publishes state.json (grant + pre-arm state) and the app drops
@@ -226,11 +233,15 @@ extraEnv:
     value: /appliance-update
   - name: SUPPORT_ACCESS_DIR
     value: /support-access
+  - name: APPLIANCE_BACKUP_DIR
+    value: /appliance-backup
 extraVolumeMounts:
   - name: appliance-update
     mountPath: /appliance-update
   - name: support-access
     mountPath: /support-access
+  - name: appliance-backup
+    mountPath: /appliance-backup
 extraVolumes:
   - name: appliance-update
     hostPath:
@@ -239,6 +250,10 @@ extraVolumes:
   - name: support-access
     hostPath:
       path: @DATA_DIR@/support
+      type: DirectoryOrCreate
+  - name: appliance-backup
+    hostPath:
+      path: @DATA_DIR@/backup
       type: DirectoryOrCreate
 
 # Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,

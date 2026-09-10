@@ -392,7 +392,35 @@ sudo /opt/suite366/backup.sh test        # destination reachable + key correct?
 systemctl list-timers suite366-backup.timer
 ```
 
-Turn it on at install time, or later by editing
+### Restoring
+
+`docs/restore.md` is the runbook — read §0 first, it is the part that decides
+whether a restore is possible at all. Two entry points:
+
+```bash
+# safe: extract somewhere and look at it. Changes nothing on the appliance.
+sudo /opt/suite366/backup.sh restore --snapshot latest --target /var/tmp/restore
+
+# destructive: rebuild THIS appliance from a snapshot, in the required order
+sudo /opt/suite366/backup.sh restore --in-place --dry-run   # the plan
+sudo /opt/suite366/backup.sh restore --in-place             # asks for RESTORE
+```
+
+The in-place path takes a `pre-restore` snapshot of the current state before it
+touches anything, refuses a snapshot that cannot carry `AUTH_SECRET`, and
+refuses a database that already has tables unless you pass `--force`. Its
+ordering guarantees are covered by `tools/test-backup.sh`; the live cluster
+interactions are **not yet exercised on real hardware**, because doing so means
+destroying a running appliance. Prefer `--target` if you have never run it.
+
+Turn it on **from the admin UI** — *Settings → Organisation → Backups* — which
+is the intended route: it sets the destination, tests it immediately, and shows
+the last run, the snapshots and the key fingerprint without anyone opening a
+shell. The page can ask for a destination but can never read the stored
+credentials back: `backup.env` is 0600 and owned by root, so an empty secret
+field means "keep the one already saved".
+
+Or at install time, or later by editing
 `/opt/suite366/backup/backup.env` (0600) and running `backup.sh init`:
 
 ```bash
@@ -402,7 +430,11 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo env \
 ```
 
 Any restic backend works (S3, SFTP, a local path on a USB disk — useful on an
-air-gapped site). Retention defaults to 7 daily / 4 weekly / 6 monthly and is
+air-gapped site). The agent itself travels with the signed channel: `channel.json`
+pins `backup_sha256` beside `updater_sha256`, so an appliance that rolls its
+updater forward rolls the backup agent forward with it — and an offline package
+carries both the agent and the pinned `restic` binary, which an air-gapped box
+has no other way to obtain. Retention defaults to 7 daily / 4 weekly / 6 monthly and is
 applied with `restic forget --prune` at the end of every run.
 
 ### What is in a snapshot

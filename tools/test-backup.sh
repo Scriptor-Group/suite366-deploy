@@ -18,6 +18,10 @@
 #   • credentials embedded in a repository URL never reach state.json;
 #   • restore refuses to extract into a directory that is not empty;
 #   • two runs cannot overlap;
+#   • a destination configured from the admin UI is VALIDATED before it becomes
+#     an environment variable for a root process, the credential file it writes
+#     is not readable by the pod, and the encryption key is never regenerated —
+#     a new key silently orphans every existing snapshot;
 #   • update.sh's convergence installs the agent on a box that never had one,
 #     arms its timer, and does NOT invent a repository key — a key generated
 #     with nobody watching exists on exactly one disk and is in nobody's hands.
@@ -211,10 +215,27 @@ contains "restic init is called when the repo is absent" "init" "$(cat "$RLOG")"
 rm -f "$WORK/no-repo"
 
 echo "== credentials never reach state.json =="
+# state.json is 0644 inside a directory the pod reads, and the admin UI renders
+# the repository string. Both credential-carrying URL forms have to be covered:
+# an earlier version only handled the one with `//`, which is NOT the form an
+# operator types for S3 — so the access key and secret went straight into the UI.
 write_env "s3:https://AKIAKEY:supersecret@s3.example.com/bucket/spark-01"
 bk test
-absent "the URL secret is redacted in state.json" "supersecret" "$(state)"
-contains "the redaction marker is there"          "<redacted>" "$(state)"
+absent "rest-style URL: the secret is redacted"  "supersecret" "$(state)"
+contains "rest-style URL: the marker is there"   "<redacted>"  "$(state)"
+
+write_env "s3:AKIAKEY:supersecret@s3.fr-par.scw.cloud/bucket/spark-01"
+bk test
+absent "S3-style URL: the secret is redacted"    "supersecret" "$(state)"
+absent "S3-style URL: the access key too"        "AKIAKEY"     "$(state)"
+contains "S3-style URL: the marker is there"     "<redacted>"  "$(state)"
+contains "S3-style URL: the endpoint stays readable" "s3.fr-par.scw.cloud" "$(state)"
+
+# A bare user@host is not a credential; redacting it would only make the
+# destination unidentifiable in the UI.
+write_env "sftp:backupuser@nas.local:/srv/suite366"
+bk test
+contains "sftp user@host is left readable" "backupuser@nas.local" "$(state)"
 write_env "s3:s3.example.com/bucket/spark-01"
 
 echo "== test mode preserves the previous run =="
@@ -336,6 +357,67 @@ sleep 0.3
 bk run
 check "a second concurrent run is refused" "$?" "1"
 wait "$holder" 2>/dev/null
+
+echo "== configuration from the admin UI =="
+export SYSTEMD_DIR="$WORK/systemd"; mkdir -p "$SYSTEMD_DIR"
+cfg() { # cfg JSON -> runs the configure trigger
+  printf '%s\n' "$1" > "$BACKUP_DIR/configure-requested"
+  "$DATA/backup.sh" handle-trigger configure >"$WORK/out" 2>&1 </dev/null
+}
+key_before="$(sha256sum "$BACKUP_DIR/repo.pass" | awk '{print $1}')"
+
+# A repository string that is not a restic backend must never reach
+# RESTIC_REPOSITORY: that variable is read by a process running as root.
+for bad in 'rm -rf /' 'file:///etc/passwd' 's3:bucket;curl evil' '$(id)' 'http://x/y'; do
+  cfg "{\"repository\":\"$bad\",\"requested_by\":\"a@b.c\"}"
+  if [[ $? -ne 0 ]] && grep -q 'refusing' "$WORK/out"; then
+    ok "rejected: $bad"
+  else
+    ko "rejected: $bad" "$(out)"
+  fi
+done
+
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","access_key":"AK","secret_key":"SK","region":"fr-par","keep_daily":14,"keep_weekly":8,"keep_monthly":12,"schedule":"03:15","requested_by":"admin@acme.tld"}'
+check "a valid destination is accepted" "$?" "0"
+env_file="$BACKUP_DIR/backup.env"
+check "backup.env is 0600 (the pod runs as 1001 and must not read it back)" \
+  "$(stat -c '%a' "$env_file")" "600"
+contains "the repository is written" "BACKUP_REPO=s3:s3.fr-par.scw.cloud/bucket/box-1" "$(cat "$env_file")"
+contains "retention is written"      "BACKUP_KEEP_DAILY=14" "$(cat "$env_file")"
+contains "the schedule is written"   "BACKUP_SCHEDULE=03:15" "$(cat "$env_file")"
+check "the trigger file is consumed" "$([[ -e "$BACKUP_DIR/configure-requested" ]] && echo present || echo gone)" "gone"
+check "the encryption key is NOT regenerated" \
+  "$(sha256sum "$BACKUP_DIR/repo.pass" | awk '{print $1}')" "$key_before"
+contains "the timer is re-armed at the new time" "OnCalendar=*-*-* 03:15:00" \
+  "$(cat "$SYSTEMD_DIR/suite366-backup.timer")"
+for k in run test configure; do
+  [[ -f "$SYSTEMD_DIR/suite366-backup-$k.path" ]] \
+    && ok "the $k trigger unit is installed" || ko "the $k trigger unit is installed"
+done
+contains "the configure unit runs the right verb" "handle-trigger configure" \
+  "$(cat "$SYSTEMD_DIR/suite366-backup-configure.service")"
+
+# Changing only the schedule must not require the UI to round-trip a secret.
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","access_key":"","secret_key":"","schedule":"04:05","requested_by":"admin@acme.tld"}'
+contains "an empty secret keeps the stored one" "BACKUP_S3_SECRET_KEY=SK" "$(cat "$env_file")"
+contains "and the schedule still changes" "BACKUP_SCHEDULE=04:05" "$(cat "$env_file")"
+
+# Retaining nothing would let the first prune delete every snapshot.
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","keep_daily":0,"requested_by":"a@b.c"}'
+contains "keep_daily=0 is floored to 1" "BACKUP_KEEP_DAILY=1" "$(cat "$env_file")"
+
+# Moving the destination is legitimate, but it must be said out loud.
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/other/box-1","requested_by":"a@b.c"}'
+contains "changing the destination warns about the old snapshots" "destination CHANGED" "$(out)"
+
+# The run/test triggers consume their own file, so the .path unit does not loop.
+: > "$RLOG"; write_env "s3:s3.example.com/bucket/spark-01"
+touch "$BACKUP_DIR/run-requested"
+"$DATA/backup.sh" handle-trigger run >"$WORK/out" 2>&1 </dev/null
+check "the run trigger is consumed" \
+  "$([[ -e "$BACKUP_DIR/run-requested" ]] && echo present || echo gone)" "gone"
+contains "and a run really happened" "backup" "$(cat "$RLOG")"
+unset SYSTEMD_DIR
 
 echo "== update.sh converges the backup agent =="
 # The functions under test live in update.sh. Pull them out verbatim, the same

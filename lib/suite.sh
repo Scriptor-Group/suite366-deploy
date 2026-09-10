@@ -80,8 +80,12 @@ deploy_suite() {
   # `support` stays EMPTY here: the remote-support toggle is a fleet feature
   # (suite366-fleet drops state.json in it). With no state.json the app hides
   # the feature, so a customer-run appliance is unaffected by the mount.
+  #
+  # `backup` is created here too, for a different reason: lib/backup.sh runs
+  # AFTER helm, so without this the mount would materialise as root:root 0755
+  # and the app could never drop a trigger into it.
   local d
-  for d in updates support; do
+  for d in updates support backup; do
     mkdir -p "$DATA_DIR/$d"
     chown root:1001 "$DATA_DIR/$d"
     chmod 0770 "$DATA_DIR/$d"

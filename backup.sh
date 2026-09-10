@@ -3,7 +3,7 @@
 # Suite 366 — appliance backup agent.
 #
 #   backup.sh init | run | test | status | snapshots | prune | restore
-#             | install-units
+#             | configure | handle-trigger KIND | install-units
 #
 # `restore` extracts, and nothing else. `restore --in-place` rebuilds this
 # appliance from a snapshot: see do_restore_in_place for the order the steps
@@ -40,6 +40,16 @@
 # snapshot exists, and why the restore runbook patches AUTH_SECRET before
 # touching the data.
 #
+# APP <-> HOST BRIDGE
+# $BACKUP_DIR is hostPath-mounted into drive-app at /appliance-backup (root:1001
+# 0770), the same idiom update.sh and support.sh already use:
+#   state.json           written by us — read by the admin UI
+#   run-requested        dropped by the app -> systemd .path unit -> `run`
+#   test-requested       dropped by the app -> `test`
+#   configure-requested  dropped by the app -> `configure` (destination + retention)
+# The app never holds root and never edits backup.env itself: it asks, we
+# validate, and the credentials land in a 0600 file it cannot read back.
+#
 # ENCRYPTION
 # restic encrypts the repository with a key held ONLY in $BACKUP_DIR/repo.pass
 # (0600) — generated at install and printed once. Lose it and the backups are
@@ -60,6 +70,10 @@ RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
 NAMESPACE="${NAMESPACE:-suite366}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
 APP_GID="${APP_GID:-1001}"
+# Overridable so install-units can be exercised without root or a live systemd.
+# It is the one part of this agent that writes outside $DATA_DIR, and an untested
+# unit file is a timer that silently never fires.
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 
 # Destination + retention live in backup.env (written by lib/backup.sh at
 # install time, or by the host agent when the app UI configures it in lot C).
@@ -92,6 +106,11 @@ kc()   { k3s kubectl "$@"; }
 tty_usable() { (exec </dev/tty) >/dev/null 2>&1; }
 now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
+# Same minimal flat-JSON reader as update.sh and support.sh — one idiom for the
+# whole appliance, and no jq dependency to guarantee across OS images.
+json_get()     { sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; }
+json_get_num() { sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1; }
+
 json_esc() {
   local s=${1//\\/\\\\}
   s=${s//\"/\\\"}
@@ -104,7 +123,17 @@ json_esc() {
 # state.json is world-readable so the app can display it — strip anything
 # between the scheme and an @ before it is ever written or logged.
 redact_repo() { # redact_repo URL
-  printf '%s' "$1" | sed -E 's#(//)[^/@]*@#\1<redacted>@#'
+  # Two forms, and the second is the one that matters in practice:
+  #   rest:https://user:pass@host/…   credentials after //
+  #   s3:AKIA…:secret@endpoint/…      credentials straight after the scheme
+  # Only the second is what an operator actually types for S3, and an earlier
+  # version of this function handled only the first — so the access key and the
+  # secret went into state.json, which is world-readable in the bridge directory
+  # and rendered in the admin UI. A bare `user@host` (sftp) is left alone: it is
+  # not a credential, and hiding it would only make the destination unreadable.
+  printf '%s' "$1" \
+    | sed -E 's#(//)[^/@]*:[^/@]*@#\1<redacted>@#' \
+    | sed -E 's#^([A-Za-z0-9]+:)[^/@]*:[^/@]*@#\1<redacted>@#'
 }
 
 [[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
@@ -170,6 +199,9 @@ write_state_json() {
   "configured": $cfg,
   "repository": "$(json_esc "$(redact_repo "$BACKUP_REPO")")",
   "key_fingerprint": "$(json_esc "$(key_fingerprint)")",
+  "key_present": $([[ -s "$PASS_FILE" ]] && echo true || echo false),
+  "restic_present": $([[ -x "$RESTIC_BIN" ]] && echo true || echo false),
+  "restic_version": "$(json_esc "$([[ -x "$RESTIC_BIN" ]] && "$RESTIC_BIN" version 2>/dev/null | awk '{print $2}' | head -1)")",
   "updated_at": "$(now_utc)",
   "schedule": "$(json_esc "$BACKUP_SCHEDULE")",
   "retention": {
@@ -750,11 +782,123 @@ do_status() {
   [[ "$st" == "success" ]]
 }
 
+# --- configure (from the admin UI) ----------------------------------------------
+# The app drops a JSON payload; we validate it and own the write. Three rules
+# make this safe enough to expose in a UI:
+#
+#   • the repository string is checked against a whitelist of restic backends
+#     rather than sanitised — it ends up in an environment variable read by a
+#     process running as root, and "looks harmless" is not a security property;
+#   • the encryption key is NEVER regenerated here. A new key silently orphans
+#     every existing snapshot, and the customer's copy of the old one becomes
+#     the only way to read backups that no longer accumulate;
+#   • the payload file is removed before anything else, so a credential does not
+#     sit in a directory the app can read for longer than one systemd tick.
+CONFIG_TRIGGER="$BACKUP_DIR/configure-requested"
+
+valid_repo() { # valid_repo STRING
+  local r="$1"
+  # No shell metacharacters, no whitespace: this becomes RESTIC_REPOSITORY for a
+  # root process.
+  [[ "$r" =~ ^[A-Za-z0-9._:/@+-]+$ ]] || return 1
+  case "$r" in
+    s3:*|b2:*|azure:*|gs:*|swift:*|rest:*|sftp:*|rclone:*) return 0 ;;
+    /*) return 0 ;;   # a local path or a mounted NAS
+    *) return 1 ;;
+  esac
+}
+
+do_configure() {
+  ensure_backup_dir
+  [[ -s "$CONFIG_TRIGGER" ]] || die "no configuration payload at $CONFIG_TRIGGER."
+  local payload; payload="$(cat "$CONFIG_TRIGGER")"
+  rm -f "$CONFIG_TRIGGER"
+
+  local repo access secret region keep_d keep_w keep_m sched by
+  repo="$(json_get repository   <<<"$payload")"
+  access="$(json_get access_key <<<"$payload")"
+  secret="$(json_get secret_key <<<"$payload")"
+  region="$(json_get region     <<<"$payload")"
+  sched="$(json_get schedule    <<<"$payload")"
+  by="$(json_get requested_by   <<<"$payload")"
+  keep_d="$(json_get_num keep_daily   <<<"$payload")"
+  keep_w="$(json_get_num keep_weekly  <<<"$payload")"
+  keep_m="$(json_get_num keep_monthly <<<"$payload")"
+
+  log "Configuring the backup destination (requested by ${by:-unknown})"
+  valid_repo "$repo" || {
+    STATE_ERROR="rejected: '$repo' is not a supported restic repository"
+    load_previous_state; write_state_json
+    die "refusing '$repo' — expected s3:/b2:/azure:/gs:/swift:/rest:/sftp:/rclone: or an absolute path."
+  }
+  [[ "$sched" =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || sched="$BACKUP_SCHEDULE"
+  [[ "$keep_d" =~ ^[0-9]+$ ]] || keep_d="$BACKUP_KEEP_DAILY"
+  [[ "$keep_w" =~ ^[0-9]+$ ]] || keep_w="$BACKUP_KEEP_WEEKLY"
+  [[ "$keep_m" =~ ^[0-9]+$ ]] || keep_m="$BACKUP_KEEP_MONTHLY"
+  # Retaining nothing would let the first prune delete every snapshot.
+  (( keep_d < 1 )) && keep_d=1
+
+  # An empty secret means "keep the one already configured" — the UI shows a
+  # masked field and must not have to round-trip a credential to change a
+  # schedule.
+  [[ -z "$access" ]] && access="$BACKUP_S3_ACCESS_KEY"
+  [[ -z "$secret" ]] && secret="$BACKUP_S3_SECRET_KEY"
+  [[ -z "$region" ]] && region="$BACKUP_S3_REGION"
+
+  local previous="$BACKUP_REPO"
+  ( umask 077
+    cat > "$BACKUP_ENV" <<ENV
+# Suite 366 backup destination + retention.
+# Written by backup.sh from an admin-UI request at $(now_utc) (by ${by:-unknown}).
+# 0600 — carries credentials.
+BACKUP_REPO=$repo
+BACKUP_S3_ACCESS_KEY=$access
+BACKUP_S3_SECRET_KEY=$secret
+BACKUP_S3_REGION=$region
+BACKUP_KEEP_DAILY=$keep_d
+BACKUP_KEEP_WEEKLY=$keep_w
+BACKUP_KEEP_MONTHLY=$keep_m
+BACKUP_SCHEDULE=$sched
+NAMESPACE=$NAMESPACE
+KUBECONFIG_PATH=$KUBECONFIG_PATH
+RESTIC_BIN=$RESTIC_BIN
+ENV
+  )
+  chmod 0600 "$BACKUP_ENV"
+  info "destination: $(redact_repo "$repo")"
+  if [[ -n "$previous" && "$previous" != "$repo" ]]; then
+    warn "the destination CHANGED (was $(redact_repo "$previous"))."
+    warn "  Snapshots already at the old location are not moved and not deleted;"
+    warn "  they simply stop accumulating. The encryption key is unchanged, so"
+    warn "  they remain readable from there."
+  fi
+
+  # Re-read, re-arm (the schedule may have moved), then prove it works.
+  # shellcheck disable=SC1090
+  . "$BACKUP_ENV"
+  BACKUP_SCHEDULE="$sched"
+  install_units
+  do_test
+}
+
+# One entry point for every trigger the app can drop, so there is one place that
+# consumes the file and one place that records the outcome.
+handle_trigger() { # handle_trigger KIND
+  local kind="${1:-}"
+  case "$kind" in
+    run)       rm -f "$BACKUP_DIR/run-requested";  do_run ;;
+    test)      rm -f "$BACKUP_DIR/test-requested"; do_test ;;
+    configure) do_configure ;;
+    *) die "unknown trigger '$kind' (use: run | test | configure)" ;;
+  esac
+}
+
 # --- install-units ------------------------------------------------------------
 # Written inline so $DATA_DIR is baked in, same as the update timer.
 install_units() {
   ensure_backup_dir
-  cat > /etc/systemd/system/suite366-backup.service <<EOF
+  mkdir -p "$SYSTEMD_DIR"
+  cat > "$SYSTEMD_DIR/suite366-backup.service" <<EOF
 [Unit]
 Description=Suite 366 — appliance backup (restic)
 After=network-online.target k3s.service
@@ -772,7 +916,7 @@ Nice=10
 IOSchedulingClass=idle
 EOF
 
-  cat > /etc/systemd/system/suite366-backup.timer <<EOF
+  cat > "$SYSTEMD_DIR/suite366-backup.timer" <<EOF
 [Unit]
 Description=Suite 366 — nightly backup
 
@@ -785,11 +929,46 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  # App-trigger units. Same shape as update.sh's: a .path watching for a file the
+  # pod drops, a oneshot that consumes it. `configure` gets its own pair rather
+  # than a generic "do what the payload says" unit, so the systemd unit name in
+  # the journal says which privileged action was requested.
+  local kind
+  for kind in run test configure; do
+    cat > "$SYSTEMD_DIR/suite366-backup-$kind.service" <<EOF
+[Unit]
+Description=Suite 366 — backup $kind (requested from the app)
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-$BACKUP_ENV
+Environment=DATA_DIR=$DATA_DIR
+ExecStart=$DATA_DIR/backup.sh handle-trigger $kind
+TimeoutStartSec=6h
+EOF
+    cat > "$SYSTEMD_DIR/suite366-backup-$kind.path" <<EOF
+[Unit]
+Description=Suite 366 — watch for backup $kind requests from the app
+
+[Path]
+PathExists=$BACKUP_DIR/$kind-requested
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  done
+
   systemctl daemon-reload
   systemctl enable suite366-backup.timer >/dev/null 2>&1 \
     || warn "could not enable suite366-backup.timer (systemd offline?)."
   systemctl start suite366-backup.timer >/dev/null 2>&1 || true
+  systemctl enable --now suite366-backup-run.path suite366-backup-test.path \
+      suite366-backup-configure.path >/dev/null 2>&1 \
+    || warn "could not enable the backup trigger units (systemd offline?)."
   info "backup timer armed (daily at $BACKUP_SCHEDULE, +up to 15 min jitter)."
+  info "app triggers armed (watching $BACKUP_DIR)."
 }
 
 case "$MODE" in
@@ -799,7 +978,9 @@ case "$MODE" in
   prune)         do_prune ;;
   snapshots)     do_snapshots ;;
   restore)       do_restore "$@" ;;
+  configure)     do_configure ;;
+  handle-trigger) handle_trigger "${2:-}" ;;
   status)        do_status ;;
   install-units) install_units ;;
-  *) die "Unknown mode '$MODE' (use: init | run | test | prune | snapshots | restore | status | install-units)" ;;
+  *) die "Unknown mode '$MODE' (use: init | run | test | prune | snapshots | restore | configure | handle-trigger KIND | status | install-units)" ;;
 esac
