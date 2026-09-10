@@ -17,7 +17,22 @@ DOMAIN="${DOMAIN:-suite366.local}"
 #   dns  : the customer's own DNS answers for the names. Avahi is not installed
 #          at all; the installer verifies the names already point at this host
 #          and tells the operator exactly which records to create if not.
+#   proxy: the box is PUBLISHED on the internet through Scriptor's proxy
+#          (suite366-fleet), at four flat names under REMOTE_DOMAIN. Those
+#          names are allocated on the proxy, not chosen here, so the appliance
+#          and the proxy registry cannot disagree about what this box is
+#          called.
+#
+#          The cost of `proxy`, stated once here and again at install time:
+#          the app has ONE canonical origin, so the public name becomes the
+#          name for EVERYONE, LAN users included. Without an internal DNS
+#          record answering it with the LAN address, traffic between two
+#          machines in the same room transits our proxy — and a WAN outage
+#          takes the appliance down for people standing next to it.
 HOST_MODE="${HOST_MODE:-mdns}"
+# Set by suite366-fleet when HOST_MODE=proxy; the four names derive from them.
+REMOTE_NAME="${REMOTE_NAME:-}"
+REMOTE_DOMAIN="${REMOTE_DOMAIN:-box.diwy.ai}"
 # The four public names. EMPTY here on purpose: they are derived from DOMAIN in
 # gather_hosts(), i.e. AFTER the interactive prompt, so a domain typed at the
 # prompt propagates into them. Setting one in the environment pins that name
@@ -37,6 +52,13 @@ TURN_HOST="${TURN_HOST:-}"
 #              drive-app trusts OnlyOffice server-side — without it, saving a
 #              document fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE (see the
 #              customCA wiring in lib/suite.sh).
+#   pushed   : HOST_MODE=proxy only. The certificate is issued by the Scriptor
+#              proxy over DNS-01 and PULLED by suite366-fleet's remote.sh,
+#              which owns the four Secrets from then on. install.sh writes a
+#              self-signed bootstrap certificate so the chart has something to
+#              reference before the box is on the tailnet. cert-manager is not
+#              deployed: two owners for one Secret means the automated one
+#              silently overwrites the working certificate.
 #   acme     : NOT implemented, and refused loudly rather than half-done — see
 #              check_tls_inputs() in lib/preflight.sh for the reasoning.
 TLS_MODE="${TLS_MODE:-local-ca}"

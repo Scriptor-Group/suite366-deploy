@@ -30,11 +30,14 @@ deploy_suite() {
   lpk_esc="$(printf '%s' "$LICENSE_PUBLIC_KEY" | sed -e 's/[&|\\]/\\&/g')"
   # TLS_MODE decides two things inside values.yaml that cannot be expressed as
   # a plain hostname: the ingress annotation line, and whether the chart asks
-  # cert-manager for the TURN Certificate. In `provided` mode both point
-  # nowhere, because install.sh has already created the four Secrets itself.
+  # cert-manager for the TURN Certificate. In `provided` and `pushed` mode both
+  # point nowhere — install.sh has already created the four Secrets itself, and
+  # in `pushed` mode remote.sh replaces them with the real certificate. A
+  # cert-manager annotation there would give the Secrets a second owner, and
+  # the automated owner is the one that wins.
   local cert_annotation turn_cert_manager
-  if [[ "$TLS_MODE" == "provided" ]]; then
-    cert_annotation="suite366.ai/tls-mode: \"provided\""
+  if [[ "$TLS_MODE" == "provided" || "$TLS_MODE" == "pushed" ]]; then
+    cert_annotation="suite366.ai/tls-mode: \"$TLS_MODE\""
     turn_cert_manager=false
   else
     cert_annotation="cert-manager.io/cluster-issuer: \"$CLUSTER_ISSUER\""
@@ -102,6 +105,11 @@ deploy_suite() {
   local ca_file=""
   case "$TLS_MODE" in
     provided) ca_file="${TLS_CA_FILE:-}" ;;
+    # pushed: the certificate comes from a public ACME issuer, already trusted
+    # inside the container image, so there is no private CA to inject. The
+    # bootstrap certificate is self-signed but is replaced before anyone uses
+    # the box for real, and injecting IT would leave a stale CA behind forever.
+    pushed)   ca_file="" ;;
     *)        ca_file="$DATA_DIR/suite366-local-ca.crt" ;;
   esac
   write_custom_ca "$vals" "$ca_file"
@@ -127,6 +135,10 @@ deploy_suite() {
 write_custom_ca() { # write_custom_ca VALUES_FILE CA_FILE
   local vals="$1" ca="$2"
   if [[ -z "$ca" || ! -f "$ca" ]]; then
+    if [[ "$TLS_MODE" == "pushed" ]]; then
+      info "No custom CA needed: the proxy issues publicly-trusted certificates."
+      return 0
+    fi
     if [[ "$TLS_MODE" == "provided" ]]; then
       warn "No TLS_CA_FILE given — drive-app will only reach OnlyOffice if the"
       warn "  issuing CA is already trusted inside the container image."
@@ -209,6 +221,10 @@ patch_coredns_for_appliance_hosts() {
   # The APEX domain is mapped only under mDNS. In `dns` mode the apex is the
   # customer's real zone (their intranet, their mail); pointing it at Traefik
   # for every pod in the cluster would break far more than it fixes.
+  # In `proxy` mode this override matters MORE, not less: without it a pod
+  # resolving the public OnlyOffice name would leave the building, cross the
+  # internet to our proxy and come back through the tunnel to reach a container
+  # running beside it — for every server-side document callback.
   local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST")
   [[ "$HOST_MODE" == "mdns" ]] && names+=("$DOMAIN")
 

@@ -127,11 +127,26 @@ install_nvidia_toolkit() {
 # (app URLs + ingress hosts), the certificates, mDNS, the CoreDNS override and
 # the final summary.
 gather_hosts() {
-  ask HOST_MODE "Hostname mode — mdns (*.local, published on the LAN) or dns (your own DNS)" "$HOST_MODE"
+  ask HOST_MODE "Hostname mode — mdns (*.local on the LAN), dns (your own DNS) or proxy (published by Scriptor)" "$HOST_MODE"
   case "$HOST_MODE" in
-    mdns|dns) ;;
-    *) die "HOST_MODE='$HOST_MODE' is invalid (expected: mdns or dns)." ;;
+    mdns|dns|proxy) ;;
+    *) die "HOST_MODE='$HOST_MODE' is invalid (expected: mdns, dns or proxy)." ;;
   esac
+
+  # In proxy mode the names are ALLOCATED, not chosen here: the four public
+  # names are flat under the proxy's domain (a wildcard covers one label, so
+  # office.<name>.<domain> would need its own certificate). Deriving them from
+  # REMOTE_NAME rather than asking keeps the appliance and the proxy registry
+  # from ever disagreeing about what this box is called.
+  if [[ "$HOST_MODE" == "proxy" ]]; then
+    [[ -n "$REMOTE_NAME" ]] || die "HOST_MODE=proxy needs REMOTE_NAME (allocate it first:
+      suite366-fleet/proxy/tools/proxy-register.sh --machine <id> --name <name>)."
+    DOMAIN="${REMOTE_DOMAIN,,}"
+    APP_HOST="${APP_HOST:-$REMOTE_NAME.$DOMAIN}"
+    OFFICE_HOST="${OFFICE_HOST:-$REMOTE_NAME-office.$DOMAIN}"
+    LIVEKIT_HOST="${LIVEKIT_HOST:-$REMOTE_NAME-livekit.$DOMAIN}"
+    TURN_HOST="${TURN_HOST:-$REMOTE_NAME-turn.$DOMAIN}"
+  fi
 
   ask DOMAIN "Base domain" "$DOMAIN"
   DOMAIN="${DOMAIN,,}"
@@ -175,6 +190,7 @@ gather_hosts() {
   # chasing DNS for a certificate problem.
   check_tls_inputs
   if [[ "$HOST_MODE" == "dns" ]]; then check_dns_records; fi
+  if [[ "$HOST_MODE" == "proxy" ]]; then check_proxy_addressing; fi
   info "Hostnames: $APP_HOST (app), $OFFICE_HOST (office), $LIVEKIT_HOST (livekit), $TURN_HOST (turn)"
 }
 
@@ -192,6 +208,11 @@ check_host_mode() {
       mDNS is only consulted for the .local domain (nss-mdns), so these names
       would be published on the LAN and resolved by no client at all.
       For a routable domain use HOST_MODE=dns and create the DNS records."
+  fi
+  if [[ "$HOST_MODE" == "proxy" && "$any_local" == 1 ]]; then
+    die "HOST_MODE=proxy with a .local hostname.
+      These names are published on the public internet through Scriptor's
+      proxy; .local is reserved for mDNS and resolves nowhere outside the LAN."
   fi
   if [[ "$HOST_MODE" == "dns" && "$any_local" == 1 ]]; then
     die "HOST_MODE=dns with a .local hostname.
@@ -233,6 +254,52 @@ check_dns_records() {
   fi
 }
 
+# The one thing about proxy mode that has to be said out loud, at install time,
+# to whoever is standing in front of the box.
+#
+# The app has ONE canonical origin (AUTH_URL / APP_URL, read from the
+# environment — see suite-366 serveur/src/lib/app-url.ts). In proxy mode that
+# origin is the PUBLIC name, for everybody, including the people sitting in the
+# same room as the appliance. So unless their resolver answers that name with
+# the LAN address, every byte they exchange with a machine ten metres away goes
+# out to our proxy in Paris and back — and a broken internet link takes the
+# appliance down for them too.
+#
+# One internal A record fixes it. It is not optional in any serious deployment,
+# and it is exactly the record nobody thinks of until the day the WAN drops.
+check_proxy_addressing() {
+  DNS_TODO=()
+  local h got
+  info "Published through the proxy at:"
+  for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
+    got="$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1; exit}' || true)"
+    if [[ -z "$got" ]]; then
+      info "  ! https://$h — does not resolve yet (the proxy wildcard may be missing)"
+    else
+      info "  v https://$h -> $got"
+    fi
+  done
+
+  # Build the recommendation regardless of what resolves: the point is the LAN
+  # answer, and from here we cannot see the customer's internal resolver.
+  local w=0
+  for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
+    (( ${#h} > w )) && w=${#h}
+  done
+  for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
+    DNS_TODO+=("$(printf '%-*s' "$w" "$h")  A  $HOST_IP   (INTERNAL resolver only)")
+  done
+
+  warn "Split-horizon DNS is strongly recommended, and here is what it costs to skip:"
+  warn "  the app has a single canonical origin, so this appliance now answers to"
+  warn "  its PUBLIC name for everyone — including users on the same LAN. Without"
+  warn "  an internal record, their traffic leaves the building and comes back,"
+  warn "  and a WAN outage makes the box unreachable from the room it sits in."
+  warn "  Create these on the CUSTOMER'S INTERNAL resolver only:"
+  local r
+  for r in "${DNS_TODO[@]}"; do warn "    $r"; done
+}
+
 check_tls_inputs() {
   case "$TLS_MODE" in
     local-ca)
@@ -253,6 +320,18 @@ check_tls_inputs() {
         warn "  callback and saving a document fails (UNABLE_TO_VERIFY_LEAF_SIGNATURE)."
       fi
       ;;
+    pushed)
+      # The certificate is issued by the proxy (DNS-01) and PULLED by
+      # suite366-fleet's remote.sh, which owns the four Secrets from then on.
+      # cert-manager is deliberately absent: two owners for one Secret means
+      # one of them silently overwrites a working certificate.
+      CLUSTER_ISSUER=""
+      [[ "$HOST_MODE" == "proxy" ]] \
+        || die "TLS_MODE=pushed only makes sense with HOST_MODE=proxy."
+      info "TLS: issued by the Scriptor proxy, pulled by remote.sh."
+      info "  A self-signed bootstrap certificate is installed now so the box is"
+      info "  usable on its LAN immediately; it is replaced on the first pull."
+      ;;
     acme)
       die "TLS_MODE=acme is not implemented.
       An appliance on a customer LAN cannot usually satisfy either ACME
@@ -262,7 +341,7 @@ check_tls_inputs() {
       certificate issued by whoever controls the domain, or the default
       TLS_MODE=local-ca."
       ;;
-    *) die "TLS_MODE='$TLS_MODE' is invalid (expected: local-ca or provided)." ;;
+    *) die "TLS_MODE='$TLS_MODE' is invalid (expected: local-ca, provided or pushed)." ;;
   esac
 }
 

@@ -154,6 +154,37 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo env \
   HOST_MODE=dns DOMAIN=suite366.acme.fr bash
 ```
 
+### `HOST_MODE=proxy` — published on the internet by Scriptor
+
+Only for **rented fleet appliances** (`suite366-fleet`). The box is reachable
+from outside the customer's office at four flat names under `box.diwy.ai`,
+through a proxy Scriptor runs. The appliance dials out; nothing dials in.
+
+```
+acme.box.diwy.ai            acme-office.box.diwy.ai
+acme-livekit.box.diwy.ai    acme-turn.box.diwy.ai
+```
+
+Flat, not nested, because a wildcard certificate covers exactly one label —
+`*.box.diwy.ai` matches `acme.box.diwy.ai` and not `office.acme.box.diwy.ai`.
+The names are allocated on the proxy (`proxy/tools/proxy-register.sh`) and
+derived here from `REMOTE_NAME`, so the appliance and the proxy registry cannot
+disagree about what the box is called.
+
+The proxy does **not** terminate TLS: it routes on SNI and pipes the raw
+stream, so the certificate the browser validates is this appliance's own and
+Scriptor cannot read the traffic. That is checked, not asserted —
+`suite366-fleet/proxy/tests/test-passthrough.sh`.
+
+⚠️ **The cost, which you must decide about before choosing this mode.** The app
+has a single canonical origin (`AUTH_URL`/`APP_URL`), so the public name becomes
+the name for *everyone* — including users on the same LAN as the box. Without an
+internal DNS record answering that name with the LAN address, their traffic
+leaves the building and comes back through the proxy, and **a WAN outage makes
+the appliance unreachable from the room it is standing in**. The installer
+prints the four records to create on the customer's internal resolver; create
+them.
+
 ### `TLS_MODE=local-ca` (default)
 
 cert-manager issues everything from a CA generated on the box. Install
@@ -190,6 +221,20 @@ Nothing on the box watches their expiry.
 A PKI that only issues single-name certificates can supply one pair per
 service instead: `APP_TLS_CERT_FILE` / `APP_TLS_KEY_FILE`, and the same for
 `OFFICE_`, `LIVEKIT_`, `TURN_`.
+
+### `TLS_MODE=pushed` — the proxy issues, the appliance pulls
+
+`HOST_MODE=proxy` only. The certificate for the four public names is issued on
+the proxy over DNS-01 and pulled by `remote.sh`, which owns the four TLS Secrets
+from then on. The DNS credential never leaves the proxy, and no appliance holds
+a fleet-wide wildcard — a stolen box must not be able to impersonate another
+customer.
+
+`install.sh` writes a **self-signed bootstrap certificate** covering the same
+four names, because the box is not on the tailnet yet and the chart needs
+Secrets to reference. It is replaced on the first pull. cert-manager is not
+deployed in this mode: two owners for one Secret means the automated one
+silently overwrites the working certificate.
 
 ### `TLS_MODE=acme` is refused
 

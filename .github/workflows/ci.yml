@@ -34,6 +34,15 @@ jobs:
       - name: Offline package verifier self-test
         run: ./tools/test-package-verify.sh
 
+  hosts-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every check here corresponds to an install that succeeds and then does
+      # not work, with nothing in any log to say why.
+      - name: Hostname + TLS decision self-test
+        run: ./tools/test-hosts.sh
+
   backup-verify:
     runs-on: ubuntu-latest
     steps:
