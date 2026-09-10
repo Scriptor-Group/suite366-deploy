@@ -3,6 +3,7 @@
   "chart_version": "0.8.0",
   "app_version": "1.8.22",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
-  "updater_sha256": "01830094a1e678aa52c69d7e3c728b7fbd2a927c1c3379eee22cc1cd6d33fd9a",
-  "notes": "app 1.8.22: roll the stable channel to the latest published Suite 366 release (app + sandbox-api + sandbox-runner image pins bumped 1.8.10 -> 1.8.22; chart unchanged at 0.8.0). app_version drives the app/sandbox image pins in values.yaml (the appliance pins them for offline safety, update.sh rewrites the pins on apply). Bump chart_version / app_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply). updater_sha256 is filled in by tools/sign-channel.sh — never by hand; it is what lets an appliance trust the update.sh it fetches."
+  "updater_sha256": "d1b707cacf213a62dc986014d89612ddebe5383f31e8cc9b82731e8dd64f2677",
+  "backup_sha256": "2a25b429114ab252df5d7802ec6ea5eeba0ca06491b74868f1c6d4172a92cc42",
+  "notes": "app 1.8.22: roll the stable channel to the latest published Suite 366 release (app + sandbox-api + sandbox-runner image pins bumped 1.8.10 -> 1.8.22; chart unchanged at 0.8.0). app_version drives the app/sandbox image pins in values.yaml (the appliance pins them for offline safety, update.sh rewrites the pins on apply). Bump chart_version / app_version / vllm_image here to roll out to the fleet; appliances poll this file daily and notify (no auto-apply). updater_sha256 and backup_sha256 are filled in by tools/sign-channel.sh - never by hand; they are what let an appliance trust the update.sh and backup.sh it fetches. backup_sha256 must be present: an appliance holding the package key REFUSES to refresh backup.sh without it, and a box whose updater rolls forward while its backup agent does not is a box that silently stops being backed up."
 }

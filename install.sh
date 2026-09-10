@@ -9,6 +9,7 @@
 #   • vLLM ×2 (generative + embeddings) on Docker host, on the Blackwell GPU;
 #   • the full Suite 366 (drive + Postgres + Redis + MinIO + OnlyOffice +
 #     LiveKit/TURN) via the `drive` Helm chart;
+#   • nightly encrypted backups (restic) to an S3 destination;
 #   • local TLS (self-signed CA, or your own certificates) + mDNS on
 #     *.suite366.local (Avahi) — or your own DNS, see HOST_MODE below.
 #
@@ -57,6 +58,21 @@
 #                              vLLM + the app survive LAN changes/offline
 #                              (default 10.99.0.1; outside pod/service CIDRs)
 #   SUITE_IFACE                name of that dummy interface (default suite0)
+#   BACKUP_REPO                restic destination, e.g.
+#                              s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>.
+#                              EMPTY (default) installs the backup mechanism
+#                              armed but idle — set it later in
+#                              <DATA_DIR>/backup/backup.env.
+#   BACKUP_S3_ACCESS_KEY,      credentials for that destination
+#   BACKUP_S3_SECRET_KEY,
+#   BACKUP_S3_REGION
+#   BACKUP_PASSWORD            repository encryption key (generated when empty
+#                              and printed ONCE — there is no recovery path)
+#   BACKUP_SCHEDULE            HH:MM local, default 02:40 (+15 min jitter)
+#   BACKUP_KEEP_DAILY,         retention, default 7 / 4 / 6
+#   BACKUP_KEEP_WEEKLY,
+#   BACKUP_KEEP_MONTHLY
+#   SKIP_BACKUP=1              do not install the backup layer at all
 #   ASSUME_YES=1               don't prompt, accept defaults
 #
 # Test / non-Spark hosts (relax hardware checks — see README "Running without
@@ -120,7 +136,7 @@ load_module() { # load_module NAME  (=> sources lib/NAME.sh)
 
 # Load order matters: config (defaults) and common (helpers) first, then each
 # deploy step in the order main() calls it.
-MODULES=(config common preflight network k3s vllm cert-manager suite mdns updater summary)
+MODULES=(config common preflight network k3s vllm cert-manager suite mdns updater backup summary)
 for _m in "${MODULES[@]}"; do load_module "$_m"; done
 
 main() {
@@ -133,6 +149,7 @@ main() {
   deploy_suite
   setup_mdns
   setup_update_timer
+  setup_backup
   summary
 }
 main "$@"

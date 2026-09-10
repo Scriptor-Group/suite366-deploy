@@ -73,6 +73,25 @@ AI
       $DATA_DIR/suite366-local-ca.crt          (same file, root-only)"
   fi
 
+  # The key itself was printed once, when it was generated (lib/backup.sh).
+  # Only its fingerprint is repeated here: re-printing a secret at the end of
+  # every re-install is how it ends up in a ticket.
+  local backup_block
+  if [[ "${SKIP_BACKUP:-0}" == "1" ]]; then
+    backup_block=" Backups         : NOT installed (SKIP_BACKUP=1)."
+  elif [[ -n "${BACKUP_REPO:-}" ]]; then
+    backup_block=" Backups         : nightly at $BACKUP_SCHEDULE -> $BACKUP_REPO
+                   keep ${BACKUP_KEEP_DAILY}d/${BACKUP_KEEP_WEEKLY}w/${BACKUP_KEEP_MONTHLY}m ; key fingerprint $(sha256sum "$BACKUP_DIR/repo.pass" 2>/dev/null | cut -c1-12)
+                   Now      : sudo $DATA_DIR/backup.sh run
+                   State    : sudo $DATA_DIR/backup.sh status
+                   !! The encryption key exists ONLY on this box. Store it."
+  else
+    backup_block=" Backups         : mechanism installed, NO DESTINATION SET.
+                   Nothing is being backed up. To turn it on:
+                     sudo \$EDITOR $BACKUP_DIR/backup.env   (BACKUP_REPO=…)
+                     sudo $DATA_DIR/backup.sh init && sudo $DATA_DIR/backup.sh run"
+  fi
+
   cat <<EOF
 
 $(printf "${c_g}========================================================================${c_0}")
@@ -94,6 +113,7 @@ $dns_block
                    LAN changes/offline). External access follows the current
                    LAN IP via Traefik$( [[ "$HOST_MODE" == "mdns" ]] && printf ' + dynamic mDNS' ).
  systemd services: suite366-net, suite366-vllm$( [[ "$HOST_MODE" == "mdns" ]] && printf ', suite366-avahi-aliases' ), k3s
+$backup_block
  Updates         : checked daily (suite366-update.timer, notify-only).
                    Check now : sudo $DATA_DIR/update.sh check
                    Apply     : sudo $DATA_DIR/update.sh apply

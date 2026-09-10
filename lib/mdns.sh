@@ -100,7 +100,11 @@ EOF
 # would otherwise leave the old watcher alive, still answering on the LAN for
 # names the appliance no longer serves.
 disable_mdns() {
-  info "mDNS not used (HOST_MODE=$HOST_MODE) — the names are resolved by your DNS."
+  if [[ "$HOST_MODE" == "proxy" ]]; then
+    info "mDNS not used (HOST_MODE=proxy) — the names are public and resolved by ours."
+  else
+    info "mDNS not used (HOST_MODE=$HOST_MODE) — the names are resolved by your DNS."
+  fi
   if [[ -e /etc/systemd/system/suite366-avahi-aliases.service ]]; then
     log "Removing the mDNS publisher installed by a previous run"
     systemctl disable --now suite366-avahi-aliases.service >/dev/null 2>&1 || true

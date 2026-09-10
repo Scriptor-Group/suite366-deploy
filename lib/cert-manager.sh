@@ -10,6 +10,10 @@ install_cert_manager() {
     install_provided_certs
     return 0
   fi
+  if [[ "$TLS_MODE" == "pushed" ]]; then
+    install_bootstrap_certs
+    return 0
+  fi
   log "cert-manager + local CA"
   if ! kc -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
     helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
@@ -77,4 +81,52 @@ install_provided_certs() {
     install -m 0644 "$TLS_CA_FILE" /usr/local/share/suite366-issuing-ca.crt
     info "  issuing CA copied to /usr/local/share/suite366-issuing-ca.crt"
   fi
+}
+
+
+# TLS_MODE=pushed — the real certificate is issued by the Scriptor proxy over
+# DNS-01 and pulled by suite366-fleet's remote.sh, which owns the four Secrets
+# from then on. That pull cannot happen during this install: the box is not on
+# the tailnet yet.
+#
+# So the Secrets are bootstrapped with a self-signed certificate covering the
+# same four names. Not decoration — without it the chart renders an Ingress
+# referencing Secrets that do not exist, Traefik serves its own default
+# certificate, and an appliance that is perfectly healthy on the LAN looks
+# broken until the first pull succeeds.
+#
+# cert-manager is deliberately NOT deployed here either. Two owners for one
+# Secret means one of them silently overwrites a working certificate, and the
+# one that would win is the automated one.
+install_bootstrap_certs() {
+  log "TLS: bootstrap certificate (the real one is pulled from the proxy)"
+  have openssl || die "openssl is required to generate the bootstrap certificate."
+  kc create namespace "$NAMESPACE" --dry-run=client -o yaml | kc apply -f - >/dev/null
+
+  local dir="$DATA_DIR/bootstrap-tls"
+  mkdir -p "$dir"; chmod 0700 "$dir"
+  if [[ ! -s "$dir/tls.crt" ]]; then
+    # One certificate over all four names, 30 days: long enough that a proxy
+    # outage at install time is not an emergency, short enough that a box still
+    # serving it a month later is visibly wrong rather than quietly wrong.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+      -keyout "$dir/tls.key" -out "$dir/tls.crt" \
+      -subj "/CN=$APP_HOST" \
+      -addext "subjectAltName=DNS:$APP_HOST,DNS:$OFFICE_HOST,DNS:$LIVEKIT_HOST,DNS:$TURN_HOST" \
+      >/dev/null 2>&1 \
+      || die "could not generate the bootstrap certificate."
+    chmod 0600 "$dir/tls.key"; chmod 0644 "$dir/tls.crt"
+  fi
+
+  local s
+  for s in "$APP_TLS_SECRET" "$OFFICE_TLS_SECRET" "$LIVEKIT_TLS_SECRET" "$TURN_TLS_SECRET"; do
+    kc -n "$NAMESPACE" create secret tls "$s" \
+      --cert="$dir/tls.crt" --key="$dir/tls.key" \
+      --dry-run=client -o yaml | kc apply -f - >/dev/null \
+      || die "could not create secret/$s"
+    info "secret/$s (bootstrap)"
+  done
+  warn "These are SELF-SIGNED and every browser will refuse them."
+  warn "  They exist only so the chart has something to reference. Publish the"
+  warn "  box to replace them:  sudo $DATA_DIR/remote.sh enable"
 }

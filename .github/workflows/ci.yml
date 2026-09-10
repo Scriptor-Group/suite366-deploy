@@ -1,8 +1,9 @@
 name: CI
 
-# Lint every shell script and run the offline-package verifier self-test on each
-# push / PR. The signed-channel machinery is only as trustworthy as the code
-# that verifies it, so that code is exercised here rather than by hand.
+# Lint every shell script and run the self-tests on each push / PR. The
+# signed-channel machinery is only as trustworthy as the code that verifies it,
+# and a backup is only as trustworthy as the run that proves it restores — so
+# both are exercised here rather than by hand.
 on:
   push:
   pull_request:
@@ -32,3 +33,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Offline package verifier self-test
         run: ./tools/test-package-verify.sh
+
+  hosts-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every check here corresponds to an install that succeeds and then does
+      # not work, with nothing in any log to say why.
+      - name: Hostname + TLS decision self-test
+        run: ./tools/test-hosts.sh
+
+  backup-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The suite stubs restic, so it runs without this; installing a real one
+      # additionally exercises a genuine init -> backup -> restore -> diff,
+      # which is the only part that proves the data actually comes back.
+      - name: Install restic
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
+      - name: Backup agent self-test
+        run: ./tools/test-backup.sh
