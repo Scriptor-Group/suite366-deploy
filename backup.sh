@@ -716,10 +716,23 @@ EOF
     encrypted columns are permanently unreadable. Nothing was changed."
   # A dump that was truncated at backup time is unusable, and finding that out
   # after dropping the live database is the worst possible moment.
-  if have pg_restore; then
-    pg_restore --list "$dump" >/dev/null 2>&1 \
-      || die "the extracted dump is not a readable pg_dump archive — nothing was changed."
-  fi
+  #
+  # Three outcomes, not two, because "pg_restore said no" and "pg_restore could
+  # not run" must not be treated alike: the first is a definitive refusal, the
+  # second is an unknown. pg_restore is NOT on the appliance host — verified on
+  # a real one, where the original host-side guard silently skipped itself and
+  # the check that mattered never ran at all. The postgres pod has it.
+  case "$(preflight_dump "$dump" "$pg_deploy")" in
+    ok)  info "the extracted dump reads as a valid pg_dump archive." ;;
+    bad) die "the extracted dump is not a readable pg_dump archive — nothing was changed." ;;
+    *)
+      [[ "$(head -c 5 "$dump")" == "PGDMP" ]] \
+        || die "the extracted dump is not a pg_dump archive at all — nothing was changed."
+      warn "pg_restore is available neither in the postgres pod nor on this host."
+      warn "  The dump has the right magic bytes but has NOT been verified as"
+      warn "  complete. Continuing; verify the restore especially carefully."
+      ;;
+  esac
   info "extracted to $stage"
 
   # --- 2. reversibility ---------------------------------------------------------
@@ -821,6 +834,23 @@ $(printf "${c_y}It is not done until you have verified it POSITIVELY:${c_0}")
   If this went wrong, the state from before is in the repository:
     $DATA_DIR/backup.sh snapshots        # look for the 'pre-restore' tag
 EOF
+}
+
+# ok | bad | unavailable — see the caller for why the third value exists.
+preflight_dump() { # preflight_dump DUMP PG_DEPLOY
+  local dump="$1" deploy="$2"
+  if kc -n "$NAMESPACE" exec "deploy/$deploy" -- sh -c 'command -v pg_restore >/dev/null 2>&1' >/dev/null 2>&1; then
+    if kc -n "$NAMESPACE" exec -i "deploy/$deploy" -- \
+         sh -c 'cat > /tmp/.preflight.dump; pg_restore --list /tmp/.preflight.dump >/dev/null 2>&1; rc=$?; rm -f /tmp/.preflight.dump; exit $rc' \
+         < "$dump" >/dev/null 2>&1
+    then printf 'ok'; else printf 'bad'; fi
+    return 0
+  fi
+  if have pg_restore; then
+    pg_restore --list "$dump" >/dev/null 2>&1 && printf 'ok' || printf 'bad'
+    return 0
+  fi
+  printf 'unavailable'
 }
 
 # Run a command inside the postgres pod. Kept separate because the in-place

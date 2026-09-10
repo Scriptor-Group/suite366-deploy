@@ -106,6 +106,8 @@ case "\$args" in
                     deployment.apps/drive-onlyoffice ;;
   *scale*|*"rollout status"*) exit 0 ;;
   *"patch secret"*) exit 0 ;;
+  *"command -v pg_restore"*) [[ -f "$WORK/no-pgrestore" ]] && exit 1; exit 0 ;;
+  *preflight.dump*) cat >/dev/null 2>&1 || true; [[ -f "$WORK/bad-dump" ]] && exit 1; exit 0 ;;
   *pg_restore*)     cat >/dev/null 2>&1 || true; exit 0 ;;
   *information_schema.tables*) cat "$WORK/pg-tables" 2>/dev/null || echo 0 ;;
   *"get pvc -o name"*)     echo "persistentvolumeclaim/drive-minio-pvc" ;;
@@ -337,7 +339,7 @@ echo 0 > "$WORK/pg-tables"
 bk restore --in-place --yes
 check "a snapshot without app-secret.yaml is refused" "$?" "1"
 contains "and explains the consequence" "permanently unreadable" "$(out)"
-absent  "nothing was reloaded" "pg_restore" "$(cat "$KLOG")"
+absent  "nothing was reloaded" "--clean --if-exists" "$(cat "$KLOG")"
 rm -f "$WORK/no-secret"
 
 : > "$KLOG"; touch "$WORK/no-dump"
@@ -348,12 +350,42 @@ rm -f "$WORK/no-dump"
 
 # A dump that was truncated at backup time must be caught BEFORE the live
 # database is dropped — finding out afterwards is the worst possible moment.
+# The check runs INSIDE the postgres pod: pg_restore is not installed on a real
+# appliance host, so the host-side version of this guard skipped itself.
 : > "$KLOG"; touch "$WORK/bad-dump"
 bk restore --in-place --yes
 check "an unreadable dump is refused" "$?" "1"
 contains "and says so" "not a readable pg_dump archive" "$(out)"
 absent  "and the app was never stopped" "--replicas=0" "$(cat "$KLOG")"
 rm -f "$WORK/bad-dump"
+
+# preflight_dump has THREE outcomes and the third is the one that actually
+# happens on an appliance: pg_restore is installed neither in the pod nor on
+# the host. Tested directly, because a dev machine with postgresql-client
+# cannot produce that condition end to end.
+# Driven by POD_HAS / VERDICT / HOST_HAS in the environment (0 = yes/success).
+pf() {
+  bash -c '
+    set -uo pipefail
+    NAMESPACE=suite366
+    kc() {
+      case "$*" in
+        *"command -v pg_restore"*) return "$POD_HAS" ;;
+        *preflight.dump*) cat >/dev/null 2>&1 || true; return "$VERDICT" ;;
+      esac
+      return 0
+    }
+    have() { [[ "$1" == "pg_restore" ]] && return "$HOST_HAS"; command -v "$1" >/dev/null 2>&1; }
+    pg_restore() { return "$VERDICT"; }
+    eval "$(sed -n "/^preflight_dump() {/,/^}/p" "$1")"
+    preflight_dump "$2" drive-postgres
+  ' _ "$REPO/backup.sh" "$WORK/anydump"
+}
+printf 'PGDMP-x' > "$WORK/anydump"
+check "pod has pg_restore and accepts the dump  -> ok"          "$(POD_HAS=0 VERDICT=0 HOST_HAS=1 pf)" "ok"
+check "pod has pg_restore and REFUSES the dump  -> bad"         "$(POD_HAS=0 VERDICT=1 HOST_HAS=1 pf)" "bad"
+check "no pod pg_restore, host has one, accepts -> ok"          "$(POD_HAS=1 VERDICT=0 HOST_HAS=0 pf)" "ok"
+check "no pg_restore anywhere                   -> unavailable" "$(POD_HAS=1 VERDICT=1 HOST_HAS=1 pf)" "unavailable"
 
 # --- the happy path, and the ordering that is the whole design ----------------
 : > "$KLOG"; : > "$RLOG"
@@ -370,13 +402,14 @@ absent  "it does NOT restore POSTGRES_PASSWORD" "POSTGRES_PASSWORD" \
         "$(grep 'patch secret' "$KLOG" || true)"
 absent  "it does NOT restore MinIO credentials" "MINIO" \
         "$(grep 'patch secret' "$KLOG" || true)"
-contains "it reloads the database" "pg_restore" "$klog"
+contains "it reloads the database" "--clean --if-exists" "$klog"
 contains "it stops the app first" "scale deploy/drive-app --replicas=0" "$klog"
 contains "it brings the app back" "scale deploy/drive-app --replicas=1" "$klog"
 
 # THE ordering guarantee: the secret has to be in place before the data is.
 patch_at=$(grep -n "patch secret" "$KLOG" | head -1 | cut -d: -f1)
-restore_at=$(grep -n "pg_restore" "$KLOG" | head -1 | cut -d: -f1)
+# The preflight also mentions pg_restore, so anchor on the reload itself.
+restore_at=$(grep -n -- "--clean --if-exists" "$KLOG" | head -1 | cut -d: -f1)
 stop_at=$(grep -n -- "--replicas=0" "$KLOG" | head -1 | cut -d: -f1)
 if [[ -n "$patch_at" && -n "$restore_at" && "$patch_at" -lt "$restore_at" ]]; then
   ok "AUTH_SECRET is patched BEFORE the data is reloaded"
