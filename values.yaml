@@ -218,6 +218,12 @@ livekit:
 #    0600, so the pod can ASK for a destination but can never read back the
 #    secret it set.
 #
+#  @DATA_DIR@/remote   -> /appliance-remote  (APPLIANCE_REMOTE_DIR)
+#    Remote publication toggle, RENTED fleet appliances only. remote.sh
+#    publishes state.json (the four public names, the certificate, whether the
+#    tunnel is up) and the app drops enable-/disable-requested. Empty on a
+#    customer-run appliance, so the feature is invisible there.
+#
 #  @DATA_DIR@/support  -> /support-access    (SUPPORT_ACCESS_DIR)
 #    Remote-support access toggle, used on RENTED fleet appliances only. The
 #    host agent publishes state.json (grant + pre-arm state) and the app drops
@@ -235,6 +241,8 @@ extraEnv:
     value: /support-access
   - name: APPLIANCE_BACKUP_DIR
     value: /appliance-backup
+  - name: APPLIANCE_REMOTE_DIR
+    value: /appliance-remote
 extraVolumeMounts:
   - name: appliance-update
     mountPath: /appliance-update
@@ -242,6 +250,8 @@ extraVolumeMounts:
     mountPath: /support-access
   - name: appliance-backup
     mountPath: /appliance-backup
+  - name: appliance-remote
+    mountPath: /appliance-remote
 extraVolumes:
   - name: appliance-update
     hostPath:
@@ -254,6 +264,10 @@ extraVolumes:
   - name: appliance-backup
     hostPath:
       path: @DATA_DIR@/backup
+      type: DirectoryOrCreate
+  - name: appliance-remote
+    hostPath:
+      path: @DATA_DIR@/remote
       type: DirectoryOrCreate
 
 # Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,

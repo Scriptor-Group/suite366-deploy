@@ -80,15 +80,15 @@ deploy_suite() {
   # DirectoryOrCreate doesn't make them root:root 0755 (the pod, uid/gid 1001,
   # must be able to drop trigger files — k8s does not fsGroup-chown hostPath).
   #
-  # `support` stays EMPTY here: the remote-support toggle is a fleet feature
-  # (suite366-fleet drops state.json in it). With no state.json the app hides
-  # the feature, so a customer-run appliance is unaffected by the mount.
+  # `support` and `remote` stay EMPTY here: both are fleet features
+  # (suite366-fleet drops state.json in them). With no state.json the app hides
+  # the feature, so a customer-run appliance is unaffected by the mounts.
   #
   # `backup` is created here too, for a different reason: lib/backup.sh runs
   # AFTER helm, so without this the mount would materialise as root:root 0755
   # and the app could never drop a trigger into it.
   local d
-  for d in updates support backup; do
+  for d in updates support backup remote; do
     mkdir -p "$DATA_DIR/$d"
     chown root:1001 "$DATA_DIR/$d"
     chmod 0770 "$DATA_DIR/$d"
