@@ -230,8 +230,20 @@ prepull_images() {
   imgs="$(kc get deploy,statefulset,daemonset,job -A \
     -o jsonpath='{range .items[*]}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{end}' \
     2>/dev/null | sort -u)"
+  # sandbox-runner is spawned on demand by sandbox-api, never by Helm, so it is
+  # not in the list above and has to be named here. Its tag is READ BACK from
+  # the values file rather than written twice: the pin lived here in full, one
+  # screen away from the identical pin in values.yaml, and an app release that
+  # updated one and not the other pre-pulled a version the box never runs —
+  # which only shows up offline, months later, as a sandbox that cannot start.
+  local runner
+  # Matched on the image NAME, not on the key: values.yaml carries a second
+  # `runnerImage:` for the workbench, and picking by position would silently
+  # pre-pull the wrong one the day the two blocks are reordered.
+  runner="$(sed -n 's|^[[:space:]]*runnerImage:[[:space:]]*\(.*suite-366-sandbox-runner:.*\)$|\1|p' \
+              "$DATA_DIR/values.yaml" 2>/dev/null | head -1)"
   extra="busybox:1.37
-ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22
+${runner:-ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.3}
 ghcr.io/scriptor-group/suite-366-workbench-runner:latest"
   for i in $imgs $extra; do
     [[ -z "$i" ]] && continue
