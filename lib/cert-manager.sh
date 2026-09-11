@@ -66,6 +66,10 @@ install_local_ca() {
 issue_local_certs() {
   [[ -n "${LOCAL_APP_HOST:-}" ]] || return 0
   log "TLS: local CA certificates for the LAN names"
+  # Not CLUSTER_ISSUER: preflight empties that one in this very mode. An empty
+  # issuerRef is rejected by the API server, which is how this was found.
+  [[ -n "${LOCAL_CLUSTER_ISSUER:-}" ]] \
+    || die "internal: LOCAL_CLUSTER_ISSUER is empty — the LAN certificates have no issuer."
   install_local_ca
 
   local svc host secret
@@ -86,7 +90,7 @@ spec:
   dnsNames:
     - ${host}
   issuerRef:
-    name: ${CLUSTER_ISSUER}
+    name: ${LOCAL_CLUSTER_ISSUER}
     kind: ClusterIssuer
 EOF
     info "  certificate/$secret <- $host"
@@ -146,6 +150,28 @@ install_provided_certs() {
 }
 
 
+# True when the Secret already carries a certificate that parses.
+#
+# The bootstrap exists ONLY to give the chart something to reference when there
+# is nothing at all. Re-running install.sh on a box that is already published
+# used to overwrite all four Secrets with the self-signed placeholder, taking
+# every public name down until someone re-pulled from the proxy — and remote.sh
+# does not notice, because it compares the certificate it fetched against its
+# own cached copy rather than against what is in the cluster. Measured on the
+# GB10: `curl` went to verify error 18 (self-signed in chain) on all four names
+# and stayed there.
+#
+# So: anything already there wins. A certificate that is present and parseable
+# came from an owner that knows more than this function does — remote.sh, the
+# customer's PKI, or an earlier bootstrap that is still doing its job.
+secret_holds_a_certificate() { # secret_holds_a_certificate NAME
+  local pem
+  pem="$(kc -n "$NAMESPACE" get secret "$1" -o jsonpath='{.data.tls\.crt}' 2>/dev/null)" || return 1
+  [[ -n "$pem" ]] || return 1
+  base64 -d <<<"$pem" 2>/dev/null | openssl x509 -noout >/dev/null 2>&1
+}
+
+
 # TLS_MODE=pushed — the real certificate is issued by the Scriptor proxy over
 # DNS-01 and pulled by suite366-fleet's remote.sh, which owns the four Secrets
 # from then on. That pull cannot happen during this install: the box is not on
@@ -180,17 +206,28 @@ install_bootstrap_certs() {
     chmod 0600 "$dir/tls.key"; chmod 0644 "$dir/tls.crt"
   fi
 
-  local s
+  local s kept=0 wrote=0
   for s in "$APP_TLS_SECRET" "$OFFICE_TLS_SECRET" "$LIVEKIT_TLS_SECRET" "$TURN_TLS_SECRET"; do
+    if secret_holds_a_certificate "$s"; then
+      info "secret/$s already holds a certificate — left alone."
+      kept=$((kept+1))
+      continue
+    fi
     kc -n "$NAMESPACE" create secret tls "$s" \
       --cert="$dir/tls.crt" --key="$dir/tls.key" \
       --dry-run=client -o yaml | kc apply -f - >/dev/null \
       || die "could not create secret/$s"
     info "secret/$s (bootstrap)"
+    wrote=$((wrote+1))
   done
-  warn "These are SELF-SIGNED and every browser will refuse them."
-  warn "  They exist only so the chart has something to reference. Publish the"
-  warn "  box to replace them:  sudo $DATA_DIR/remote.sh enable"
+  if (( kept )); then
+    info "$kept of 4 TLS secrets were already populated; $wrote bootstrapped."
+  fi
+  if (( wrote )); then
+    warn "The bootstrap certificates are SELF-SIGNED and every browser will refuse them."
+    warn "  They exist only so the chart has something to reference. Publish the"
+    warn "  box to replace them:  sudo $DATA_DIR/remote.sh enable"
+  fi
 
   # The LAN names are served from this box whether or not the proxy ever
   # answers, so their certificates are issued here and now.
