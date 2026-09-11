@@ -456,9 +456,36 @@ compute_diffs() {
   info "app    running : ${cur_app:-unknown}    target : ${want_app:-unchanged}"
   info "vLLM   running : ${cur_vllm:-unknown}    target : ${want_vllm:-unchanged}"
 
-  [[ -n "$cur_chart" && -n "$want_chart" && "$cur_chart" != "$want_chart" ]] && chart_diff=1
-  [[ -n "$want_vllm" && -n "$cur_vllm" && "$cur_vllm" != "$want_vllm" ]] && vllm_diff=1
-  [[ -n "$want_app"  && -n "$cur_app"  && "$cur_app"  != "$want_app"  ]] && app_diff=1
+  # STRICTLY NEWER, not merely different. The channel is rolled deliberately and
+  # the installer's own default runs ahead of it between rolls, so a box
+  # installed in that window found itself one button away from going backwards:
+  # observed on the GB10 as `update_available: true, "chart 0.9.0 -> 0.8.0"`,
+  # with the admin UI offering it as an update. A silent downgrade takes back
+  # whatever the newer chart added — which is exactly the kind of loss nobody
+  # attributes to an update that presented itself as one.
+  #
+  # A genuine rollback is still possible: publish it as a HIGHER version of the
+  # older content, which is a deliberate act and leaves a trace. Reaching it by
+  # lowering a number is not something a fleet should follow automatically.
+  if ver_gt "$want_chart" "$cur_chart" && [[ -n "$cur_chart" ]]; then chart_diff=1; fi
+  if ver_gt "$want_app"  "$cur_app"  && [[ -n "$cur_app"  ]]; then app_diff=1; fi
+  # The vLLM image is a tag, not a version: `cu130-nightly` does not order, so
+  # difference is the only signal available and a change is always a roll.
+  if [[ -n "$want_vllm" && -n "$cur_vllm" && "$cur_vllm" != "$want_vllm" ]]; then vllm_diff=1; fi
+
+  # A channel BEHIND the box is not an update, but it is worth saying out loud:
+  # it usually means the channel has not been rolled since this box was built,
+  # and someone is waiting for a fix that is already installed here.
+  local behind=""
+  if [[ -n "$cur_chart" ]] && ver_gt "$cur_chart" "$want_chart"; then
+    behind="chart $want_chart < $cur_chart"
+  fi
+  if [[ -n "$cur_app" ]] && ver_gt "$cur_app" "$want_app"; then
+    behind="${behind:+$behind; }app $want_app < $cur_app"
+  fi
+  if [[ -n "$behind" ]]; then
+    info "channel is BEHIND this box ($behind) — not offered as an update."
+  fi
 
   # One-line human summary of what's available.
   local parts=()

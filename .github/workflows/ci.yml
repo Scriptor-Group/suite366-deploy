@@ -42,6 +42,10 @@ jobs:
       # not work, with nothing in any log to say why.
       - name: Hostname + TLS decision self-test
         run: ./tools/test-hosts.sh
+      # A channel that lags the installer must never present itself as an
+      # update: the admin UI button would silently roll the box backwards.
+      - name: Update decision self-test
+        run: ./tools/test-update-diffs.sh
 
   backup-verify:
     runs-on: ubuntu-latest
