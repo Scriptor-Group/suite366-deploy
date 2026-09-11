@@ -101,6 +101,14 @@ TURN_TLS_KEY_FILE="${TURN_TLS_KEY_FILE:-}"
 # that does not exist. check_tls_inputs() empties it in `provided` mode, which
 # is how the chart learns to drop the cert-manager annotations entirely.
 CLUSTER_ISSUER="suite366-local-ca"
+# The SAME issuer, under a name that is never emptied. CLUSTER_ISSUER carries a
+# second meaning — "annotate the chart's Ingresses with this" — and preflight
+# clears it in `provided` and `pushed` mode to switch those annotations off.
+# The LAN certificates in proxy mode still need the issuer OBJECT by name, and
+# reusing the cleared variable produced a Certificate with an empty issuerRef:
+#   The Certificate "drive-local-tls" is invalid: spec.issuerRef.name: Required value
+# found on the first run against real hardware.
+LOCAL_CLUSTER_ISSUER="suite366-local-ca"
 # Fixed Secret names: `provided` mode must know exactly what to create, and the
 # chart must never silently fall back to its own default names.
 APP_TLS_SECRET="${APP_TLS_SECRET:-drive-tls}"

@@ -51,6 +51,11 @@ jobs:
       # what it got before.
       - name: values.yaml dual-name rendering self-test
         run: ./tools/test-dual-names.sh
+      # Both of these were found by running the installer against a published
+      # box, not by reading it: an empty issuerRef, and four working
+      # certificates replaced by a self-signed placeholder.
+      - name: LAN certificates + bootstrap self-test
+        run: ./tools/test-local-certs.sh
 
   backup-verify:
     runs-on: ubuntu-latest
