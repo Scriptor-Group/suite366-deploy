@@ -395,6 +395,7 @@ lib/summary.sh                        final post-install summary
 backup.sh                             backup agent (run | test | status | snapshots | prune | restore | install-units); run by suite366-backup.timer
 lib/backup.sh                         installs the pinned restic, the repository key, backup.sh and its timer
 tools/test-backup.sh                  self-test: stubbed restic + cluster, plus a real restic round trip when one is on PATH
+tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a lagging channel is reported, never offered
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
