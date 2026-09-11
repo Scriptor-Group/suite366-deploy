@@ -29,12 +29,35 @@ AI
   # DNS / TLS guidance depends on the two choices made in gather_hosts(); a
   # summary that told every box to install a local CA and wait for mDNS was
   # actively misleading on a box using the customer's DNS and certificates.
-  local dns_block tls_block
+  local dns_block tls_block mdns_on=""
+  if [[ "$HOST_MODE" == "mdns" || -n "${LOCAL_APP_HOST:-}" ]]; then mdns_on=1; fi
   if [[ "$HOST_MODE" == "mdns" ]]; then
     dns_block=" DNS: these names are published via mDNS on the current LAN IP.
       LAN machines with mDNS (macOS, Windows 10+, Linux+nss-mdns) resolve them
       with no configuration. mDNS does not cross VPNs or multicast-blocking
       networks — fallback: add the names to those clients' /etc/hosts."
+  elif [[ "$HOST_MODE" == "proxy" ]]; then
+    # Nothing to create: the public names are ours and already point at the
+    # proxy, and the LAN names are published over multicast by this box. Saying
+    # "required records" here would send an operator to configure a zone they
+    # do not own for a box that is already reachable.
+    dns_block=" DNS: nothing to create. $DOMAIN is resolved publicly and points at
+      Scriptor's proxy, which reaches this box through the tunnel remote.sh
+      opens."
+    if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+      dns_block+="
+      The LAN names are published over mDNS on the current LAN IP, exactly as
+      on an unpublished box — so LAN clients need no configuration either.
+      mDNS does not cross VPNs or multicast-blocking networks; those clients
+      can use the public names, which work from anywhere."
+    fi
+    if (( ${#DNS_TODO[@]} )); then
+      local ptodo
+      dns_block+="
+   !! Still to check:"
+      for ptodo in "${DNS_TODO[@]}"; do dns_block+="
+        $ptodo"; done
+    fi
   else
     local w=0 h
     for h in "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST"; do
@@ -58,6 +81,27 @@ AI
     fi
   fi
 
+  # The LAN names, when the box keeps them. Worth its own block rather than a
+  # line in the DNS one: an operator reading this has to know both that the old
+  # URL still works and that signing in on one name does not sign them in on
+  # the other.
+  local lan_block=""
+  if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+    lan_block="
+ On the LAN, unchanged and with no configuration anywhere:
+
+ Application :   https://$LOCAL_APP_HOST
+ OnlyOffice  :   https://$LOCAL_OFFICE_HOST
+ LiveKit     :   wss://$LOCAL_LIVEKIT_HOST
+
+      A browser gets the editor and the meeting socket matching the name it
+      arrived on, so both keep working with the WAN down. TURN stays on
+      $TURN_HOST (LiveKit serves one TURN certificate); LAN media
+      goes direct over UDP and does not use it.
+      Sessions are per-name: signing in on one does not sign you in on the
+      other, and e-mailed links always point at $APP_HOST."
+  fi
+
   if [[ "$TLS_MODE" == "provided" ]]; then
     tls_block=" TLS: your own certificates are installed (TLS_MODE=provided).
       Nothing to deploy on client machines, as long as they already trust the
@@ -67,6 +111,16 @@ AI
       $APP_TLS_SECRET / $OFFICE_TLS_SECRET / $LIVEKIT_TLS_SECRET /
       $TURN_TLS_SECRET (namespace $NAMESPACE), then restart livekit for TURN.
       Nothing on this box watches their expiry."
+  elif [[ "$TLS_MODE" == "pushed" ]]; then
+    tls_block=" TLS: the public names use a certificate issued by the Scriptor proxy
+      and renewed by it — nothing to install on any client."
+    if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+      tls_block+="
+      The LAN names use the local CA instead (a public issuer cannot validate
+      a .local name), so clients that browse by LAN name need it once:
+      /usr/local/share/suite366-local-ca.crt   (world-readable, ready to scp)
+      $DATA_DIR/suite366-local-ca.crt          (same file, root-only)"
+    fi
   else
     tls_block=" TLS trust: install the local CA on each client machine
       /usr/local/share/suite366-local-ca.crt   (world-readable, ready to scp)
@@ -102,6 +156,7 @@ $(printf "${c_g}================================================================
  OnlyOffice  :   https://$OFFICE_HOST
  LiveKit     :   wss://$LIVEKIT_HOST
  TURN        :   $TURN_HOST:5349
+$lan_block
 
 $ai
 
@@ -111,8 +166,8 @@ $dns_block
 
  Network     : cluster pinned to $SUITE_IP on $SUITE_IFACE (stable, survives
                    LAN changes/offline). External access follows the current
-                   LAN IP via Traefik$( [[ "$HOST_MODE" == "mdns" ]] && printf ' + dynamic mDNS' ).
- systemd services: suite366-net, suite366-vllm$( [[ "$HOST_MODE" == "mdns" ]] && printf ', suite366-avahi-aliases' ), k3s
+                   LAN IP via Traefik$( [[ -n "$mdns_on" ]] && printf ' + dynamic mDNS' ).
+ systemd services: suite366-net, suite366-vllm$( [[ -n "$mdns_on" ]] && printf ', suite366-avahi-aliases' ), k3s
 $backup_block
  Updates         : checked daily (suite366-update.timer, notify-only).
                    Check now : sudo $DATA_DIR/update.sh check

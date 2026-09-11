@@ -23,13 +23,31 @@ DOMAIN="${DOMAIN:-suite366.local}"
 #          and the proxy registry cannot disagree about what this box is
 #          called.
 #
-#          The cost of `proxy`, stated once here and again at install time:
-#          the app has ONE canonical origin, so the public name becomes the
-#          name for EVERYONE, LAN users included. Without an internal DNS
-#          record answering it with the LAN address, traffic between two
-#          machines in the same room transits our proxy — and a WAN outage
-#          takes the appliance down for people standing next to it.
+#          `proxy` keeps the LAN name as well, by default. The box answers to
+#          BOTH: the public names through the proxy, and the usual
+#          *.LOCAL_DOMAIN names published over mDNS exactly as in `mdns` mode.
+#          A browser gets the URLs matching the name it arrived on — so a LAN
+#          client loads the document editor and the meeting socket from the
+#          box beside it, not from Paris, and keeps working when the WAN is
+#          down.
+#
+#          What it cannot do is share a SESSION between the two names: cookies
+#          are host-only, and the app's canonical origin (used for e-mail
+#          links, OAuth callbacks and bot endpoints, which must be stable and
+#          externally resolvable) is the PUBLIC name. Someone browsing on the
+#          LAN name who follows an e-mailed link lands on the public one and
+#          signs in again. Set LOCAL_DOMAIN="" to publish the public names
+#          only.
 HOST_MODE="${HOST_MODE:-mdns}"
+# The LAN-side domain kept alongside the public names in `proxy` mode. Served
+# over mDNS with certificates from a local CA generated here — the same
+# arrangement `mdns` mode has always had, which is why a customer that already
+# trusts that CA needs to do nothing at all.
+LOCAL_DOMAIN="${LOCAL_DOMAIN:-suite366.local}"
+LOCAL_APP_HOST="${LOCAL_APP_HOST:-}"
+LOCAL_OFFICE_HOST="${LOCAL_OFFICE_HOST:-}"
+LOCAL_LIVEKIT_HOST="${LOCAL_LIVEKIT_HOST:-}"
+LOCAL_TURN_HOST="${LOCAL_TURN_HOST:-}"
 # Set by suite366-fleet when HOST_MODE=proxy; the four names derive from them.
 REMOTE_NAME="${REMOTE_NAME:-}"
 REMOTE_DOMAIN="${REMOTE_DOMAIN:-box.diwy.ai}"
@@ -89,6 +107,14 @@ APP_TLS_SECRET="${APP_TLS_SECRET:-drive-tls}"
 OFFICE_TLS_SECRET="${OFFICE_TLS_SECRET:-drive-onlyoffice-tls}"
 LIVEKIT_TLS_SECRET="${LIVEKIT_TLS_SECRET:-drive-livekit-tls}"
 TURN_TLS_SECRET="${TURN_TLS_SECRET:-drive-turn-tls}"
+# The LAN counterparts, used only in `proxy` mode with LOCAL_DOMAIN set. They
+# are SEPARATE Secrets on purpose: the public ones are owned by remote.sh
+# (which overwrites them wholesale on every pull from the proxy), these ones by
+# cert-manager. One Secret with two owners is one working certificate away from
+# being silently replaced by the other owner's idea of it.
+LOCAL_APP_TLS_SECRET="${LOCAL_APP_TLS_SECRET:-drive-local-tls}"
+LOCAL_OFFICE_TLS_SECRET="${LOCAL_OFFICE_TLS_SECRET:-drive-onlyoffice-local-tls}"
+LOCAL_LIVEKIT_TLS_SECRET="${LOCAL_LIVEKIT_TLS_SECRET:-drive-livekit-local-tls}"
 # Filled by check_dns_records() (HOST_MODE=dns): names that do not resolve to
 # this host yet. Surfaced again by the final summary so it cannot be missed.
 DNS_TODO=()
@@ -96,8 +122,10 @@ DNS_TODO=()
 # Scriptor-Group org. Public, no login required. Override CHART_REF if you
 # mirror it.
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
-# 0.9.0 : support workbench (namespace/RBAC/quota + env des deux côtés)
-CHART_VERSION="${CHART_VERSION:-0.9.0}"
+# 0.10.0 : onlyoffice/livekit ingress `extraHosts` (un 2e nom + son propre
+#          Secret TLS sur le meme Ingress), requis par HOST_MODE=proxy qui
+#          garde les noms du LAN a cote des noms publics.
+CHART_VERSION="${CHART_VERSION:-0.10.0}"
 # Channel manifest polled daily by the update timer (see setup_update_timer).
 # Publishing a new chart_version/vllm_image here rolls the fleet forward;
 # appliances NOTIFY only (no auto-apply). Override to pin a box to a private

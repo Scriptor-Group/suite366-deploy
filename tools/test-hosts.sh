@@ -78,18 +78,26 @@ out="$(run_fn check_host_mode HOST_MODE=proxy $H4)"
 [[ $? -ne 0 ]] && grep -qi "resolves nowhere outside the LAN" <<<"$out" \
   && ok "proxy + .local is refused" || ko "proxy + .local is refused" "$out"
 
-# The split-horizon warning is the entire cost of proxy mode, so it has to be
-# impossible to miss — and it must name the internal resolver explicitly, or an
-# operator will create the records on the PUBLIC zone and point the world at a
-# private address.
+# In proxy mode the LAN keeps its own names, so the interesting assertion is
+# which of the two stories the operator is told — and that the fallback story
+# is still there for a deployment that deliberately turns the LAN names off.
+# shellcheck disable=SC2086
+out="$(run_fn check_proxy_addressing HOST_MODE=proxy HOST_IP=192.168.1.50 $P4 \
+        LOCAL_APP_HOST=drive.suite366.local)"
+grep -q "LAN keeps its own names" <<<"$out" && ok "with LAN names, it says nothing has to be configured" \
+  || ko "with LAN names, it says nothing has to be configured" "$out"
+grep -q "Sessions are per-name" <<<"$out" && ok "and warns that sessions do not cross" \
+  || ko "and warns that sessions do not cross" "$out"
+grep -q "INTERNAL resolver only" <<<"$out" && ko "it should NOT ask for DNS records" "$out" \
+  || ok "and asks for no DNS records at all"
+
 # shellcheck disable=SC2086
 out="$(run_fn check_proxy_addressing HOST_MODE=proxy HOST_IP=192.168.1.50 $P4)"
-grep -q "Split-horizon" <<<"$out" && ok "proxy mode warns about split-horizon" \
-  || ko "proxy mode warns about split-horizon" "$out"
-grep -q "WAN outage" <<<"$out" && ok "and says what skipping it costs" \
-  || ko "and says what skipping it costs" "$out"
-grep -q "INTERNAL resolver only" <<<"$out" && ok "and marks the records internal-only" \
-  || ko "and marks the records internal-only" "$out"
+grep -q "PUBLIC name only" <<<"$out" && ok "without LAN names, it says so" \
+  || ko "without LAN names, it says so" "$out"
+grep -q "WAN outage" <<<"$out" && ok "and what that costs" || ko "and what that costs" "$out"
+grep -q "INTERNAL resolver only" <<<"$out" && ok "and falls back to asking for split-horizon" \
+  || ko "and falls back to asking for split-horizon" "$out"
 grep -q "192.168.1.50" <<<"$out" && ok "with this host's LAN address" \
   || ko "with this host's LAN address" "$out"
 

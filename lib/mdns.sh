@@ -3,9 +3,14 @@
 # lib/mdns.sh — Avahi/mDNS publishing of the appliance hostnames so LAN clients
 # resolve them without any DNS configuration.
 #
-# Only ever used with HOST_MODE=mdns, which gather_hosts() ties to the `.local`
-# domain: nss-mdns routes only `.local` to mDNS, so publishing a routable name
-# here would advertise something no client ever asks us about.
+# Used with HOST_MODE=mdns, and with HOST_MODE=proxy whenever LOCAL_DOMAIN is
+# kept (the default) — a published box still answers on the LAN under its own
+# `.local` names, which is the whole point: nothing on the customer side has to
+# change, and the box keeps working with the WAN down.
+#
+# What is published is always the `.local` set and never the public one:
+# nss-mdns routes only `.local` to mDNS, so advertising a routable name here
+# would announce something no client ever asks us about.
 #
 # Design: a single self-contained WATCHER service. It polls the current LAN IP
 # every 5s and, only when it actually changes, (re)publishes the mDNS names and
@@ -20,13 +25,27 @@
 
 # --- 5. mDNS (Avahi) ---------------------------------------------------------
 setup_mdns() {
-  # HOST_MODE=dns: the customer's DNS is authoritative for these names, and a
-  # second answer published over multicast is a liability, not a fallback.
-  if [[ "$HOST_MODE" != "mdns" ]]; then
+  # Which names, if any, this box publishes over multicast:
+  #   mdns  : the four hostnames, which gather_hosts() has forced into `.local`.
+  #   proxy : the LAN set kept beside the public names (empty if LOCAL_DOMAIN="").
+  #   dns   : none — the customer's DNS is authoritative for these names, and a
+  #           second answer over multicast is a liability, not a fallback.
+  # `[[ test ]] && assignment` would be the obvious way to write the proxy arm
+  # and would kill the installer: the AND-list returns the failed test's status
+  # and `set -e` takes it. if/fi throughout.
+  local names="" shown=""
+  if [[ "$HOST_MODE" == "mdns" ]]; then
+    names="$DOMAIN $APP_HOST $OFFICE_HOST $LIVEKIT_HOST $TURN_HOST"
+    shown="$APP_HOST"
+  elif [[ "$HOST_MODE" == "proxy" && -n "${LOCAL_APP_HOST:-}" ]]; then
+    names="$LOCAL_DOMAIN $LOCAL_APP_HOST $LOCAL_OFFICE_HOST $LOCAL_LIVEKIT_HOST $LOCAL_TURN_HOST"
+    shown="$LOCAL_APP_HOST"
+  fi
+  if [[ -z "$names" ]]; then
     disable_mdns
     return 0
   fi
-  log "mDNS (Avahi) — $APP_HOST + 3 more"
+  log "mDNS (Avahi) — $shown + 3 more"
   if ! have avahi-daemon; then
     apt-get update -y || warn "apt-get update failed (stale cache?) — install may fail."
     apt-get install -y avahi-daemon avahi-utils \
@@ -40,7 +59,7 @@ setup_mdns() {
 # CURRENT LAN IP and refreshes them (plus livekit's advertised media IP)
 # whenever the IP changes. See lib/mdns.sh for the design rationale.
 set -u
-NAMES="$DOMAIN $APP_HOST $OFFICE_HOST $LIVEKIT_HOST $TURN_HOST"
+NAMES="$names"
 STATE=/run/suite366-mdns.ip   # survives service restarts, wiped at boot
 
 current_ip() { ip route get 1.1.1.1 2>/dev/null | awk '{print \$7; exit}'; }
@@ -101,7 +120,7 @@ EOF
 # names the appliance no longer serves.
 disable_mdns() {
   if [[ "$HOST_MODE" == "proxy" ]]; then
-    info "mDNS not used (HOST_MODE=proxy) — the names are public and resolved by ours."
+    info "mDNS not used (HOST_MODE=proxy, LOCAL_DOMAIN empty) — only the public names are served."
   else
     info "mDNS not used (HOST_MODE=$HOST_MODE) — the names are resolved by your DNS."
   fi

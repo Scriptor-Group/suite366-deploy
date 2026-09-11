@@ -15,6 +15,15 @@ install_cert_manager() {
     return 0
   fi
   log "cert-manager + local CA"
+  install_local_ca
+}
+
+
+# cert-manager + the self-signed CA ClusterIssuer + the exported CA cert.
+# Split out of install_cert_manager() because `pushed` mode needs exactly this
+# and nothing else from it: the LAN names are served with a local-CA
+# certificate there too, while the four public Secrets are left to remote.sh.
+install_local_ca() {
   if ! kc -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
     helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
     helm repo update >/dev/null
@@ -39,6 +48,59 @@ install_cert_manager() {
     chmod 0644 "$DATA_DIR/suite366-local-ca.crt"
     install -m 0644 "$DATA_DIR/suite366-local-ca.crt" /usr/local/share/suite366-local-ca.crt
   fi
+}
+
+
+# The LAN certificates in `proxy` mode.
+#
+# The Ingress annotation cannot do this job: it is per-Ingress, not per-host,
+# so cert-manager would try to cover the PUBLIC names with the local CA too and
+# write the result over the Secret remote.sh owns. Asking for the three
+# Certificates explicitly keeps each name with the issuer that should sign it.
+#
+# TURN is deliberately absent. LiveKit's TURN server reads ONE cert_file for
+# ONE domain (charts/drive livekit-configmap.yaml), so it cannot answer to two
+# names; the public one wins because it is the one a restrictive network needs
+# a relay for. LAN clients reach LiveKit media directly over UDP (hostNetwork),
+# which is exactly what TURN exists to avoid — so nothing is lost on the LAN.
+issue_local_certs() {
+  [[ -n "${LOCAL_APP_HOST:-}" ]] || return 0
+  log "TLS: local CA certificates for the LAN names"
+  install_local_ca
+
+  local svc host secret
+  for svc in app office livekit; do
+    case "$svc" in
+      app)     host="$LOCAL_APP_HOST";     secret="$LOCAL_APP_TLS_SECRET" ;;
+      office)  host="$LOCAL_OFFICE_HOST";  secret="$LOCAL_OFFICE_TLS_SECRET" ;;
+      livekit) host="$LOCAL_LIVEKIT_HOST"; secret="$LOCAL_LIVEKIT_TLS_SECRET" ;;
+    esac
+    kc apply -f - >/dev/null <<EOF || die "could not request the certificate for $host."
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${secret}
+  namespace: ${NAMESPACE}
+spec:
+  secretName: ${secret}
+  dnsNames:
+    - ${host}
+  issuerRef:
+    name: ${CLUSTER_ISSUER}
+    kind: ClusterIssuer
+EOF
+    info "  certificate/$secret <- $host"
+  done
+
+  # Non-fatal: issuance from a local CA takes seconds, but a box whose LAN
+  # certificate is one minute late is still a working box on the public name.
+  local secret_wait
+  for secret_wait in "$LOCAL_APP_TLS_SECRET" "$LOCAL_OFFICE_TLS_SECRET" "$LOCAL_LIVEKIT_TLS_SECRET"; do
+    kc -n "$NAMESPACE" wait --for=condition=Ready "certificate/$secret_wait" --timeout=120s >/dev/null 2>&1 \
+      || warn "certificate/$secret_wait not issued yet — the LAN name will show a TLS error until it is."
+  done
+  warn "LAN clients must trust the Suite 366 Local CA for $LOCAL_APP_HOST:"
+  warn "  /usr/local/share/suite366-local-ca.crt (the public names need nothing)."
 }
 
 
@@ -129,4 +191,8 @@ install_bootstrap_certs() {
   warn "These are SELF-SIGNED and every browser will refuse them."
   warn "  They exist only so the chart has something to reference. Publish the"
   warn "  box to replace them:  sudo $DATA_DIR/remote.sh enable"
+
+  # The LAN names are served from this box whether or not the proxy ever
+  # answers, so their certificates are issued here and now.
+  issue_local_certs
 }

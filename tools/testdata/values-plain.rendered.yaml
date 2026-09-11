@@ -3,14 +3,14 @@
 # Derived from charts/drive/values-client-autonome.yaml.
 #
 # DGX Spark specifics:
-#   • hostnames are NOT hardcoded: install.sh substitutes @APP_HOST@ /
-#     @OFFICE_HOST@ / @LIVEKIT_HOST@ / @TURN_HOST@ (defaults drive./office./
+#   • hostnames are NOT hardcoded: install.sh substitutes acme.box.diwy.ai /
+#     acme-office.box.diwy.ai / acme-livekit.box.diwy.ai / acme-turn.box.diwy.ai (defaults drive./office./
 #     livekit./turn. under *.suite366.local, resolved via mDNS/Avahi);
 #   • TLS from the self-signed local CA (ClusterIssuer "suite366-local-ca") or
 #     from customer-provided certificates — see TLS_MODE in lib/config.sh;
 #   • images pulled anonymously from ghcr.io/scriptor-group (chart defaults).
 #     The packages are public; no imagePullSecrets needed.
-#   • sandbox (code-exec) stack enabled — runs in the `@SANDBOX_NAMESPACE@`
+#   • sandbox (code-exec) stack enabled — runs in the `sandbox`
 #     namespace pre-created (with PSS labels) by install.sh so helm doesn't
 #     have to manage the Namespace itself.
 #   • generative + embeddings served by vLLM OUTSIDE the cluster (Docker
@@ -50,62 +50,52 @@ migrations:
 # persisted. We add VLLM_API_KEY (shared between vLLM and the app)
 # so chooseDefaultModel() can authenticate against the local nginx proxy.
 secrets:
-  VLLM_API_KEY: "@VLLM_API_KEY@"
+  VLLM_API_KEY: "sk-test"
 
 config:
   NODE_ENV: "production"
   PORT: "3000"
   HOSTNAME: "0.0.0.0"
   WS_PORT: "3001"
-  AUTH_URL: https://@APP_HOST@
-  APP_URL: https://@APP_HOST@
-  WS_URL: wss://@APP_HOST@
+  AUTH_URL: https://acme.box.diwy.ai
+  APP_URL: https://acme.box.diwy.ai
+  WS_URL: wss://acme.box.diwy.ai
   MINIO_BUCKET: suite-366
-  ONLYOFFICE_URL: https://@OFFICE_HOST@
-  LIVEKIT_PUBLIC_URL: wss://@LIVEKIT_HOST@
-  # The three URLs above are the CANONICAL origin: e-mail links, OAuth    #@local
-  # callbacks and the OnlyOffice callback all have to be one stable, externally    #@local
-  # resolvable name, and in proxy mode that is the public one.    #@local
-  #    #@local
-  # APPLIANCE_ORIGINS is the per-request override for what the BROWSER loads.    #@local
-  # A client arriving on the LAN name gets the LAN OnlyOffice and the LAN    #@local
-  # LiveKit socket, so the editor and the meeting come from the box beside it    #@local
-  # and keep working with the WAN down. Anything else keeps the canonical    #@local
-  # origin. Single-quoted so the JSON's own quotes need no escaping.    #@local
-  APPLIANCE_ORIGINS: '@APPLIANCE_ORIGINS@'    #@local
+  ONLYOFFICE_URL: https://acme-office.box.diwy.ai
+  LIVEKIT_PUBLIC_URL: wss://acme-livekit.box.diwy.ai
   # --- Local AI (vLLM host) — wired AUTOMATICALLY ---------------------------
   # Suite 366 PR #325 (chooseDefaultModel): when VLLM_BASE_URL is set, the
   # local vLLM is preferred over Anthropic/OpenAI for every role. The base
   # URL points to the nginx proxy on the host, which routes by URL path
   # (/v1/embeddings -> vllm-embed, everything else -> vllm-llm). We target
-  # @SUITE_IP@ (the stable internal IP on the dummy interface, reached via the
+  # 10.9.9.1 (the stable internal IP on the dummy interface, reached via the
   # node IP) instead of the LAN IP: pods keep reaching vLLM across DHCP/NIC
   # changes and offline. `.local` mDNS is not usable here — pods don't resolve
   # it (host-side resolution only).
-  VLLM_BASE_URL: "http://@SUITE_IP@:@PROXY_PORT@/v1"
-  VLLM_MODEL_HIGH: "@LLM_MODEL@"
-  VLLM_MODEL_LIGHT: "@LLM_MODEL@"
-  VLLM_MODEL_VISION: "@LLM_MODEL@"
-  VLLM_MODEL_EMBEDDING: "@EMBED_MODEL@"
-  VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
+  VLLM_BASE_URL: "http://10.9.9.1:8000/v1"
+  VLLM_MODEL_HIGH: "m"
+  VLLM_MODEL_LIGHT: "m"
+  VLLM_MODEL_VISION: "m"
+  VLLM_MODEL_EMBEDDING: "e"
+  VLLM_EMBEDDING_DIMENSIONS: "1024"
   # Max context window (tokens) the app advertises for the local model, so
   # prompt assembly / truncation sizes correctly. install.sh substitutes
-  # @VLLM_MAX_CONTEXT_WINDOW@ (default 200000, override via env var).
-  VLLM_MAX_CONTEXT_WINDOW: "@VLLM_MAX_CONTEXT_WINDOW@"
+  # 8192 (default 200000, override via env var).
+  VLLM_MAX_CONTEXT_WINDOW: "8192"
   # --- Licensing -----------------------------------------------------------
   # Ed25519 (EdDSA) PUBLIC key the app uses to VERIFY signed license tokens.
   # Verification-only: it cannot forge or sign licenses, so it is safe to ship
   # with every appliance. The matching PRIVATE key never leaves the issuer
   # (Devana) — see suite-366 serveur/LICENSE-GENERATION.md. install.sh
-  # substitutes @LICENSE_PUBLIC_KEY@ (default baked in, override via the
+  # substitutes PUBKEY (default baked in, override via the
   # LICENSE_PUBLIC_KEY env var). The \n escapes become real PEM newlines once
   # YAML parses this double-quoted scalar. To actually unlock multi-org /
   # paid limits, also set a signed LICENSE_KEY (issued against your org id).
-  LICENSE_PUBLIC_KEY: "@LICENSE_PUBLIC_KEY@"
+  LICENSE_PUBLIC_KEY: "PUBKEY"
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com
   # SMTP_PORT: "587"
-  # SMTP_FROM: "Suite 366 <noreply@@DOMAIN@>"
+  # SMTP_FROM: "Suite 366 <noreply@box.diwy.ai>"
 
 ingress:
   enabled: true
@@ -116,9 +106,9 @@ ingress:
     # where install.sh creates the TLS Secrets itself and cert-manager is not
     # deployed at all). Keeping it a single line keeps the YAML valid in both
     # modes without conditional rendering.
-    @INGRESS_CERT_ANNOTATION@
+    suite366.ai/tls-mode: "pushed"
   hosts:
-    - host: @APP_HOST@
+    - host: acme.box.diwy.ai
       paths:
         - path: /socket.io/
           pathType: Prefix
@@ -135,31 +125,9 @@ ingress:
         - path: /
           pathType: Prefix
           port: 80
-    # The LAN name, kept alongside the public one in HOST_MODE=proxy. Every    #@local
-    # line below is tagged `#@local` and is DELETED by lib/suite.sh in any    #@local
-    # other mode — the template stays valid YAML either way (the tag is a    #@local
-    # comment), which is why there is no second template to keep in sync.    #@local
-    - host: @LOCAL_APP_HOST@    #@local
-      paths:    #@local
-        - path: /socket.io/    #@local
-          pathType: Prefix    #@local
-          port: 3001    #@local
-        - path: /wb-desktop/    #@local
-          pathType: Prefix    #@local
-          port: 3001    #@local
-        - path: /dav/    #@local
-          pathType: Prefix    #@local
-          port: 3001    #@local
-        - path: /    #@local
-          pathType: Prefix    #@local
-          port: 80    #@local
   tls:
-    - secretName: @APP_TLS_SECRET@
-      hosts: [@APP_HOST@]
-    # Its own Secret, not a SAN added to the public certificate: the public one    #@local
-    # is overwritten wholesale by remote.sh on every pull from the proxy.    #@local
-    - secretName: @LOCAL_APP_TLS_SECRET@    #@local
-      hosts: [@LOCAL_APP_HOST@]    #@local
+    - secretName: drive-tls
+      hosts: [acme.box.diwy.ai]
 
 redis:
   enabled: true
@@ -195,14 +163,11 @@ onlyoffice:
   ingress:
     enabled: true
     className: traefik
-    host: @OFFICE_HOST@
+    host: acme-office.box.diwy.ai
     # Empty in TLS_MODE=provided: the chart drops the cert-manager annotation
     # but still renders the tls block, because tlsSecretName is set explicitly.
-    clusterIssuer: "@CLUSTER_ISSUER@"
-    tlsSecretName: @OFFICE_TLS_SECRET@
-    extraHosts:    #@local
-      - host: @LOCAL_OFFICE_HOST@    #@local
-        tlsSecretName: @LOCAL_OFFICE_TLS_SECRET@    #@local
+    clusterIssuer: "suite366-local-ca"
+    tlsSecretName: drive-onlyoffice-tls
 
 # livekit is the ONE workload that needs the CURRENT LAN IP (not the stable
 # internal IP): hostNetwork media must be reachable by LAN browsers. With
@@ -221,48 +186,45 @@ livekit:
   ingress:
     enabled: true
     className: traefik
-    host: @LIVEKIT_HOST@
-    clusterIssuer: "@CLUSTER_ISSUER@"
-    tlsSecretName: @LIVEKIT_TLS_SECRET@
-    extraHosts:    #@local
-      - host: @LOCAL_LIVEKIT_HOST@    #@local
-        tlsSecretName: @LOCAL_LIVEKIT_TLS_SECRET@    #@local
+    host: acme-livekit.box.diwy.ai
+    clusterIssuer: "suite366-local-ca"
+    tlsSecretName: drive-livekit-tls
   turn:
     enabled: true
-    domain: @TURN_HOST@
+    domain: acme-turn.box.diwy.ai
     tlsPort: 5349
-    tlsSecretName: @TURN_TLS_SECRET@
+    tlsSecretName: drive-turn-tls
     # TURN is not HTTP, so cert-manager cannot issue through an Ingress: the
     # chart asks for a Certificate explicitly. In TLS_MODE=provided that whole
     # object is disabled and install.sh writes the Secret instead.
     certManager:
-      enabled: @TURN_CERT_MANAGER@
-      issuerName: "@CLUSTER_ISSUER@"
+      enabled: false
+      issuerName: "suite366-local-ca"
       issuerKind: ClusterIssuer
 
 # --- Appliance host <-> app bridges ------------------------------------------
 # Two hostPath dirs are shared with the drive-app pod:
 #
-#  @DATA_DIR@/updates  -> /appliance-update  (APPLIANCE_UPDATE_DIR)
+#  /opt/suite366/updates  -> /appliance-update  (APPLIANCE_UPDATE_DIR)
 #    update.sh publishes state.json / apply.json there, and the app drops
 #    trigger files (check-requested / apply-requested) that systemd .path units
 #    pick up to run update.sh — this powers the "update available" banner + the
 #    update button in the admin UI.
 #
-#  @DATA_DIR@/backup   -> /appliance-backup  (APPLIANCE_BACKUP_DIR)
+#  /opt/suite366/backup   -> /appliance-backup  (APPLIANCE_BACKUP_DIR)
 #    backup.sh publishes state.json there (last run, snapshots, destination,
 #    key fingerprint) and the app drops run-/test-/configure-requested triggers.
 #    The credentials themselves live in backup.env inside that directory at
 #    0600, so the pod can ASK for a destination but can never read back the
 #    secret it set.
 #
-#  @DATA_DIR@/remote   -> /appliance-remote  (APPLIANCE_REMOTE_DIR)
+#  /opt/suite366/remote   -> /appliance-remote  (APPLIANCE_REMOTE_DIR)
 #    Remote publication toggle, RENTED fleet appliances only. remote.sh
 #    publishes state.json (the four public names, the certificate, whether the
 #    tunnel is up) and the app drops enable-/disable-requested. Empty on a
 #    customer-run appliance, so the feature is invisible there.
 #
-#  @DATA_DIR@/support  -> /support-access    (SUPPORT_ACCESS_DIR)
+#  /opt/suite366/support  -> /support-access    (SUPPORT_ACCESS_DIR)
 #    Remote-support access toggle, used on RENTED fleet appliances only. The
 #    host agent publishes state.json (grant + pre-arm state) and the app drops
 #    grant-requested / revoke-requested / prearm-requested. On a customer-run
@@ -293,19 +255,19 @@ extraVolumeMounts:
 extraVolumes:
   - name: appliance-update
     hostPath:
-      path: @DATA_DIR@/updates
+      path: /opt/suite366/updates
       type: DirectoryOrCreate
   - name: support-access
     hostPath:
-      path: @DATA_DIR@/support
+      path: /opt/suite366/support
       type: DirectoryOrCreate
   - name: appliance-backup
     hostPath:
-      path: @DATA_DIR@/backup
+      path: /opt/suite366/backup
       type: DirectoryOrCreate
   - name: appliance-remote
     hostPath:
-      path: @DATA_DIR@/remote
+      path: /opt/suite366/remote
       type: DirectoryOrCreate
 
 # Sandbox (code-exec) stack — runs in a dedicated PSS-restricted namespace,
@@ -315,7 +277,7 @@ extraVolumes:
 # secret-sandbox so the two sides match.
 sandbox:
   enabled: true
-  namespace: @SANDBOX_NAMESPACE@
+  namespace: sandbox
   # install.sh creates the namespace + applies PSS labels, so the chart skips
   # its own Namespace template (avoids ownership conflict with our pre-create).
   createNamespace: false

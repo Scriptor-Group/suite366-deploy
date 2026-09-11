@@ -35,6 +35,19 @@ deploy_suite() {
   # in `pushed` mode remote.sh replaces them with the real certificate. A
   # cert-manager annotation there would give the Secrets a second owner, and
   # the automated owner is the one that wins.
+  #
+  # The LAN names are the third: `proxy` mode keeps them alongside the public
+  # ones, every other mode has none. Rather than a second template, the LAN
+  # lines in values.yaml carry a `#@local` tag — stripped when they apply,
+  # deleted line by line when they do not. Both states are valid YAML, so the
+  # template can be read and diffed as the file that actually ships.
+  local local_lines origins=""
+  if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+    local_lines='s|[[:space:]]*#@local$||'
+    origins="$(appliance_origins_json)"
+  else
+    local_lines='/#@local$/d'
+  fi
   local cert_annotation turn_cert_manager
   if [[ "$TLS_MODE" == "provided" || "$TLS_MODE" == "pushed" ]]; then
     cert_annotation="suite366.ai/tls-mode: \"$TLS_MODE\""
@@ -49,7 +62,8 @@ deploy_suite() {
   # in case umask was inherited from elsewhere.
   ( umask 077
     fetch "values.yaml" \
-      | sed -e "s|@DOMAIN@|$DOMAIN|g" \
+      | sed -e "$local_lines" \
+            -e "s|@DOMAIN@|$DOMAIN|g" \
             -e "s|@APP_HOST@|$APP_HOST|g" \
             -e "s|@OFFICE_HOST@|$OFFICE_HOST|g" \
             -e "s|@LIVEKIT_HOST@|$LIVEKIT_HOST|g" \
@@ -58,6 +72,13 @@ deploy_suite() {
             -e "s|@OFFICE_TLS_SECRET@|$OFFICE_TLS_SECRET|g" \
             -e "s|@LIVEKIT_TLS_SECRET@|$LIVEKIT_TLS_SECRET|g" \
             -e "s|@TURN_TLS_SECRET@|$TURN_TLS_SECRET|g" \
+            -e "s|@LOCAL_APP_HOST@|$LOCAL_APP_HOST|g" \
+            -e "s|@LOCAL_OFFICE_HOST@|$LOCAL_OFFICE_HOST|g" \
+            -e "s|@LOCAL_LIVEKIT_HOST@|$LOCAL_LIVEKIT_HOST|g" \
+            -e "s|@LOCAL_APP_TLS_SECRET@|$LOCAL_APP_TLS_SECRET|g" \
+            -e "s|@LOCAL_OFFICE_TLS_SECRET@|$LOCAL_OFFICE_TLS_SECRET|g" \
+            -e "s|@LOCAL_LIVEKIT_TLS_SECRET@|$LOCAL_LIVEKIT_TLS_SECRET|g" \
+            -e "s|@APPLIANCE_ORIGINS@|$origins|g" \
             -e "s|@CLUSTER_ISSUER@|$CLUSTER_ISSUER|g" \
             -e "s|@INGRESS_CERT_ANNOTATION@|$cert_annotation|g" \
             -e "s|@TURN_CERT_MANAGER@|$turn_cert_manager|g" \
@@ -121,6 +142,27 @@ deploy_suite() {
       -f "$vals" --wait --timeout 15m
   prepull_images
 }
+
+# APPLIANCE_ORIGINS — the per-request browser-facing origins, as JSON.
+#
+# The app has ONE canonical origin (APP_URL/WS_URL/ONLYOFFICE_URL/
+# LIVEKIT_PUBLIC_URL) and that is correct for everything that must be stable
+# and externally resolvable: e-mail links, OAuth callbacks, the OnlyOffice
+# callback. It is wrong for the URLs a browser is told to load, because those
+# should come from the name the browser actually arrived on — otherwise a LAN
+# client is sent across the internet and back to reach a container in the same
+# room, and loses the editor and meetings entirely when the WAN is down.
+#
+# Both names are listed, not just the LAN one: an entry that merely restates
+# the canonical origin costs nothing and makes the mapping readable on the box
+# instead of implied by a fallback.
+appliance_origins_json() {
+  printf '[{"host":"%s","appUrl":"https://%s","wsUrl":"wss://%s","officeUrl":"https://%s","livekitUrl":"wss://%s"},' \
+    "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST"
+  printf '{"host":"%s","appUrl":"https://%s","wsUrl":"wss://%s","officeUrl":"https://%s","livekitUrl":"wss://%s"}]' \
+    "$APP_HOST" "$APP_HOST" "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST"
+}
+
 
 # Write the CA INTO the generated values.yaml, replacing the template's
 # `customCA: {enabled: false}` placeholder with `enabled: true` + the PEM.
@@ -227,6 +269,13 @@ patch_coredns_for_appliance_hosts() {
   # running beside it — for every server-side document callback.
   local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST")
   [[ "$HOST_MODE" == "mdns" ]] && names+=("$DOMAIN")
+  # And the LAN names, for the same reason: a pod resolving drive.suite366.local
+  # over the cluster DNS gets NXDOMAIN (mDNS is a HOST-side resolver, pods never
+  # see it), so any callback aimed at a LAN name would fail inside the cluster
+  # while working perfectly from a browser.
+  if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+    names+=("$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST" "$LOCAL_TURN_HOST")
+  fi
 
   local nh corefile
   nh="$(kc -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}')"
