@@ -3,7 +3,7 @@
   "chart_version": "0.8.0",
   "app_version": "1.8.22",
   "vllm_image": "vllm/vllm-openai:cu130-nightly",
-  "updater_sha256": "60a7f2db2b1d954b0b05241c3383d1e53255b5f392fad13324707d6dcf1048de",
+  "updater_sha256": "e369291748e57936670e5d4a19e62173002196c9180dfc2bb84d2f6e5e93c78c",
   "backup_sha256": "8d2885af44fe8667bb3fa7dd37544453c9c3fb459d08f637bca6435abc5e9f80",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
