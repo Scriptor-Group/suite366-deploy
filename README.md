@@ -198,11 +198,24 @@ the OnlyOffice callback — stays the public name, because it has to be stable
 and resolvable from outside. Someone signed in on the LAN name who follows an
 e-mailed link lands on the public one and signs in again.
 
-⚠️ **TURN stays on the public name only.** LiveKit reads one certificate for
-one TURN domain, so it cannot answer to two. LAN clients reach LiveKit media
-directly over UDP (`hostNetwork`), which is exactly what TURN exists to avoid,
-so nothing is lost on the LAN; a LAN client behind a restrictive firewall
-*and* cut off from the WAN would lose the relay.
+**LiveKit works on the LAN name.** Signalling has its own Ingress host and its
+own certificate (`wss://livekit.suite366.local`), and media goes straight to
+the box: LiveKit runs with `hostNetwork` and `rtc.dynamicNodeIp`, so it
+advertises the current LAN address as its ICE candidate and a LAN browser
+sends UDP directly to it. That is the normal path, and the one that survives a
+WAN outage.
+
+What is not duplicated is **TURN**, the relay used only when direct UDP is
+impossible. It stays on `<name>-turn.box.diwy.ai`, and deliberately so: a WAN
+client receives that same LAN address as a candidate, cannot reach it, and
+*must* fall back to the relay. TURN is the WAN's path; the LAN does not need
+it. (LiveKit reads one `cert_file` for one `domain`, so it could not answer to
+both names anyway.)
+
+A LAN client can still use TURN normally while the WAN is up — the public name
+resolves, goes out to the proxy and comes back through the tunnel. The single
+degraded case is a client **on the LAN, with UDP blocked on that LAN, while
+the WAN is down**.
 
 ### `TLS_MODE=local-ca` (default)
 

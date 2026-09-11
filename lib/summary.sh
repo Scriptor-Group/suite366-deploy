@@ -95,9 +95,10 @@ AI
  LiveKit     :   wss://$LOCAL_LIVEKIT_HOST
 
       A browser gets the editor and the meeting socket matching the name it
-      arrived on, so both keep working with the WAN down. TURN stays on
-      $TURN_HOST (LiveKit serves one TURN certificate); LAN media
-      goes direct over UDP and does not use it.
+      arrived on, so both keep working with the WAN down — LiveKit media goes
+      straight to this box over UDP. The TURN relay stays on $TURN_HOST
+      alone: a WAN client cannot reach the LAN address LiveKit advertises and
+      must relay, while a LAN client reaches it directly and does not.
       Sessions are per-name: signing in on one does not sign you in on the
       other, and e-mailed links always point at $APP_HOST."
   fi
