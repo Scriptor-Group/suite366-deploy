@@ -800,6 +800,11 @@ do_apply() {
     sed -i "s|^  tag: \".*\"|  tag: \"$want_app\"|" "$vals"
     sed -i "s|\(suite-366-sandbox-api:\)[^\"[:space:]]*|\1$want_app|" "$vals"
     sed -i "s|\(suite-366-sandbox-runner:\)[^\"[:space:]]*|\1$want_app|" "$vals"
+    # The workbench runner rides the same release train and was left out while
+    # it was pinned to `latest`, where nothing had to be rewritten. Pinning it
+    # without adding it here would have frozen it at the version of whatever
+    # release happened to pin it, silently, while the other three moved on.
+    sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$want_app|" "$vals"
   fi
 
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 ]]; then
