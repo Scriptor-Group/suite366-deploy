@@ -430,6 +430,7 @@ tools/test-backup.sh                  self-test: stubbed restic + cluster, plus 
 tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a lagging channel is reported, never offered
 tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 tools/test-local-certs.sh             self-test: the LAN certs name a real issuer, and a re-run never replaces a working certificate
+tools/test-e2e-origins.sh             ON A BOX: signs in, uploads a document, and checks what the running app hands a browser on each name
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
