@@ -11,15 +11,30 @@
 #     LiveKit/TURN) via the `drive` Helm chart;
 #   • nightly encrypted backups (restic) to an S3 destination;
 #   • local TLS (self-signed CA, or your own certificates) + mDNS on
-#     *.suite366.local (Avahi) — or your own DNS, see HOST_MODE below.
+#     *.suite366.local (Avahi) — or your own DNS, or a public name published
+#     through Scriptor's proxy alongside the LAN ones. See HOST_MODE below.
 #
 # Idempotent. Interactive prompts via /dev/tty (compatible with curl|bash), OR
 # via environment variables (non-interactive mode):
 #   HF_TOKEN                   HuggingFace token (optional, gated models)
-#   HOST_MODE                  mdns (default) | dns — how clients RESOLVE the
-#                              appliance. mdns is tied to `.local`; use dns for
-#                              a routable domain served by your own DNS.
+#   HOST_MODE                  mdns (default) | dns | proxy — how clients
+#                              RESOLVE the appliance. mdns is tied to `.local`;
+#                              dns serves a routable domain from your own DNS;
+#                              proxy publishes the box on the internet through
+#                              Scriptor's proxy (names allocated there, see
+#                              suite366-fleet) AND keeps the LAN names.
 #   DOMAIN                     default: suite366.local
+#   LOCAL_DOMAIN               HOST_MODE=proxy only, default suite366.local:
+#                              the `.local` names kept beside the public ones,
+#                              published over mDNS with a local-CA certificate
+#                              exactly as on an unpublished box — so a LAN
+#                              client needs no change and keeps working with
+#                              the WAN down. Set to "" to publish only the
+#                              public names.
+#   LOCAL_APP_HOST,            the LAN names. Default to drive./office./
+#   LOCAL_OFFICE_HOST,         livekit./turn.<LOCAL_DOMAIN>.
+#   LOCAL_LIVEKIT_HOST,
+#   LOCAL_TURN_HOST
 #   APP_HOST, OFFICE_HOST,     the four public names. Default to
 #   LIVEKIT_HOST, TURN_HOST    drive./office./livekit./turn.<DOMAIN>; override
 #                              individually for non-uniform naming.

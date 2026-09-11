@@ -79,6 +79,14 @@ APP_HOST="${APP_HOST:-drive.$DOMAIN}"
 OFFICE_HOST="${OFFICE_HOST:-office.$DOMAIN}"
 LIVEKIT_HOST="${LIVEKIT_HOST:-livekit.$DOMAIN}"
 TURN_HOST="${TURN_HOST:-turn.$DOMAIN}"
+# The LAN names a published box keeps alongside the public ones. Empty on every
+# other kind of box, and on one installed before they existed — which is why
+# the CoreDNS revert below skips empty entries instead of matching on $DOMAIN.
+LOCAL_APP_HOST="${LOCAL_APP_HOST:-}"
+LOCAL_OFFICE_HOST="${LOCAL_OFFICE_HOST:-}"
+LOCAL_LIVEKIT_HOST="${LOCAL_LIVEKIT_HOST:-}"
+LOCAL_TURN_HOST="${LOCAL_TURN_HOST:-}"
+LOCAL_DOMAIN="${LOCAL_DOMAIN:-}"
 MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
 SUITE_IFACE="${SUITE_IFACE:-suite0}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
@@ -246,9 +254,14 @@ revert_coredns() {
   local nh corefile new_nh n
   nh="$(k3s kubectl -n kube-system get cm coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null)" || return 0
   [[ -n "$nh" ]] || return 0
-  local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST" "$DOMAIN")
+  local names=("$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST" "$TURN_HOST" "$DOMAIN"
+               "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST"
+               "$LOCAL_TURN_HOST" "$LOCAL_DOMAIN")
   new_nh="$nh"
   for n in "${names[@]}"; do
+    # An empty name would match the awk field of every blank line and wipe the
+    # customer's own NodeHosts along with ours.
+    [[ -n "$n" ]] || continue
     new_nh="$(awk -v name="$n" '$2 != name' <<<"$new_nh")"
   done
   [[ "$new_nh" != "$nh" ]] || return 0

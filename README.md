@@ -51,7 +51,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 | **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
 | **TLS** | self-signed local CA (cert-manager) by default, or **your own certificates** (`TLS_MODE=provided`) |
 | **Backups** | nightly `restic` to an S3 destination, encrypted with a key held only on the box |
-| **DNS** | mDNS/Avahi by default (`*.suite366.local`, no client config), or **your own DNS** (`HOST_MODE=dns`) |
+| **DNS** | mDNS/Avahi by default (`*.suite366.local`, no client config), **your own DNS** (`HOST_MODE=dns`), or a public name through Scriptor's proxy *alongside* the LAN ones (`HOST_MODE=proxy`) |
 
 Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
 (weights for the two vLLM models are ~33 GiB combined).
@@ -89,7 +89,8 @@ The script is interactive (reads `/dev/tty`, so it works through
 | Variable | Default | Purpose |
 |---|---|---|
 | `HF_TOKEN` | empty | HuggingFace token (for *gated* models) |
-| `HOST_MODE` | `mdns` | `mdns` (names published on the LAN, `.local` only) or `dns` (your own DNS answers) — see below |
+| `HOST_MODE` | `mdns` | `mdns` (names published on the LAN, `.local` only), `dns` (your own DNS answers) or `proxy` (published by Scriptor, LAN names kept) — see below |
+| `LOCAL_DOMAIN` | `suite366.local` | `HOST_MODE=proxy` only: the LAN domain kept beside the public names. `""` to publish the public names only |
 | `DOMAIN` | `suite366.local` | base domain the four names derive from |
 | `APP_HOST` | `drive.<DOMAIN>` | application hostname |
 | `OFFICE_HOST` | `office.<DOMAIN>` | OnlyOffice hostname |
@@ -176,14 +177,45 @@ stream, so the certificate the browser validates is this appliance's own and
 Scriptor cannot read the traffic. That is checked, not asserted —
 `suite366-fleet/proxy/tests/test-passthrough.sh`.
 
-⚠️ **The cost, which you must decide about before choosing this mode.** The app
-has a single canonical origin (`AUTH_URL`/`APP_URL`), so the public name becomes
-the name for *everyone* — including users on the same LAN as the box. Without an
-internal DNS record answering that name with the LAN address, their traffic
-leaves the building and comes back through the proxy, and **a WAN outage makes
-the appliance unreachable from the room it is standing in**. The installer
-prints the four records to create on the customer's internal resolver; create
-them.
+**The LAN names are kept.** A published box answers to both sets at once: the
+public names above, and the usual `*.suite366.local` names published over mDNS
+with a local-CA certificate — the same arrangement an unpublished box has
+always had. Nothing on the customer side changes, and nobody has to configure
+split-horizon DNS: LAN traffic never leaves the building, and the box stays
+reachable from the room it is standing in when the WAN is down.
+
+Browser-facing URLs follow the name the request arrived on. The app is handed
+`APPLIANCE_ORIGINS` (a JSON map, `serveur/src/lib/appliance-origins.ts`) and a
+client on `drive.suite366.local` is told to load OnlyOffice and the LiveKit
+socket from the LAN names, so the document editor and meetings keep working
+offline too.
+
+Set `LOCAL_DOMAIN=""` to publish only the public names.
+
+⚠️ **What the two names do not share is a session.** Cookies are host-only, and
+the *canonical* origin — `AUTH_URL`/`APP_URL`, e-mail links, OAuth callbacks,
+the OnlyOffice callback — stays the public name, because it has to be stable
+and resolvable from outside. Someone signed in on the LAN name who follows an
+e-mailed link lands on the public one and signs in again.
+
+**LiveKit works on the LAN name.** Signalling has its own Ingress host and its
+own certificate (`wss://livekit.suite366.local`), and media goes straight to
+the box: LiveKit runs with `hostNetwork` and `rtc.dynamicNodeIp`, so it
+advertises the current LAN address as its ICE candidate and a LAN browser
+sends UDP directly to it. That is the normal path, and the one that survives a
+WAN outage.
+
+What is not duplicated is **TURN**, the relay used only when direct UDP is
+impossible. It stays on `<name>-turn.box.diwy.ai`, and deliberately so: a WAN
+client receives that same LAN address as a candidate, cannot reach it, and
+*must* fall back to the relay. TURN is the WAN's path; the LAN does not need
+it. (LiveKit reads one `cert_file` for one `domain`, so it could not answer to
+both names anyway.)
+
+A LAN client can still use TURN normally while the WAN is up — the public name
+resolves, goes out to the proxy and comes back through the tunnel. The single
+degraded case is a client **on the LAN, with UDP blocked on that LAN, while
+the WAN is down**.
 
 ### `TLS_MODE=local-ca` (default)
 
@@ -389,13 +421,14 @@ lib/k3s.sh                            single-node k3s + Helm
 lib/vllm.sh                           vLLM ×2 + nginx proxy (host Docker, systemd unit)
 lib/cert-manager.sh                   cert-manager + local self-signed CA
 lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
-lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN
+lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN (or *.LOCAL_DOMAIN in proxy mode)
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
 backup.sh                             backup agent (run | test | status | snapshots | prune | restore | install-units); run by suite366-backup.timer
 lib/backup.sh                         installs the pinned restic, the repository key, backup.sh and its timer
 tools/test-backup.sh                  self-test: stubbed restic + cluster, plus a real restic round trip when one is on PATH
 tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a lagging channel is reported, never offered
+tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)

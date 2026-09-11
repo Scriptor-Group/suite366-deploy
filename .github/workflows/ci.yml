@@ -46,6 +46,11 @@ jobs:
       # update: the admin UI button would silently roll the box backwards.
       - name: Update decision self-test
         run: ./tools/test-update-diffs.sh
+      # Renders values.yaml both ways and diffs the no-LAN-names render against
+      # the previous template: a box that is not published must get byte-for-byte
+      # what it got before.
+      - name: values.yaml dual-name rendering self-test
+        run: ./tools/test-dual-names.sh
 
   backup-verify:
     runs-on: ubuntu-latest

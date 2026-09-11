@@ -146,6 +146,30 @@ gather_hosts() {
     OFFICE_HOST="${OFFICE_HOST:-$REMOTE_NAME-office.$DOMAIN}"
     LIVEKIT_HOST="${LIVEKIT_HOST:-$REMOTE_NAME-livekit.$DOMAIN}"
     TURN_HOST="${TURN_HOST:-$REMOTE_NAME-turn.$DOMAIN}"
+    # The LAN names are kept as well, so nothing on the customer side has to
+    # change for local access to stay local.
+    if [[ -n "$LOCAL_DOMAIN" ]]; then
+      LOCAL_DOMAIN="${LOCAL_DOMAIN,,}"
+      LOCAL_APP_HOST="${LOCAL_APP_HOST:-drive.$LOCAL_DOMAIN}"
+      LOCAL_OFFICE_HOST="${LOCAL_OFFICE_HOST:-office.$LOCAL_DOMAIN}"
+      LOCAL_LIVEKIT_HOST="${LOCAL_LIVEKIT_HOST:-livekit.$LOCAL_DOMAIN}"
+      LOCAL_TURN_HOST="${LOCAL_TURN_HOST:-turn.$LOCAL_DOMAIN}"
+      local l
+      for l in "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST" "$LOCAL_TURN_HOST"; do
+        [[ "$l" == *.local ]] || die "LOCAL_DOMAIN must end in .local — '$l' would be published
+      over mDNS and resolved by no client at all (nss-mdns routes only .local)."
+        [[ "$l" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+          || die "'$l' is not a valid FQDN (letters, digits, '-', at least one dot)."
+      done
+      # Eight names, eight distinct values. A duplicate would put two hosts on
+      # one Ingress rule (Traefik keeps one) or two Certificates on one Secret
+      # (cert-manager keeps re-issuing), both of which fail quietly.
+      local luniq
+      luniq="$(printf '%s\n' "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST" \
+                              "$LOCAL_TURN_HOST" "$APP_HOST" "$OFFICE_HOST" \
+                              "$LIVEKIT_HOST" "$TURN_HOST" | sort -u | wc -l)"
+      [[ "$luniq" == "8" ]] || die "The LAN names must differ from the public ones (8 distinct names)."
+    fi
   fi
 
   ask DOMAIN "Base domain" "$DOMAIN"
@@ -290,12 +314,21 @@ check_proxy_addressing() {
     DNS_TODO+=("$(printf '%-*s' "$w" "$h")  A  $HOST_IP   (INTERNAL resolver only)")
   done
 
-  warn "Split-horizon DNS is strongly recommended, and here is what it costs to skip:"
-  warn "  the app has a single canonical origin, so this appliance now answers to"
-  warn "  its PUBLIC name for everyone — including users on the same LAN. Without"
-  warn "  an internal record, their traffic leaves the building and comes back,"
-  warn "  and a WAN outage makes the box unreachable from the room it sits in."
-  warn "  Create these on the CUSTOMER'S INTERNAL resolver only:"
+  if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+    info "The LAN keeps its own names, published over mDNS — nothing to configure:"
+    info "  https://$LOCAL_APP_HOST  (+ office / livekit / turn)"
+    info "A browser is handed the URLs matching the name it arrived on, so a"
+    info "client on the LAN reaches the editor and the meeting socket directly."
+    info "Sessions are per-name: someone on the LAN who follows an e-mailed link"
+    info "lands on the public name and signs in there."
+    return 0
+  fi
+
+  warn "LOCAL_DOMAIN is empty, so this appliance answers to its PUBLIC name only."
+  warn "  The app has a single canonical origin, so LAN users reach it through the"
+  warn "  proxy: their traffic leaves the building and comes back, and a WAN outage"
+  warn "  takes the box down for people standing next to it. Either set"
+  warn "  LOCAL_DOMAIN, or create these on the CUSTOMER'S INTERNAL resolver only:"
   local r
   for r in "${DNS_TODO[@]}"; do warn "    $r"; done
 }
