@@ -29,11 +29,14 @@ appName: drive-app
 global:
   imagePullPolicy: IfNotPresent
 
-# App + sandbox share the release train; 1.8.22 is the current published version.
+# App + sandbox share the release train; 1.11.3 is the current published version.
+# All four images (app, sandbox-api, sandbox-runner, workbench-runner) are built
+# under one version by suite-366's Publish Public Image workflow, which is why
+# update.sh can rewrite all three pins below from a single app_version.
 # image.repository stays at the chart default (ghcr.io/scriptor-group/suite-366);
 # the GHCR packages are public so no imagePullSecrets are needed.
 image:
-  tag: "1.8.22"
+  tag: "1.11.3"
 
 replicas: 1
 podAntiAffinity:
@@ -284,9 +287,9 @@ sandbox:
   # Pinned to the current release (chart defaults are :latest). pullPolicy
   # IfNotPresent overrides the chart's Always so runner/api restart offline.
   api:
-    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.8.22
+    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.11.3
     pullPolicy: IfNotPresent
-  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.3
   # Tune sessions/limits if the GB10 unified memory budget is tight — defaults
   # aim at 20 pods × 512 MB.
 
