@@ -242,9 +242,12 @@ prepull_images() {
   # pre-pull the wrong one the day the two blocks are reordered.
   runner="$(sed -n 's|^[[:space:]]*runnerImage:[[:space:]]*\(.*suite-366-sandbox-runner:.*\)$|\1|p' \
               "$DATA_DIR/values.yaml" 2>/dev/null | head -1)"
+  local wbrunner
+  wbrunner="$(sed -n 's|^[[:space:]]*runnerImage:[[:space:]]*\(.*suite-366-workbench-runner:.*\)$|\1|p' \
+                "$DATA_DIR/values.yaml" 2>/dev/null | head -1)"
   extra="busybox:1.37
 ${runner:-ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.3}
-ghcr.io/scriptor-group/suite-366-workbench-runner:latest"
+${wbrunner:-ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.3}"
   for i in $imgs $extra; do
     [[ -z "$i" ]] && continue
     if k3s crictl pull "$i" >/dev/null 2>&1; then info "  ✓ $i"; else warn "  ✗ $i (pull failed — offline restart may miss it)"; fi

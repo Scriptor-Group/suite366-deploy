@@ -302,9 +302,11 @@ sandbox:
   # NOTE budget GB10 : chaque workbench actif = jusqu'à 4 Gi / 2 cpu.
   workbench:
     enabled: true
-    # latest jusqu'au premier release train qui publie l'image ; épingler
-    # ensuite comme les images sandbox ci-dessus.
-    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:latest
+    # Épinglée comme les images sandbox ci-dessus : le release train publie
+    # bien cette image (matrice `Build sandbox` du workflow Publish Public
+    # Image), donc `latest` n'a plus de raison d'être — et sur une appliance
+    # censée redémarrer hors-ligne, c'est le seul tag qui ne garantit rien.
+    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.3
     # IfNotPresent : redémarrage offline (l'image est pré-pullée par install.sh)
     pullPolicy: IfNotPresent
     storageClass: local-path

@@ -76,6 +76,37 @@ out="$(diffs 0.9.0 "" 1.8.22 "" img "")"
 [[ "${out%% *}" == "000" ]] && ok "a manifest with no target proposes nothing" \
   || ko "a manifest with no target proposes nothing" "$out"
 
+echo "== an app release moves EVERY image pin, or none of them =="
+# The four images ride one release train (suite-366's Publish Public Image
+# builds them under a single version), so values.yaml must never end up with
+# one of them left behind: the workbench runner was, for as long as it was
+# pinned to `latest` and therefore had nothing to rewrite. A box that
+# pre-pulls one version and runs another only finds out offline.
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+cat > "$WORK/values.yaml" <<'YAML'
+image:
+  tag: "1.0.0"
+sandbox:
+  api:
+    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.0.0
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.0.0
+  workbench:
+    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:1.0.0
+YAML
+# The rewrite is EXTRACTED from update.sh, not retyped: a fifth pin added there
+# and forgotten here would otherwise pass.
+rew="$(grep -n 'sed -i "s|' "$REPO/update.sh" | grep -E 'tag: |sandbox-api|sandbox-runner|workbench-runner' | cut -d: -f2- )"
+[[ -n "$rew" ]] && ok "the pin rewrite is found in update.sh" || ko "the pin rewrite is found in update.sh"
+( want_app=2.0.0 vals="$WORK/values.yaml"; eval "$rew" )
+left="$(grep -c '1\.0\.0' "$WORK/values.yaml")"
+[[ "$left" == "0" ]] && ok "no pin is left on the old version" \
+  || ko "no pin is left on the old version" "$(grep -n '1\.0\.0' "$WORK/values.yaml" | tr '\n' ' ')"
+moved="$(grep -c '2\.0\.0' "$WORK/values.yaml")"
+[[ "$moved" == "4" ]] && ok "all four pins moved (app + 3 runners)" \
+  || ko "all four pins moved (app + 3 runners)" "$moved moved"
+grep -q 'workbench-runner:2.0.0' "$WORK/values.yaml" \
+  && ok "  the workbench runner included" || ko "  the workbench runner included"
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" == 0 ]]
