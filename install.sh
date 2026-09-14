@@ -68,6 +68,9 @@
 #   LICENSE_PUBLIC_KEY         Ed25519 SPKI PEM the app uses to VERIFY signed
 #                              license tokens (default: shipped public key).
 #                              Verification-only — cannot sign/forge licenses.
+#   LICENSE_KEY                signed license for the whole box (issued with
+#                              scope "instance"): lifts the quotas of every
+#                              organization on it. Persisted across re-runs.
 #   SUITE_IP                   stable internal IP the cluster is pinned to,
 #                              carried by an always-up dummy interface so k3s +
 #                              vLLM + the app survive LAN changes/offline

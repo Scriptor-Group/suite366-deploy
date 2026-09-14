@@ -175,6 +175,10 @@ VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-200000}"
 # the chart renders the value. Override per-deployment via the env var.
 _DEFAULT_LICENSE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk84/ONPJm9WFpnlQAf7IpRTfdcwwH4Ua3f7NAZtf6/4=\n-----END PUBLIC KEY-----\n'
 LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
+# Optional signed license for the whole box (issued by Scriptor with scope
+# "instance"). Empty = unlicensed; read back from values.yaml on re-runs so a
+# key set once survives every later install/update (see lib/preflight.sh).
+LICENSE_KEY="${LICENSE_KEY:-}"
 
 # --- vLLM tuning for the GB10 UNIFIED memory (one shared pool ~121 GiB) -------
 # Both vLLM instances share this pool (along with the OS, runtime, and KV

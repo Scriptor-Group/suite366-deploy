@@ -54,6 +54,9 @@ migrations:
 # so chooseDefaultModel() can authenticate against the local nginx proxy.
 secrets:
   VLLM_API_KEY: "@VLLM_API_KEY@"
+  # Optional signed license for the whole box (scope "instance"), see the
+  # LICENSE_PUBLIC_KEY note under config. Empty = unlicensed.
+  LICENSE_KEY: "@LICENSE_KEY@"
 
 config:
   NODE_ENV: "production"
@@ -102,8 +105,10 @@ config:
   # (Devana) — see suite-366 serveur/LICENSE-GENERATION.md. install.sh
   # substitutes @LICENSE_PUBLIC_KEY@ (default baked in, override via the
   # LICENSE_PUBLIC_KEY env var). The \n escapes become real PEM newlines once
-  # YAML parses this double-quoted scalar. To actually unlock multi-org /
-  # paid limits, also set a signed LICENSE_KEY (issued against your org id).
+  # YAML parses this double-quoted scalar. To unlock multi-org and the paid
+  # limits on the whole box, set LICENSE_KEY (under secrets above) to a
+  # license issued with scope "instance" — the installer takes it from the
+  # LICENSE_KEY env var and persists it across re-runs.
   LICENSE_PUBLIC_KEY: "@LICENSE_PUBLIC_KEY@"
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com

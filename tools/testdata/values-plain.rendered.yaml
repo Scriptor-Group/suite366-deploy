@@ -54,6 +54,9 @@ migrations:
 # so chooseDefaultModel() can authenticate against the local nginx proxy.
 secrets:
   VLLM_API_KEY: "sk-test"
+  # Optional signed license for the whole box (scope "instance"), see the
+  # LICENSE_PUBLIC_KEY note under config. Empty = unlicensed.
+  LICENSE_KEY: ""
 
 config:
   NODE_ENV: "production"

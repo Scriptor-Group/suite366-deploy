@@ -467,6 +467,12 @@ gather_inputs() {
     VLLM_API_KEY="$(sed -n 's/.*VLLM_API_KEY: *"\(sk-[^"]*\)".*/\1/p' "$DATA_DIR/values.yaml" | head -1)"
   fi
   VLLM_API_KEY="${VLLM_API_KEY:-sk-$(head -c24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c32)}"
+  # Same for the box license: a key set on one run must not vanish on the next
+  # (an appliance re-runs the installer for every update). Env wins, then the
+  # value already rendered. A JWT is [A-Za-z0-9_.-] so the sed needs no escaping.
+  if [[ -z "${LICENSE_KEY:-}" && -f "$DATA_DIR/values.yaml" ]]; then
+    LICENSE_KEY="$(sed -n 's/^  LICENSE_KEY: *"\([A-Za-z0-9_.-]*\)".*/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  fi
   # Bash `set -e` + `[[ test ]] && cmd` as the last statement of a function
   # propagates the exit code of `[[ test ]]`: if false, the function returns 1
   # and the script dies silently. We use `if/fi` (plus a final `:`).

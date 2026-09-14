@@ -91,6 +91,7 @@ deploy_suite() {
             -e "s|@VLLM_EMBEDDING_DIMENSIONS@|$VLLM_EMBEDDING_DIMENSIONS|g" \
             -e "s|@VLLM_MAX_CONTEXT_WINDOW@|$VLLM_MAX_CONTEXT_WINDOW|g" \
             -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
+            -e "s|@LICENSE_KEY@|$LICENSE_KEY|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
             -e "s|@DATA_DIR@|$DATA_DIR|g" \
         > "$vals" )
