@@ -102,8 +102,9 @@ config:
   # (Devana) — see suite-366 serveur/LICENSE-GENERATION.md. install.sh
   # substitutes @LICENSE_PUBLIC_KEY@ (default baked in, override via the
   # LICENSE_PUBLIC_KEY env var). The \n escapes become real PEM newlines once
-  # YAML parses this double-quoted scalar. To actually unlock multi-org /
-  # paid limits, also set a signed LICENSE_KEY (issued against your org id).
+  # YAML parses this double-quoted scalar. Limits and multi-org are already
+  # unlocked on the box by APPLIANCE_UNLIMITED (extraEnv below); a signed
+  # LICENSE_KEY is only needed on deployments that do not set it.
   LICENSE_PUBLIC_KEY: "@LICENSE_PUBLIC_KEY@"
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com
@@ -286,6 +287,11 @@ extraEnv:
     value: /appliance-backup
   - name: APPLIANCE_REMOTE_DIR
     value: /appliance-remote
+  # The box is one unlimited enterprise license: no agent / seat / storage /
+  # token / IDP caps and no single-organization limit, without a LICENSE_KEY
+  # per organization (suite-366 serveur/src/lib/appliance-license.ts).
+  - name: APPLIANCE_UNLIMITED
+    value: "1"
 extraVolumeMounts:
   - name: appliance-update
     mountPath: /appliance-update
