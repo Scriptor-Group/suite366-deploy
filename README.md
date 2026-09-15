@@ -410,6 +410,38 @@ to register a per-organization provider in the admin UI:
 | Embeddings (direct) | `http://<HOST_IP>:8002/v1` | `Qwen/Qwen3-VL-Embedding-8B` | vLLM key shown |
 | Unified (nginx)      | `http://<HOST_IP>:8000/v1` | either of the above | vLLM key shown |
 
+### The five copies of `VLLM_API_KEY`
+
+The key exists five times on an appliance, and only the last one decides whether
+an LLM call works:
+
+| # | Copy | Written by | Read by |
+|---|---|---|---|
+| 1 | `/opt/suite366/llm/.env` | `deploy_vllm` | the vLLM containers, **at start only** |
+| 2 | the containers' environment | docker compose | vLLM — this is the copy that **validates** a request |
+| 3 | `/opt/suite366/values.yaml` | `deploy_suite` | helm |
+| 4 | the chart's Secret -> the app's env | the chart | the app, **at seed time only** |
+| 5 | Postgres `"AIProvider".config->>'apiKey'` | the app, at the first organization creation | **every LLM call** |
+
+The app seeds (5) out of (4) once, when the first organization is created, and
+never re-reads its environment; its resolver then prefers that row over the
+environment fallback. So a key that changes anywhere in 1-4 leaves (5) stale and
+**every LLM call returns 401 while `docker ps` says `Up (healthy)`, every pod is
+`Running`, and the app's own provider health check says HEALTHY** — it writes
+that verdict without making a request. That state ran for four days on a real
+box before anyone could name it.
+
+`lib/vllm-db.sh` closes it: it realigns (5) and then proves the result by asking
+vLLM **with the key read back out of Postgres**, on install, on `update.sh apply`,
+on the daily `update.sh check`, and after `backup.sh restore --in-place` (whose
+dump carries the key that was current when it was taken). The install fails when
+that key is rejected; it only warns when there is no row yet, or when vLLM has
+not answered yet — a model that is still loading is not a bad key.
+
+Rows an admin aimed at *another* vLLM are neither realigned nor blamed: the scope
+is the app's own seed (`name = 'vLLM Local'`), a seed with no base URL, or a row
+already pointing at this box.
+
 ## Repository layout
 
 ```
@@ -421,6 +453,7 @@ lib/k3s.sh                            single-node k3s + Helm
 lib/vllm.sh                           vLLM ×2 + nginx proxy (host Docker, systemd unit)
 lib/cert-manager.sh                   cert-manager + local self-signed CA
 lib/suite.sh                          Suite 366 drive Helm chart + CoreDNS patch
+lib/vllm-db.sh                        realigns + verifies "AIProvider".config->>'apiKey' in Postgres — the fifth, and only authoritative, copy of VLLM_API_KEY
 lib/mdns.sh                           Avahi/mDNS publishing of *.DOMAIN (or *.LOCAL_DOMAIN in proxy mode)
 lib/updater.sh                        install update.sh + daily notify-only timer
 lib/summary.sh                        final post-install summary
@@ -430,10 +463,12 @@ tools/test-backup.sh                  self-test: stubbed restic + cluster, plus 
 tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a lagging channel is reported, never offered
 tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 tools/test-local-certs.sh             self-test: the LAN certs name a real issuer, and a re-run never replaces a working certificate
+tools/test-vllm-db.sh                 self-test: a key change reaches the database row, a stale row fails the install, a loading model does not
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
 tools/gen-package-key.sh              generate the Ed25519 keypair that signs packages AND channels
+tools/sync-vllm-db-block.sh           copy the shared vllm-db block from lib/ into update.sh and backup.sh (they cannot source lib/)
 tools/test-package-verify.sh          self-test: real signatures, real tampering, no hardware
 uninstall.sh                          clean uninstaller — reverses install.sh (systemd units, vLLM stack, k3s, DATA_DIR, …)
 channel.json                          fleet release manifest (chart_version / app_version / vllm_image / updater_sha256) polled by update.sh
@@ -572,9 +607,13 @@ nothing on the appliance. The in-place sequence is manual and order-dependent
 stopped) and is deliberately not automated yet: it has to be exercised on a real
 box before a recovery is allowed to become a second outage.
 
-Verify a restore **positively** — open a document *and* make one LLM call using
-a provider key stored in the database. A box that merely boots proves nothing
-about the step above.
+Verify a restore **positively** — open a document (the objects and the database
+agree), make one LLM call (the stored provider key is realigned automatically in
+step 6/8, so a 401 there means something else), *and* exercise one `enc:`-prefixed
+secret: an SSO sign-in, a bot integration or an agent connector. That last one is
+what proves `AUTH_SECRET` came over — `"AIProvider".config` is stored in clear,
+so an LLM call never proved anything about it. A box that merely boots proves
+nothing about the step above.
 
 ### Updates
 

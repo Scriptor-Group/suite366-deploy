@@ -5,7 +5,18 @@
 
 # --- 6. Summary --------------------------------------------------------------
 summary() {
-  local ai
+  local ai db_line
+  # The verdict of the only check that exercises the key the app really uses —
+  # the one stored in Postgres (lib/vllm-db.sh). `unknown` is not a failure:
+  # vLLM may simply not have answered yet.
+  case "${VLLM_DB_VERIFIED:-unknown}" in
+    ok)      db_line="verified — vLLM accepted it on /v1/models, chat and embeddings" ;;
+    stale)   db_line="!! STALE — every LLM call in the app will return 401 (see the error below)" ;;
+    norow)   db_line="not created yet (no organization) — nothing to verify" ;;
+    notable) db_line="no AIProvider table yet (the app's migrations have not run)" ;;
+    skipped) db_line="not verified (SKIP_VLLM)" ;;
+    *)       db_line="NOT verified — vLLM did not answer; the models may still be loading" ;;
+  esac
   if [[ "$SKIP_VLLM" == "1" ]]; then
     ai=" Local AI (vLLM): NOT deployed (test mode)."
   else
@@ -18,7 +29,12 @@ summary() {
    • Direct vLLM endpoints (debug, from the box):
        - Generative : http://$SUITE_IP:$LLM_PORT/v1   (model: $LLM_MODEL)
        - Embeddings : http://$SUITE_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)
-   • API key (shared by vLLM + Suite 366): $VLLM_API_KEY
+   • API key (shared by vLLM + Suite 366): fingerprint $(printf '%s' "$VLLM_API_KEY" | sha256sum | cut -c1-12)
+       In clear in $DATA_DIR/llm/.env (root-only) — not reprinted here, for the
+       reason given for the backup key below.
+   • Key stored in Postgres      : $db_line
+       That row is what an LLM call actually reads; the four other copies of the
+       key are only what fed it. See lib/vllm-db.sh.
    -> The chart receives VLLM_BASE_URL + VLLM_MODEL_* + VLLM_API_KEY via
       values.yaml; chooseDefaultModel() picks vLLM by default.
    -> Org admins can still register additional "CUSTOM" providers for

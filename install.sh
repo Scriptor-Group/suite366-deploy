@@ -151,7 +151,7 @@ load_module() { # load_module NAME  (=> sources lib/NAME.sh)
 
 # Load order matters: config (defaults) and common (helpers) first, then each
 # deploy step in the order main() calls it.
-MODULES=(config common preflight network k3s vllm cert-manager suite mdns updater backup summary)
+MODULES=(config common preflight network k3s vllm cert-manager suite vllm-db mdns updater backup summary)
 for _m in "${MODULES[@]}"; do load_module "$_m"; done
 
 main() {
@@ -162,9 +162,16 @@ main() {
   if [[ "$SKIP_VLLM" == "1" ]]; then warn "vLLM stack not deployed (SKIP_VLLM)."; else deploy_vllm; fi
   install_cert_manager
   deploy_suite
+  # The chart has just re-pushed the key into the app's Secret; realign the copy
+  # in Postgres, which is the only one an LLM call reads (see lib/vllm-db.sh).
+  reconcile_vllm_provider_row
   setup_mdns
   setup_update_timer
   setup_backup
+  verify_vllm_provider_row
   summary
+  # Fails the install AFTER the summary is printed, so a broken key does not
+  # cost the operator the URLs and the backup-key fingerprint.
+  vllm_db_gate
 }
 main "$@"
