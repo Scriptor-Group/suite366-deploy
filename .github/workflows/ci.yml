@@ -56,6 +56,12 @@ jobs:
       # certificates replaced by a self-signed placeholder.
       - name: LAN certificates + bootstrap self-test
         run: ./tools/test-local-certs.sh
+      # Four days in production: 100% of LLM calls returning 401 while
+      # `docker ps` said Up (healthy) and every pod was Running, because the
+      # key the app actually uses lives in a jsonb column written once, at
+      # organization creation, and never re-read.
+      - name: vLLM provider key reconcile + verify self-test
+        run: ./tools/test-vllm-db.sh
 
   backup-verify:
     runs-on: ubuntu-latest

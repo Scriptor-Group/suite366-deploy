@@ -436,7 +436,13 @@ fi
 check "the live .minio.sys is untouched" "$(cat "$MINIO_DATA/.minio.sys/iam.json")" "iam"
 [[ -f "$MINIO_DATA/suite-366/doc/part.1" ]] \
   && ok "objects from the snapshot are restored" || ko "objects from the snapshot are restored"
-contains "it demands a positive verification" "LLM call using a STORED provider key" "$(out)"
+# The wording it used to assert ("the only check that proves AUTH_SECRET") was
+# factually wrong: "AIProvider".config is plain jsonb, so an LLM call proves
+# nothing about AUTH_SECRET. What it must demand now is the secret class that
+# IS encrypted with it — and, separately, that the stored provider key was
+# realigned rather than left carrying whatever the dump held.
+contains "it demands a positive verification" "enc:" "$(out)"
+contains "it realigns the stored vLLM key" "Realigning the stored vLLM provider key" "$(out)"
 contains "it points at the way back" "pre-restore" "$(out)"
 unset MINIO_PVC
 

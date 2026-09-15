@@ -167,6 +167,14 @@ VLLM_EMBEDDING_DIMENSIONS="${VLLM_EMBEDDING_DIMENSIONS:-4096}"
 # via VLLM_MAX_CONTEXT_WINDOW so prompt assembly / truncation sizes correctly.
 VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-200000}"
 
+# Verdict of the post-install check on the vLLM key stored in Postgres — the
+# fifth and only authoritative copy of it (see lib/vllm-db.sh). Defaulted here
+# so lib/summary.sh can render it under `set -u` even if the module never ran.
+VLLM_DB_VERIFIED="${VLLM_DB_VERIFIED:-unknown}"
+# Postgres deployment override, mirroring backup.sh — discovery derives the name
+# from the chart's appName and never hardcodes `drive-postgres`.
+PG_DEPLOY="${PG_DEPLOY:-}"
+
 # --- Licensing ---------------------------------------------------------------
 # Ed25519 (EdDSA) PUBLIC key shipped to the app to VERIFY signed license
 # tokens. Public/verification-only -> safe to ship with the appliance; it
