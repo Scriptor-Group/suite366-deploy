@@ -1,16 +1,27 @@
-name: Release channel
+name: Release
 
-# Publishes the fleet channel: rewrites channel.json, re-pins the hashes of the
-# update.sh / backup.sh in this tree, signs the pair and commits everything in
-# ONE commit on the default branch. It replaces
-# `PACKAGE_PRIVATE_KEY=… tools/sign-channel.sh` run by hand on a laptop.
+# The one entry point for shipping a release. Two jobs, picked with `what`:
 #
-# Why it is worth a workflow. channel.json decides which chart and which vLLM
-# image every appliance is told to run, and update.sh is fetched from beside it
-# and then runs AS ROOT on the next apply. The only thing standing between those
-# two facts and "whoever can write this repo owns the fleet" is the Ed25519
-# signature — so the key that makes it belongs in one place with an audit trail,
-# not on whichever machine happened to cut the release.
+#   channel  rewrites channel.json, re-pins the hashes of the update.sh /
+#            backup.sh in this tree, signs the pair and commits everything in
+#            ONE commit on the default branch. Replaces
+#            `PACKAGE_PRIVATE_KEY=… tools/sign-channel.sh` run on a laptop.
+#   package  builds and signs the USB package for air-gapped appliances and
+#            publishes it as a GitHub Release. Reads channel.json from the
+#            commit the channel job just pushed, so a package can never
+#            describe a release the channel does not.
+#
+# `both` is the ordinary roll. `channel` alone is the common case (no
+# air-gapped site is waiting). `package` alone cuts a USB drive for a customer
+# visit without touching the channel — which is why the package job does not
+# simply hang off the channel one.
+#
+# Why any of this is worth a workflow. channel.json decides which chart and
+# which vLLM image every appliance is told to run, and update.sh is fetched from
+# beside it and then runs AS ROOT on the next apply. The only thing standing
+# between those two facts and "whoever can write this repo owns the fleet" is
+# the Ed25519 signature — so the key that makes it belongs in one place with an
+# audit trail, not on whichever machine happened to cut the release.
 #
 # Everything here fails closed in the same direction the appliance does: a bad
 # release STOPS the fleet (every box silently keeps its current version) rather
@@ -18,11 +29,18 @@ name: Release channel
 #
 # One rule this file follows everywhere: no `${{ }}` inside a `run:` block.
 # GitHub substitutes those textually before bash parses the line, so quoting
-# does not contain them — and this job has an Ed25519 private key on disk.
+# does not contain them — and these jobs have an Ed25519 private key on disk.
 # Inputs reach bash through `env:` only.
+#
+# (workflow_dispatch allows at most 10 inputs; that is the whole budget below.)
 on:
   workflow_dispatch:
     inputs:
+      what:
+        description: 'What to release'
+        type: choice
+        options: [both, channel, package]
+        default: both
       chart_version:
         description: 'New chart_version (blank = keep what channel.json says)'
         required: false
@@ -40,7 +58,21 @@ on:
         required: false
         default: ''
       dry_run:
-        description: 'Sign and verify, publish nothing (uploads the signed pair + diff as an artifact)'
+        description: 'Sign, build and verify — publish nothing (no commit, no push, no release; everything lands as an artifact)'
+        type: boolean
+        required: false
+        default: false
+      package_arch:
+        description: 'Package: image platform'
+        type: choice
+        options: [arm64, amd64]
+        default: arm64
+      package_min_from:
+        description: 'Package: refuse to apply on appliances older than this app version (blank = no floor)'
+        required: false
+        default: ''
+      package_include_vllm:
+        description: 'Package: bundle the vLLM image (~10 GB — usually exceeds the runner disk)'
         type: boolean
         required: false
         default: false
@@ -48,16 +80,26 @@ on:
 permissions:
   contents: read
 
-# Two releases racing over one channel.json is the thing to prevent, whichever
-# ref they were dispatched from — hence no github.ref in the group. Not
-# cancelling in flight: a cancel between sign-channel.sh and the push leaves a
-# signed pair nobody published, which is harmless but makes the run log lie.
-concurrency:
-  group: release-channel
-  cancel-in-progress: false
-
 jobs:
-  release:
+  channel:
+    if: ${{ inputs.what != 'package' }}
+    # Two releases racing over one channel.json is the thing to prevent,
+    # whichever ref they were dispatched from — hence no github.ref in the
+    # group. Per JOB, not per workflow: a 25-minute package build must not hold
+    # up a channel roll that has nothing to do with it. Not cancelling in
+    # flight either: a cancel between sign-channel.sh and the push leaves a
+    # signed pair nobody published, which is harmless but makes the log lie.
+    concurrency:
+      group: release-channel
+      cancel-in-progress: false
+    outputs:
+      app_version: ${{ steps.plan.outputs.new_app }}
+      chart_version: ${{ steps.plan.outputs.new_chart }}
+      # The commit this job pushed. The package job checks it out, so it packages
+      # the channel that was just published and not the tip as it stood when the
+      # run was queued. Empty on a dry run, and the package job falls back to
+      # github.sha.
+      sha: ${{ steps.push.outputs.sha }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -583,6 +625,7 @@ jobs:
           git --no-pager log -1 --stat
 
       - name: push to the default branch
+        id: push
         if: ${{ !inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -599,6 +642,7 @@ jobs:
             echo "::error::push the commit from a branch and merge it by hand, or grant the workflow a token that can."
             exit 1
           fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "::warning::a push made with GITHUB_TOKEN triggers no workflow, so ci.yml and channel-signature.yml will not run on the release commit. The equivalent checks ran in this job, against the key derived from the secret."
 
       - name: the published pair verifies over the CDN
@@ -626,3 +670,216 @@ jobs:
           echo "::warning::five minutes after the push, raw.githubusercontent is still serving an old or mismatched pair. Re-check by hand:"
           echo "::warning::  curl -fsSL $url -o /tmp/c.json; curl -fsSL $url.sig -o /tmp/c.sig"
           echo "::warning::  openssl pkeyutl -verify -rawin -pubin -inkey package-release.pub -sigfile /tmp/c.sig -in /tmp/c.json"
+
+  package:
+    needs: channel
+    # `needs` is also "wait for": with what=package the channel job is skipped,
+    # and a skipped dependency has to be accepted explicitly or this job never
+    # runs at all.
+    if: ${{ !cancelled() && inputs.what != 'channel' && (needs.channel.result == 'success' || needs.channel.result == 'skipped') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    # One build per platform at a time: two of them would race over the same
+    # release tag and its assets.
+    concurrency:
+      group: release-package-${{ inputs.package_arch }}
+      cancel-in-progress: false
+    permissions:
+      contents: write   # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The channel job pushed a commit; github.sha still points at the tip
+          # as it stood when this run was queued. Packaging that one would sign
+          # a USB drive for the release we just replaced. Empty when the channel
+          # job was skipped (what=package), and then github.sha is right.
+          ref: ${{ needs.channel.outputs.sha || github.sha }}
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Read target versions from channel.json
+        id: target
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" channel.json | head -1; }
+          {
+            echo "app_version=$(get app_version)"
+            echo "chart_version=$(get chart_version)"
+            echo "vllm_image=$(get vllm_image)"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Building the package for app %s / chart %s\n' "$(get app_version)" "$(get chart_version)"
+
+      - name: Install the signing key
+        env:
+          # Ed25519 private key (PEM), generated by tools/gen-package-key.sh.
+          # Its public half lives on every appliance as package-release.pub.
+          PACKAGE_PRIVATE_KEY_PEM: ${{ secrets.PACKAGE_PRIVATE_KEY_PEM }}
+        run: |
+          [[ -n "$PACKAGE_PRIVATE_KEY_PEM" ]] || {
+            echo "::error::secret PACKAGE_PRIVATE_KEY_PEM is not set"; exit 1; }
+          install -m 0700 -d "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PACKAGE_PRIVATE_KEY_PEM" > "$RUNNER_TEMP/keys/package.key"
+          chmod 0600 "$RUNNER_TEMP/keys/package.key"
+          # Derive the public half NOW, while the private key is on disk: the
+          # verification step below must not need the secret again (interpolating
+          # it into a later `run:` block would print it under any shell trace).
+          openssl pkey -in "$RUNNER_TEMP/keys/package.key" -pubout \
+            -out "$RUNNER_TEMP/package.pub"
+
+      - name: Build + sign the package
+        env:
+          IN_ARCH: ${{ inputs.package_arch }}
+          IN_MIN_FROM: ${{ inputs.package_min_from }}
+          IN_INCLUDE_VLLM: ${{ inputs.package_include_vllm }}
+        run: |
+          set -euo pipefail
+          args=( --arch "$IN_ARCH" --out "$RUNNER_TEMP/dist" --prune-images )
+          [[ -n "$IN_MIN_FROM" ]] && args+=( --min-from "$IN_MIN_FROM" )
+          [[ "$IN_INCLUDE_VLLM" == 'true' ]] || args+=( --no-vllm )
+          PACKAGE_PRIVATE_KEY="$RUNNER_TEMP/keys/package.key" \
+            tools/build-offline-package.sh "${args[@]}"
+          df -h /
+
+      - name: Drop the signing key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/keys/package.key" 2>/dev/null || true
+
+      - name: Verify the package as an appliance would
+        env:
+          APP_VERSION: ${{ steps.target.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/dist/suite366-update-$APP_VERSION"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/package.pub" \
+            -sigfile "$pkg/SHA256SUMS.sig" -in "$pkg/SHA256SUMS"
+          ( cd "$pkg" && sha256sum -c --strict --quiet SHA256SUMS )
+          echo "package verifies; size: $(du -sh "$pkg" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suite366-update-${{ steps.target.outputs.app_version }}-${{ inputs.package_arch }}
+          path: ${{ runner.temp }}/dist/
+          retention-days: 30
+          # Already-compressed image layers: recompressing costs minutes and
+          # saves nothing.
+          compression-level: 0
+
+      - name: Pack the release assets
+        if: ${{ !inputs.dry_run }}
+        id: assets
+        env:
+          APP_VERSION: ${{ steps.target.outputs.app_version }}
+          IN_ARCH: ${{ inputs.package_arch }}
+        run: |
+          set -euo pipefail
+          # The images are out of the daemon and into tars by now; the store is
+          # dead weight and the tarball below needs the room.
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+          pkg="suite366-update-$APP_VERSION"
+          base="$pkg-$IN_ARCH"
+          install -d "$RUNNER_TEMP/assets"
+          tar -czf "$RUNNER_TEMP/$base.tar.gz" -C "$RUNNER_TEMP/dist" "$pkg"
+
+          # A release asset cannot exceed 2 GiB. Split at 1.9 GiB so the parts
+          # concatenate back to a byte-identical tarball — the sha256 beside
+          # them is what proves it did.
+          sha256sum "$RUNNER_TEMP/$base.tar.gz" | sed "s| .*| $base.tar.gz|" \
+            > "$RUNNER_TEMP/assets/$base.tar.gz.sha256"
+          size="$(stat -c %s "$RUNNER_TEMP/$base.tar.gz")"
+          if (( size > 1900 * 1024 * 1024 )); then
+            split -b 1900m -d -a 2 "$RUNNER_TEMP/$base.tar.gz" \
+              "$RUNNER_TEMP/assets/$base.tar.gz.part"
+            rm -f "$RUNNER_TEMP/$base.tar.gz"
+            echo "split=1" >> "$GITHUB_OUTPUT"
+          else
+            mv "$RUNNER_TEMP/$base.tar.gz" "$RUNNER_TEMP/assets/"
+            echo "split=0" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The three small files that let anyone check what was signed without
+          # downloading gigabytes first.
+          cp "$RUNNER_TEMP/dist/$pkg/manifest.json" \
+             "$RUNNER_TEMP/dist/$pkg/SHA256SUMS" \
+             "$RUNNER_TEMP/dist/$pkg/SHA256SUMS.sig" "$RUNNER_TEMP/assets/"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          ls -lh "$RUNNER_TEMP/assets"
+
+      - name: Publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.target.outputs.app_version }}
+          CHART_VERSION: ${{ steps.target.outputs.chart_version }}
+          VLLM_IMAGE: ${{ steps.target.outputs.vllm_image }}
+          IN_ARCH: ${{ inputs.package_arch }}
+          IN_MIN_FROM: ${{ inputs.package_min_from }}
+          IN_INCLUDE_VLLM: ${{ inputs.package_include_vllm }}
+          BASE: ${{ steps.assets.outputs.base }}
+          SPLIT: ${{ steps.assets.outputs.split }}
+          RELEASE_TAG: pkg/${{ steps.target.outputs.app_version }}-${{ inputs.package_arch }}
+        run: |
+          set -euo pipefail
+          vllm="not bundled (the box keeps the image it runs)"
+          [[ "$IN_INCLUDE_VLLM" == 'true' ]] && vllm="$VLLM_IMAGE"
+          # Built with printf, not a multi-line literal: every line of a `run:`
+          # block has to stay inside the YAML block scalar.
+          if [[ "$SPLIT" == 1 ]]; then
+            reassemble="$(printf '%s\n' \
+              "cat $BASE.tar.gz.part* > $BASE.tar.gz" \
+              "sha256sum -c $BASE.tar.gz.sha256" \
+              "tar xzf $BASE.tar.gz")"
+          else
+            reassemble="$(printf '%s\n' \
+              "sha256sum -c $BASE.tar.gz.sha256" \
+              "tar xzf $BASE.tar.gz")"
+          fi
+          notes="$(printf '%s\n' \
+            "Signed offline update package for an air-gapped appliance." \
+            "" \
+            "| | |" \
+            "|---|---|" \
+            "| app | \`$APP_VERSION\` |" \
+            "| chart | \`$CHART_VERSION\` |" \
+            "| platform | \`linux/$IN_ARCH\` |" \
+            "| min_from | \`${IN_MIN_FROM:-none}\` |" \
+            "| vLLM image | $vllm |" \
+            "" \
+            "Reassemble, check and unpack — a release asset cannot exceed 2 GiB, so the" \
+            "tarball travels in 1.9 GiB parts:" \
+            "" \
+            '```bash' \
+            "$reassemble" \
+            "sudo /opt/suite366/update.sh scan-usb \"\$PWD/suite366-update-$APP_VERSION\"" \
+            '```' \
+            "" \
+            "\`scan-usb\` verifies \`SHA256SUMS.sig\` against the appliance's own" \
+            "\`package-release.pub\` and applies nothing on its own — it stages the package" \
+            "and surfaces the usual update prompt in the admin UI. A box with no key" \
+            "installed refuses every package, which is the intended fail-closed default." \
+            "" \
+            "\`manifest.json\`, \`SHA256SUMS\` and \`SHA256SUMS.sig\` are attached separately so" \
+            "the signature can be checked before downloading gigabytes." \
+            "" \
+            "Built by \`.github/workflows/offline-package.yml\`, run $GITHUB_RUN_ID.")"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::warning::release $RELEASE_TAG already exists — replacing its assets."
+            gh release edit "$RELEASE_TAG" --notes "$notes"
+            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* \
+              --title "Offline package $APP_VERSION ($IN_ARCH)" \
+              --notes "$notes"
+          fi
+          {
+            echo "### Offline package published"
+            echo
+            echo "- tag \`$RELEASE_TAG\` — app \`$APP_VERSION\`, chart \`$CHART_VERSION\`, \`linux/$IN_ARCH\`"
+            gh release view "$RELEASE_TAG" --json url --jq '"- " + .url' || true
+          } >> "$GITHUB_STEP_SUMMARY"
