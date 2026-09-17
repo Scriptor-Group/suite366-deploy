@@ -18,6 +18,8 @@
 #   --out DIR       output directory (default: ./dist)
 #   --min-from VER  refuse to apply on appliances older than VER
 #   --no-vllm       skip the multi-GB vLLM image (box already runs the right one)
+#   --prune-images  docker image rm each image as soon as it is saved: on a CI
+#                   runner the tar and the image cannot both fit on the disk
 #   --channel FILE  channel manifest to build from (default: ./channel.json)
 #   --no-restic     skip the restic binary (an air-gapped box then has a backup
 #                   agent it can never run — only pass this for a box you know
@@ -49,6 +51,7 @@ OUT="$REPO_ROOT/dist"
 MIN_FROM=""
 WITH_VLLM=1
 WITH_RESTIC=1
+PRUNE_IMAGES=0
 CHANNEL_FILE="$REPO_ROOT/channel.json"
 
 c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
@@ -67,7 +70,8 @@ while [[ $# -gt 0 ]]; do
     --channel)   CHANNEL_FILE="$2"; shift 2 ;;
     --no-vllm)   WITH_VLLM=0; shift ;;
     --no-restic) WITH_RESTIC=0; shift ;;
-    -h|--help)   sed -n '2,46p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --prune-images) PRUNE_IMAGES=1; shift ;;
+    -h|--help)   sed -n '2,48p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)           die "unknown option: $1" ;;
   esac
 done
@@ -129,7 +133,14 @@ trap 'rm -f "$rendered" "$helm_out" "$helm_err"' EXIT
 # @INGRESS_CERT_ANNOTATION@ is NOT optional here: it stands alone on a line
 # inside `annotations:`, so leaving it as a literal makes the file a mapping
 # with a bare scalar in it and `helm template` refuses to render at all.
-sed -e "s|@DOMAIN@|suite366.local|g" \
+# The LAN-name lines carry a `#@local` tag and @LOCAL_*@ tokens this
+# substitution does not fill. lib/suite.sh deletes them line by line on a box
+# with no LAN names; here they must go too, because a bare @ cannot start a
+# YAML scalar and `helm template` then refuses the whole file — which is how
+# this build failed with "the chart did not render" on a tree where nothing
+# was wrong with the chart.
+sed -e '/#@local$/d' \
+    -e "s|@DOMAIN@|suite366.local|g" \
     -e "s|@APP_HOST@|drive.suite366.local|g" \
     -e "s|@OFFICE_HOST@|office.suite366.local|g" \
     -e "s|@LIVEKIT_HOST@|livekit.suite366.local|g" \
@@ -182,6 +193,9 @@ for img in "${images[@]}"; do
     || die "docker pull failed: $img"
   docker save "$img" -o "$PKG/images/$safe.tar" || die "docker save failed: $img"
   info "  -> images/$safe.tar ($(du -h "$PKG/images/$safe.tar" | cut -f1))"
+  # The saved tar and the image in the daemon's store hold the same layers
+  # twice. A hosted runner cannot afford that for eleven images.
+  [[ "$PRUNE_IMAGES" == 1 ]] && docker image rm "$img" >/dev/null 2>&1 || true
 done
 
 if [[ "$WITH_VLLM" == 1 && -n "$VLLM_IMAGE" ]]; then
