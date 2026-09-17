@@ -100,7 +100,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
-| `LLM_MODEL` | `nvidia/Gemma-4-26B-A4B-NVFP4` | generative model (HF id) |
+| `LLM_MODEL` | `nvidia/Qwen3.8-27B-NVFP4` | generative model (HF id) |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
 | `VLLM_IMAGE` | `vllm/vllm-openai:cu130-nightly` | vLLM image arm64/sm_121 (Docker Hub, no NGC login) |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
@@ -312,36 +312,52 @@ plumbing, not the AI path.
 ## Measured GB10 realities (read before tuning)
 
 Validated on Spark `aarch64 / GB10 / DGX OS 6.17 / 121 GiB unified`,
-Gemma-4-26B-A4B-NVFP4 under `vllm/vllm-openai:cu130-nightly` (vLLM 0.19.2rc1):
+nvidia/Qwen3.8-27B-NVFP4 under `vllm/vllm-openai:v0.29.0` (2026-09-17). The
+vLLM recipe for Qwen3.8-27B marks this exact checkpoint verified on
+`dgx_spark_gb10`; `llm/docker-compose.yml` carries that profile.
 
 **Unified memory budget.** `gpu_memory_utilization` is NOT pre-allocated in
 VRAM (there is no VRAM on GB10) - vLLM uses it to compute the KV cache size
 after weights are loaded. With the defaults:
-- LLM `0.55` → weights 17.97 GiB + workspace + cudagraphs + **KV cache = 402,416 tokens** (fp8).
-- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → weights 15.5 GiB + KV 4 GiB
-  (29k tokens, 3.5 concurrent 8k requests) + graphs ≈ **20 GiB**. With the
-  fraction alone (the old 0.30) vLLM filled the whole share with KV cache:
-  18.75 GiB for chunk embedding, ~36 GiB per container. The explicit byte
-  budget skips the profiler, whose result on a unified pool depends on what
-  else is resident at start-up (that is why 0.25 used to fail cold).
-- Sum `0.75` → ~34 GiB of OS headroom on 121 GiB. The previous 0.85 left 12 GiB
-  and 10 GiB of swap in use at idle.
+- LLM `0.45` → weights 20.8 GiB + workspace + cudagraphs + **KV cache = 818,650 tokens** (fp8),
+  3.1× a full 262,144-token request. A dense 27B needs a *smaller* share than
+  the Gemma 4 MoE did: only 16 of its 64 layers carry a KV cache, the other 48
+  are Gated-DeltaNet linear attention with a fixed-size state.
+- EMBED `0.30` → ~36 GiB raw budget, but ~14 GiB perceived as "workspace" (the
+  shared unified pool makes vLLM see the LLM's memory as workspace) →
+  effective KV cache ~4 GiB for `max_model_len=8192`. **0.25 fails cold**, 0.20
+  yields negative KV cache.
+- Sum `0.75` → ~30 GiB of OS headroom on 121 GiB (`free -h` ≈ 95/121 used with
+  both models warm). The previous 0.85 left 12 GiB and 10 GiB of swap in use.
 
-**Prefill rate (the real GB10 bottleneck).** ~Quadratic scaling on long contexts:
+**Kernels.** vLLM v0.29.0 picks the native paths on sm_121: W4A4 NVFP4 via
+`FlashInferCutlassNvFp4LinearKernel`, FP8 FlashInfer for the attention
+projections, `FLASHINFER` attention (fp8 KV, xqa decode), CUDA Gated-DeltaNet
+decode. The Marlin weight-only fallback that vLLM 0.19 used for Gemma 4 is gone
+(it dequantised FP4 to FP16 and never touched the FP4 tensor cores).
 
-| Input tokens | Cold prefill |
-|---|---|
-| 8.7k | 3.3s (2656 t/s) |
-| 26k | 13s |
-| 53k | 34s |
-| 106k | 124s |
-| 200k | **565s (≈9m30)** |
+**Decode is memory-bandwidth bound.** 20.8 GiB of weights over the GB10's
+273 GB/s is 12 t/s bare — measured 12.2. The in-checkpoint MTP draft head
+(`--speculative-config`) is the only lever: 19-20 t/s on French prose, ~30 t/s
+on code, `num_speculative_tokens` 3 and 5 measured identical. Acceptance is
+readable in `/metrics` (`vllm:spec_decode_num_{accepted,draft}_tokens_total`).
 
-This curve is due to the combination of Marlin weight-only FP4 (the only
-functional NVFP4 backend on sm_121 in vLLM 0.19) + the `TRITON_ATTN` attention
-backend (forced by Gemma 4's heterogeneous heads: `head_dim=256/512`). Native
-FP4 paths and `FLASH_ATTN` are not available today for this model on this
-platform.
+**Prefill.** Dense compute costs about 2× Gemma 4 on short prompts, but the
+linear-attention layers keep long contexts from going quadratic:
+
+| Input tokens | Qwen3.8-27B (cold) | Gemma 4 (cold, for reference) |
+|---|---|---|
+| 2k | 0.85 s | 0.43 s |
+| 16k | 8.2 s | 4.3 s |
+| 69k | 49 s (~1,400 t/s) | 62k in 65 s (~950 t/s) |
+| 200k | not re-measured | 565 s |
+
+**Start-up.** Weights load in 12 s with `--load-format fastsafetensors` (114 s
+with the default loader). Cold start 257 s once the model is on disk; **96 s
+warm** because torch.compile artifacts, the FlashInfer autotune sweep and the
+Triton kernels persist under `$CACHE_DIR` (`/opt/suite366/cache`). A config
+change that alters the compiled graph (speculative tokens, attention backend)
+invalidates those caches and costs a cold start again.
 
 **Concurrency and preemption.** At `max_num_seqs=2 + max_model_len=262144`,
 worst-case KV demand (`2×262144 = 524,288`) exceeds budget (`402,416`), but on
@@ -368,9 +384,9 @@ is **wired automatically** through the chart values:
 ```yaml
 config:
   VLLM_BASE_URL:            http://<HOST_IP>:8000/v1   # nginx proxy
-  VLLM_MODEL_HIGH:          nvidia/Gemma-4-26B-A4B-NVFP4
-  VLLM_MODEL_LIGHT:         nvidia/Gemma-4-26B-A4B-NVFP4
-  VLLM_MODEL_VISION:        nvidia/Gemma-4-26B-A4B-NVFP4
+  VLLM_MODEL_HIGH:          nvidia/Qwen3.8-27B-NVFP4
+  VLLM_MODEL_LIGHT:         nvidia/Qwen3.8-27B-NVFP4
+  VLLM_MODEL_VISION:        nvidia/Qwen3.8-27B-NVFP4
   VLLM_MODEL_EMBEDDING:     Qwen/Qwen3-VL-Embedding-8B
   VLLM_EMBEDDING_DIMENSIONS: "4096"
   VLLM_MAX_CONTEXT_WINDOW:   "200000"
@@ -380,8 +396,14 @@ secrets:
 
 When `VLLM_BASE_URL` is set, `chooseDefaultModel(role)` picks the local vLLM
 over Anthropic/OpenAI for every role (precedence `vllm → anthropic → openai`).
-Embedding and vision skip Anthropic; vision uses `VLLM_MODEL_VISION` (Gemma 4
-is multimodal).
+Embedding and vision skip Anthropic; vision uses `VLLM_MODEL_VISION` (Qwen3.8
+is a native vision-language model; the NVFP4 build keeps its vision tower in
+BF16).
+
+The app seeds the model ids into Postgres when an organisation is created
+(`AIProvider` + `AIModel` rows) and agents store the id again in `Agent.model`.
+Changing `LLM_MODEL` on an installed box therefore also means updating those
+rows — the env vars only drive new organisations and the env fallback.
 
 ### Why an nginx proxy
 
@@ -409,7 +431,7 @@ to register a per-organization provider in the admin UI:
 
 | Provider (CUSTOM, OpenAI-compatible) | Base URL | Model | Key |
 |---|---|---|---|
-| Chat / vision (direct) | `http://<HOST_IP>:8001/v1` | `nvidia/Gemma-4-26B-A4B-NVFP4` | vLLM key shown |
+| Chat / vision (direct) | `http://<HOST_IP>:8001/v1` | `nvidia/Qwen3.8-27B-NVFP4` | vLLM key shown |
 | Embeddings (direct) | `http://<HOST_IP>:8002/v1` | `Qwen/Qwen3-VL-Embedding-8B` | vLLM key shown |
 | Unified (nginx)      | `http://<HOST_IP>:8000/v1` | either of the above | vLLM key shown |
 
@@ -478,7 +500,6 @@ channel.json                          fleet release manifest (chart_version / ap
 channel.json.sig                      Ed25519 signature over channel.json — required by any appliance holding the public key
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
-llm/tool_chat_template_gemma4.jinja   chat template required by --tool-call-parser=gemma4
 llm/nginx.conf                        URL-path router unifying both vLLM behind a single endpoint
 tls/local-ca-issuer.yaml              local self-signed CA (cert-manager)
 dns/avahi-aliases.service             systemd unit publishing mDNS names
