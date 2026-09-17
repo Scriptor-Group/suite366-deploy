@@ -202,18 +202,21 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 #     full 262,144-token request. Only 16 of the 64 layers carry a KV cache
 #     (the other 48 are linear attention with a fixed-size state), which is
 #     why a DENSE 27B needs a smaller share than the Gemma 4 MoE did (0.55).
-#   EMBED 0.30 -> effective KV cache ~4 GiB for Qwen3-VL-Embedding-8B (8192
-#     max model len), once the pool is shared with a warm LLM. 0.25 fails in
-#     practice: vLLM sees the LLM's memory as "workspace" on the unified pool
-#     -> KV cache computed at 0.41 GiB, not enough. 0.20 -> negative KV.
-#   Sum 0.75 -> ~30 GiB of OS headroom on 121 GiB (`free -h` ≈ 95/121 GiB
+#   EMBED 0.20 + an explicit 4 GiB KV budget in the compose
+#     (--kv-cache-memory-bytes). The fraction alone was the wrong tool: at 0.30
+#     vLLM filled the whole share with KV cache (18.75 GiB, 136k tokens) for a
+#     chunk-embedding workload, and lower fractions were fragile because the
+#     profiler's result depends on whatever else sits in the unified pool at
+#     start-up. With the byte budget the profiler is skipped and the fraction
+#     only has to clear the start-up free-memory check. Measured: ~20 GiB.
+#   Sum 0.65 -> ~45 GiB of OS headroom on 121 GiB (`free -h` ≈ 76/121 GiB
 #     used with both models warm). The previous 0.85 left 12 GiB and the box
 #     sat 10 GiB into swap at idle.
 #   max_num_seqs=2: above that, chunked_prefill collapses gen throughput
 #     (the bottleneck is GB10's prefill compute, not memory). 4 = no
 #     measurable improvement, just more OS pressure.
 LLM_GPU_MEM_UTIL="${LLM_GPU_MEM_UTIL:-0.45}"
-EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.30}"
+EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.20}"
 LLM_MAX_NUM_SEQS="${LLM_MAX_NUM_SEQS:-2}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-262144}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"

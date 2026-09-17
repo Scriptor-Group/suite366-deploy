@@ -156,6 +156,8 @@ services:
       # tokens in flight (3.5 full 8k requests); measured, the container drops
       # from ~36 GiB to ~20 GiB and the box gains 16 GiB of headroom.
       - --kv-cache-memory-bytes=4294967296
+      # Same loader win as the LLM: 15.5 GiB of BF16 in 6 s instead of 72.
+      - --load-format=fastsafetensors
       - --limit-mm-per-prompt.image=4
       - --limit-mm-per-prompt.video=0
       - --host=0.0.0.0

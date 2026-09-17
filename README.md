@@ -323,11 +323,13 @@ after weights are loaded. With the defaults:
   3.1× a full 262,144-token request. A dense 27B needs a *smaller* share than
   the Gemma 4 MoE did: only 16 of its 64 layers carry a KV cache, the other 48
   are Gated-DeltaNet linear attention with a fixed-size state.
-- EMBED `0.30` → ~36 GiB raw budget, but ~14 GiB perceived as "workspace" (the
-  shared unified pool makes vLLM see the LLM's memory as workspace) →
-  effective KV cache ~4 GiB for `max_model_len=8192`. **0.25 fails cold**, 0.20
-  yields negative KV cache.
-- Sum `0.75` → ~30 GiB of OS headroom on 121 GiB (`free -h` ≈ 95/121 used with
+- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → weights 15.5 GiB + KV 4 GiB
+  (29k tokens, 3.5 concurrent 8k requests) + graphs ≈ **20 GiB**. With the
+  fraction alone (the old 0.30) vLLM filled the whole share with KV cache:
+  18.75 GiB for chunk embedding, ~36 GiB per container. The explicit byte
+  budget skips the profiler, whose result on a unified pool depends on what
+  else is resident at start-up (that is why 0.25 used to fail cold).
+- Sum `0.65` → ~45 GiB of OS headroom on 121 GiB (`free -h` ≈ 76/121 used with
   both models warm). The previous 0.85 left 12 GiB and 10 GiB of swap in use.
 
 **Kernels.** vLLM v0.29.0 picks the native paths on sm_121: W4A4 NVFP4 via

@@ -57,7 +57,7 @@
 #                              OpenAI-compatible endpoint, wired into the
 #                              Suite 366 chart.
 #   LLM_GPU_MEM_UTIL,          fractions of the 121 GiB unified pool allocated
-#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0; defaults 0.45 / 0.30)
+#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0; defaults 0.45 / 0.20)
 #   LLM_MAX_NUM_SEQS,          generative tuning (defaults 2 / 262144 — covers
 #   LLM_MAX_MODEL_LEN          100% of prod traffic up to 256k tokens)
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
