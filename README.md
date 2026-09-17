@@ -64,8 +64,8 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
     present but Docker doesn't see the runtime (common DGX OS case - the
     compose uses `gpus: all` and works either way, but the runtime
     registration is useful for other tools);
-  - generates a **persistent** CDI spec at `/etc/cdi/nvidia.yaml` so
-    `gpus: all` survives reboots (see *Survival across reboots* below).
+  - refreshes a **persistent** CDI spec at `/etc/cdi/nvidia.yaml` on every run
+    so `gpus: all` survives reboots (see *Survival across reboots* below).
 - **Helm chart + container images**: all hosted anonymously on GHCR under
   the Scriptor-Group org. No login required.
   - Chart: `oci://ghcr.io/scriptor-group/chart/drive` (v `0.7.1`)
@@ -798,10 +798,48 @@ CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all
 …and crash-loop forever (`vllm-llm` exits in <10s, `vllm-embed` and
 `vllm-proxy` never get past their `depends_on: service_healthy` gate).
 
-The installer therefore generates a **persistent** CDI spec at
-`/etc/cdi/nvidia.yaml` during preflight (`nvidia-ctk cdi generate`). If you
-add a GPU, swap drivers, or otherwise change the host's NVIDIA stack,
-regenerate it:
+The installer therefore writes a **persistent** CDI spec at
+`/etc/cdi/nvidia.yaml` during preflight (`nvidia-ctk cdi generate`).
+
+Persistent is not the same as correct, though. The spec pins the device-node
+**majors**, and `/dev/nvidia-uvm`'s major is allocated dynamically at each boot
+(497, 498, …). A spec written on an earlier boot keeps the old number, and every
+GPU container is then handed a device node on the wrong char device. That one is
+nasty to diagnose, because it hides where you look first:
+
+- `nvidia-smi` works — on the host **and inside the container**, because NVML
+  goes through `/dev/nvidiactl` (major 195, fixed);
+- the driver, the kernel modules and `/dev/nvidia*` are all healthy;
+- the only symptom is `torch.cuda.init()` raising `CUDA unknown error - this may
+  be due to an incorrectly set up environment`, which names neither CDI nor the
+  driver — with vLLM crash-looping behind it.
+
+So the spec is refreshed in two places, and both are needed:
+
+- **every installer run** (preflight), which fixes a box you are already working
+  on;
+- **every start of `suite366-vllm.service`**, via an `ExecStartPre` that runs
+  `nvidia-ctk cdi generate` before Compose creates the containers — devices are
+  injected at container *creation*, so a later refresh would be too late. It is
+  best-effort (`-` prefix): it can never hold the stack down when the spec is
+  already good.
+
+NVIDIA ships `nvidia-cdi-refresh.service` for this, but it cannot be relied on
+here: it is disabled by default, it writes to `/var/run/cdi/` (leaving the stale
+`/etc/cdi/nvidia.yaml` in place beside it), and it is ordered
+`After=multi-user.target` — so it runs *after* the LLM stack, and on a box where
+`plymouth-quit-wait.service` hangs (DGX OS boots with `quiet splash`) the target
+is never reached and the unit never runs at all. Worth knowing beyond CDI: check
+`systemctl list-jobs` before trusting anything ordered after that target.
+
+To check a box by hand, compare the live major against the one in the spec:
+
+```bash
+grep -i nvidia /proc/devices | grep uvm                     # e.g. 498 nvidia-uvm
+grep -A1 'path: /dev/nvidia-uvm' /etc/cdi/nvidia.yaml       # must match
+```
+
+If they differ:
 
 ```bash
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml

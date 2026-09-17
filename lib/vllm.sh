@@ -49,6 +49,17 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$DATA_DIR/llm
+# /dev/nvidia-uvm's major is allocated dynamically at each boot while
+# /etc/cdi/nvidia.yaml pins it, so refresh the spec before the containers are
+# created: devices are injected at creation, and a boot that shifted the major
+# otherwise hands them a node on the wrong char device — nvidia-smi still works
+# inside the container, torch.cuda.init() does not, and vLLM crash-loops.
+# This lives here rather than in NVIDIA's nvidia-cdi-refresh.service because of
+# ordering: that unit is After=multi-user.target, so it runs after this stack —
+# and on a box where plymouth-quit-wait hangs (DGX OS, `quiet splash`), the
+# target is never reached and it never runs at all.
+# Best-effort (leading -): never hold the stack down when the spec is fine.
+ExecStartPre=-/usr/bin/nvidia-ctk cdi generate --output=$CDI_SPEC
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
