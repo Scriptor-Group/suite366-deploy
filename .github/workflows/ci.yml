@@ -62,6 +62,12 @@ jobs:
       # organization creation, and never re-read.
       - name: vLLM provider key reconcile + verify self-test
         run: ./tools/test-vllm-db.sh
+      # A reboot moved /dev/nvidia-uvm from major 497 to 498. The CDI spec still
+      # said 497, so every GPU container got a node on the wrong char device:
+      # nvidia-smi fine everywhere, torch.cuda.init() dead, vLLM crash-looping
+      # 63 times, and nothing in any log naming CDI.
+      - name: CDI spec refresh self-test
+        run: ./tools/test-vllm-cdi.sh
 
   backup-verify:
     runs-on: ubuntu-latest

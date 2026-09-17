@@ -209,6 +209,11 @@ EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"
 
+# Where the persistent CDI spec is written. Both the preflight refresh and the
+# ExecStartPre baked into suite366-vllm.service read this one value, so the two
+# cannot drift onto different files.
+CDI_SPEC="${CDI_SPEC:-/etc/cdi/nvidia.yaml}"
+
 # --- Backup (restic) ---------------------------------------------------------
 # The destination is a CUSTOMER decision, so it is empty by default and the
 # appliance ships with the mechanism armed but idle: `backup.sh run` then

@@ -5,6 +5,33 @@
 # =============================================================================
 
 # --- 0. Preflight ------------------------------------------------------------
+# Persistent CDI spec. The compose uses `gpus: all`, which resolves via CDI
+# device "nvidia.com/gpu=all". DGX OS does NOT ship a persistent spec under
+# /etc/cdi/ ; the toolkit auto-generates one in /var/run/cdi/ (tmpfs) at first
+# container start. After a reboot /var/run is wiped, the spec is gone, and the
+# next `docker compose up` fails with
+#   "CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all"
+# which crash-loops every container that requests GPU.
+#
+# Write it on EVERY run, not only when the file is missing. The spec pins the
+# device-node majors, and /dev/nvidia-uvm's major is allocated dynamically at
+# each boot (497, 498, …) — a spec written on an earlier boot keeps the old
+# one, and the container then gets a node pointing at the wrong char device.
+# That failure hides where you look first: `nvidia-smi` still works inside the
+# container (NVML goes through /dev/nvidiactl, major 195, fixed) while
+# torch.cuda.init() dies with "CUDA unknown error - this may be due to an
+# incorrectly set up environment", which names neither the driver nor CDI. Seen
+# in production 2026-09-17: vLLM crash-looped 63 times after a reboot shifted
+# the major from 497 to 498. Regenerating is idempotent and takes under a
+# second, so there is nothing to gain by skipping it.
+refresh_cdi_spec() {
+  local spec="${CDI_SPEC:-/etc/cdi/nvidia.yaml}"
+  info "Refreshing persistent CDI spec at $spec…"
+  mkdir -p "$(dirname "$spec")"
+  nvidia-ctk cdi generate --output="$spec" >/dev/null 2>&1 \
+    || warn "nvidia-ctk cdi generate failed — gpus:all may not resolve after reboot."
+}
+
 preflight() {
   log "Preflight"
   [[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
@@ -53,20 +80,7 @@ preflight() {
         nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
       fi
     fi
-    # Persistent CDI specs. The compose uses `gpus: all`, which resolves via
-    # CDI device "nvidia.com/gpu=all". DGX OS does NOT ship a persistent spec
-    # under /etc/cdi/ ; the toolkit auto-generates one in /var/run/cdi/ (tmpfs)
-    # at first container start. After a reboot, /var/run is wiped, the spec
-    # is gone, and the next `docker compose up` fails with
-    #   "CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all"
-    # which crash-loops every container that requests GPU. Generate the spec
-    # ONCE into /etc/cdi/ so it survives reboots.
-    if ! [[ -s /etc/cdi/nvidia.yaml ]]; then
-      info "Generating persistent CDI spec at /etc/cdi/nvidia.yaml…"
-      mkdir -p /etc/cdi
-      nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >/dev/null 2>&1 \
-        || warn "nvidia-ctk cdi generate failed — gpus:all may not resolve after reboot."
-    fi
+    refresh_cdi_spec
   fi
 
   HOST_IP="${HOST_IP:-$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')}"
