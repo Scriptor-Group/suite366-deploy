@@ -1,0 +1,628 @@
+name: Release channel
+
+# Publishes the fleet channel: rewrites channel.json, re-pins the hashes of the
+# update.sh / backup.sh in this tree, signs the pair and commits everything in
+# ONE commit on the default branch. It replaces
+# `PACKAGE_PRIVATE_KEY=… tools/sign-channel.sh` run by hand on a laptop.
+#
+# Why it is worth a workflow. channel.json decides which chart and which vLLM
+# image every appliance is told to run, and update.sh is fetched from beside it
+# and then runs AS ROOT on the next apply. The only thing standing between those
+# two facts and "whoever can write this repo owns the fleet" is the Ed25519
+# signature — so the key that makes it belongs in one place with an audit trail,
+# not on whichever machine happened to cut the release.
+#
+# Everything here fails closed in the same direction the appliance does: a bad
+# release STOPS the fleet (every box silently keeps its current version) rather
+# than moving it wrongly. So every check below refuses rather than repairs.
+#
+# One rule this file follows everywhere: no `${{ }}` inside a `run:` block.
+# GitHub substitutes those textually before bash parses the line, so quoting
+# does not contain them — and this job has an Ed25519 private key on disk.
+# Inputs reach bash through `env:` only.
+on:
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: 'New chart_version (blank = keep what channel.json says)'
+        required: false
+        default: ''
+      app_version:
+        description: 'New app_version (blank = keep what channel.json says)'
+        required: false
+        default: ''
+      vllm_image:
+        description: 'New vllm_image, full ref including the tag (blank = keep)'
+        required: false
+        default: ''
+      notes:
+        description: 'Release notes override (blank = keep the committed ones). NO double quotes: update.sh parses the manifest with sed and truncates the note at the first one.'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Sign and verify, publish nothing (uploads the signed pair + diff as an artifact)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Two releases racing over one channel.json is the thing to prevent, whichever
+# ref they were dispatched from — hence no github.ref in the group. Not
+# cancelling in flight: a cancel between sign-channel.sh and the push leaves a
+# signed pair nobody published, which is harmless but makes the run log lie.
+concurrency:
+  group: release-channel
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write   # commit + push the release
+      checks: read      # read CI's verdict on this commit
+    steps:
+      # The signature pins the update.sh and backup.sh IN THIS TREE, and the
+      # fleet fetches them from beside the manifest. Releasing from a feature
+      # branch would therefore publish that branch's root-run scripts to every
+      # appliance. A dry run from a branch is fine — it is how you test a change
+      # to this workflow.
+      - name: this run is on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+            echo "on $DEFAULT_BRANCH"
+          elif [[ "$DRY_RUN" == "true" ]]; then
+            echo "::warning::running from $GITHUB_REF_NAME, not $DEFAULT_BRANCH — dry run only. The artifact is for inspection; do not commit it by hand."
+          else
+            echo "::error::refusing to publish from $GITHUB_REF_NAME."
+            echo "::error::Re-run on $DEFAULT_BRANCH, or with dry_run=true."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: read the committed channel
+        id: cur
+        run: |
+          set -euo pipefail
+          # The appliance's own parser idiom (update.sh:141). No jq anywhere in
+          # this repo: the box has to parse this file with the shell it has.
+          get() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" channel.json | head -1; }
+          {
+            echo "chart=$(get chart_version)"
+            echo "app=$(get app_version)"
+            echo "vllm=$(get vllm_image)"
+          } >> "$GITHUB_OUTPUT"
+          printf 'committed: chart %s / app %s / vllm %s\n' \
+            "$(get chart_version)" "$(get app_version)" "$(get vllm_image)"
+
+      - name: the roll goes forward
+        id: plan
+        env:
+          IN_CHART: ${{ inputs.chart_version }}
+          IN_APP: ${{ inputs.app_version }}
+          IN_VLLM: ${{ inputs.vllm_image }}
+          CUR_CHART: ${{ steps.cur.outputs.chart }}
+          CUR_APP: ${{ steps.cur.outputs.app }}
+          CUR_VLLM: ${{ steps.cur.outputs.vllm }}
+        run: |
+          set -euo pipefail
+          rc=0
+
+          # These values end up on the replacement side of a sed further down
+          # (lib/config.sh, values.yaml), where & and \ are syntax. Constrain the
+          # alphabet rather than trying to escape prose that should not be prose.
+          if [[ -n "$IN_CHART" && ! "$IN_CHART" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            echo "::error::chart_version: unexpected characters."; rc=1
+          fi
+          if [[ -n "$IN_APP" && ! "$IN_APP" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            echo "::error::app_version: unexpected characters."; rc=1
+          fi
+          if [[ -n "$IN_VLLM" && ! "$IN_VLLM" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::vllm_image must be repo:tag."; rc=1
+          fi
+          [[ $rc -eq 0 ]] || exit $rc
+
+          # ver_gt lifted out of update.sh the way tools/test-update-diffs.sh
+          # does it: the comparison that decides whether the fleet moves must be
+          # the fleet's own, not a second copy that can drift from it.
+          eval "$(sed -n '/^ver_gt() {/,/^}/p' update.sh)"
+
+          new_chart="${IN_CHART:-$CUR_CHART}"
+          new_app="${IN_APP:-$CUR_APP}"
+          new_vllm="${IN_VLLM:-$CUR_VLLM}"
+
+          # update.sh:326 — a manifest with no chart_version is discarded whole.
+          if [[ -z "$new_chart" ]]; then
+            echo "::error::chart_version would be empty; every appliance would discard the manifest."
+            rc=1
+          fi
+
+          fwd() {  # fwd LABEL NEW CUR
+            if [[ "$2" == "$3" ]]; then echo "  $1 unchanged ($3)"; return 0; fi
+            if ver_gt "$2" "$3"; then echo "  $1 $3 -> $2"; return 0; fi
+            echo "::error::$1 would go BACKWARDS: $3 -> $2."
+            echo "::error::update.sh only ever offers a strictly-newer channel, so every box would"
+            echo "::error::report the channel BEHIND and never be offered anything again. The fleet"
+            echo "::error::does not break, it STALLS, silently. To ship older content, publish it"
+            echo "::error::under a HIGHER version."
+            rc=1
+          }
+          fwd chart_version "$new_chart" "$CUR_CHART"
+          fwd app_version "$new_app" "$CUR_APP"
+
+          # vllm_image is a TAG, not a version: `cu130-nightly` does not order,
+          # so difference is the only signal. Nothing to compare — but say it out
+          # loud, because a typo here points the whole fleet at an image that
+          # does not exist.
+          if [[ "$new_vllm" != "$CUR_VLLM" ]]; then
+            echo "::notice::vllm_image $CUR_VLLM -> $new_vllm (a tag does not order: this is a roll, not an upgrade)"
+          fi
+
+          if [[ "$new_chart" == "$CUR_CHART" && "$new_app" == "$CUR_APP" && "$new_vllm" == "$CUR_VLLM" ]]; then
+            echo "::notice::no version change — this run RE-SIGNS the current channel against the scripts in this tree."
+          fi
+
+          {
+            echo "new_chart=$new_chart"
+            echo "new_app=$new_app"
+            echo "new_vllm=$new_vllm"
+          } >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: the notes survive the appliance's parser
+        env:
+          IN_NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IN_NOTES:-}" ]]; then
+            echo "notes unchanged (keeping the committed ones)"
+            exit 0
+          fi
+          rc=0
+          # An appliance parses the manifest with sed, not a JSON library:
+          #   json_get() { sed -n 's/.*"KEY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'; }
+          # `[^"]*` stops at the first ESCAPED quote, so a note containing a
+          # double quote is truncated on every box — and the truncated half is
+          # what the admin UI shows as the reason to click Apply.
+          if [[ "$IN_NOTES" == *'"'* ]]; then
+            echo "::error::notes contain a double quote: update.sh would truncate the note there on every appliance."
+            echo "::error::Use single quotes, or none."
+            rc=1
+          fi
+          # Same parser: it does not decode \uXXXX, and json_esc doubles the
+          # backslash on the way into state.json — so a typographic dash reaches
+          # the admin UI as the six characters —.
+          if printf '%s' "$IN_NOTES" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+            echo "::warning::notes contain non-ASCII; the admin UI will show it as a literal \\uXXXX escape. Prefer plain ASCII."
+          fi
+          if [[ "$IN_NOTES" == *$'\n'* ]]; then
+            echo "::warning::notes contain newlines; collapsing to one paragraph (a \\n is shown literally in the UI)."
+          fi
+          exit $rc
+
+      - name: rewrite channel.json
+        env:
+          NEW_CHART: ${{ steps.plan.outputs.new_chart }}
+          NEW_APP: ${{ steps.plan.outputs.new_app }}
+          NEW_VLLM: ${{ steps.plan.outputs.new_vllm }}
+          IN_NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          # python3, not sed and not jq. `notes` is free prose, and on sed's
+          # replacement side &, \1, \ and the delimiter are all syntax — there is
+          # no escaping function you can write in bash that is correct for all of
+          # them. jq would work but reformats on a version bump, in a file whose
+          # EXACT BYTES the signature covers. json.dumps(indent=2,
+          # ensure_ascii=True) reproduces this file byte for byte (checked
+          # against every revision of channel.json in this repo), so a release is
+          # a 1-to-4 line diff and never a whole-file rewrite. The prose reaches
+          # python through the environment, never through a command line.
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          p = pathlib.Path("channel.json")
+          raw = p.read_bytes()
+          doc = json.loads(raw.decode("utf-8"))
+
+          def canon(d):
+              return (json.dumps(d, indent=2, ensure_ascii=True) + "\n").encode()
+
+          # Refuse to be the commit that reformats the manifest: rewriting a
+          # hand-edited shape would produce a diff nobody can review, over bytes
+          # nobody inspected, under a signature that says they did.
+          if canon(doc) != raw:
+              sys.exit("::error::channel.json is not in its canonical 2-space / ASCII-escaped form. "
+                       "Normalise it in a separate, reviewed commit first.")
+
+          for field, var in (("chart_version", "NEW_CHART"),
+                             ("app_version", "NEW_APP"),
+                             ("vllm_image", "NEW_VLLM")):
+              v = os.environ.get(var, "")
+              if v:
+                  doc[field] = v
+
+          notes = os.environ.get("IN_NOTES", "")
+          if notes:
+              # One paragraph: a newline survives json_get as a literal \n and is
+              # re-escaped by json_esc, so the UI would show the two characters.
+              doc["notes"] = re.sub(r"\s*\n\s*", " ", notes).strip()
+
+          p.write_bytes(canon(doc))
+          print("channel.json rewritten")
+          PY
+
+      - name: the fresh-install defaults follow the channel
+        env:
+          NEW_CHART: ${{ steps.plan.outputs.new_chart }}
+          NEW_APP: ${{ steps.plan.outputs.new_app }}
+          NEW_VLLM: ${{ steps.plan.outputs.new_vllm }}
+        run: |
+          set -euo pipefail
+          # channel.json rolls the EXISTING fleet. Three other files decide what
+          # a box installed AFTER the roll lands on, and nothing checks them
+          # against the channel today: lib/config.sh's CHART_VERSION and
+          # VLLM_IMAGE, and values.yaml's four app pins (lib/suite.sh fetches
+          # that file from this repo). Left behind, a fresh box installs the old
+          # chart and is immediately offered the upgrade it should have shipped
+          # with. So they move in the same commit.
+          cfg() { sed -n "s/^$1=\"\\\${$1:-\([^}]*\)}\"/\1/p" lib/config.sh | head -1; }
+          pin_cfg() {  # pin_cfg VAR VALUE
+            local was; was="$(cfg "$1")"
+            [[ "$was" == "$2" ]] && { echo "  lib/config.sh $1 already $2"; return 0; }
+            sed -i -E "s|^($1=\"\\\$\{$1:-)[^}]*(\}\")|\1$2\2|" lib/config.sh
+            [[ "$(cfg "$1")" == "$2" ]] || {
+              echo "::error::could not rewrite $1 in lib/config.sh (is the assignment still \"\${$1:-…}\"?)"
+              return 1
+            }
+            echo "  lib/config.sh $1 $was -> $2"
+            echo "::warning::lib/config.sh $1 is now $2 — the comment above it was NOT updated; re-read it if it justifies the old value."
+          }
+          pin_cfg CHART_VERSION "$NEW_CHART"
+          pin_cfg VLLM_IMAGE "$NEW_VLLM"
+
+          # The same four expressions update.sh applies on the box when it rolls
+          # the app pins (update.sh, "rewriting values.yaml pins").
+          sed -i "s|^  tag: \".*\"|  tag: \"$NEW_APP\"|" values.yaml
+          sed -i "s|\(suite-366-sandbox-api:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
+          sed -i "s|\(suite-366-sandbox-runner:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
+          sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
+
+          rc=0
+          got="$(sed -n 's/^  tag: "\(.*\)"/\1/p' values.yaml | head -1)"
+          [[ "$got" == "$NEW_APP" ]] || { echo "::error::values.yaml image.tag is $got, expected $NEW_APP"; rc=1; }
+          for img in suite-366-sandbox-api suite-366-sandbox-runner suite-366-workbench-runner; do
+            got="$(sed -n "s|.*$img:\([^\"[:space:]]*\).*|\1|p" values.yaml | head -1)"
+            [[ "$got" == "$NEW_APP" ]] || { echo "::error::values.yaml pins $img:$got, expected $NEW_APP"; rc=1; }
+          done
+          echo "  values.yaml app pins -> $NEW_APP"
+          git --no-pager diff --stat -- lib/config.sh values.yaml
+          exit $rc
+
+      - name: every tracked script parses
+        run: |
+          set -euo pipefail
+          # sign-channel.sh bash -n's update.sh and backup.sh before pinning
+          # them; this covers the rest, and turns a die buried in script output
+          # into an annotation.
+          rc=0
+          mapfile -t files < <(git ls-files '*.sh')
+          for f in "${files[@]}"; do
+            bash -n "$f" || { echo "::error::$f does not parse"; rc=1; }
+          done
+          printf 'parsed %d scripts\n' "${#files[@]}"
+          exit $rc
+
+      # The two self-tests that bear directly on a release: test-update-diffs
+      # proves the roll about to be published will actually be offered (and that
+      # a lagging one still will not), test-package-verify covers the refusal
+      # paths that decide whether a box accepts what we are about to sign.
+      - name: the roll-decision self-test passes
+        run: ./tools/test-update-diffs.sh
+
+      - name: the verifier self-test passes
+        run: ./tools/test-package-verify.sh
+
+      - name: CI is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # We are about to sign the update.sh and backup.sh in this tree and
+          # tell every appliance to fetch them and run them as root. Doing that
+          # without the full matrix green on this exact SHA is how a broken
+          # backup agent reaches the fleet with a signature saying it is fine.
+          # (--jq is gh's built-in expression evaluator, not the jq binary.)
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+                    --jq '.check_runs[] | [.name, .status, (.conclusion // "-")] | @tsv' || true)"
+          rc=0
+          if [[ -z "$runs" ]]; then
+            echo "::error::no check run reported on $GITHUB_SHA — refusing to sign a commit CI has not seen."
+            rc=1
+          else
+            while IFS=$'\t' read -r name status concl; do
+              [[ "$name" == "release" ]] && continue
+              case "$status:$concl" in
+                completed:success|completed:neutral|completed:skipped) printf '  ok      %s\n' "$name" ;;
+                completed:*) echo "::error::check '$name' concluded $concl on this commit."; rc=1 ;;
+                *) echo "::error::check '$name' is still $status — wait for CI, then re-run."; rc=1 ;;
+              esac
+            done <<<"$runs"
+          fi
+          if [[ $rc -ne 0 && "$DRY_RUN" == "true" ]]; then
+            echo "::warning::CI is not green on this commit; continuing because this is a dry run."
+            exit 0
+          fi
+          exit $rc
+
+      - name: install the signing key
+        env:
+          # Ed25519 private key, PEM, from tools/gen-package-key.sh. Its public
+          # half is on every appliance as $DATA_DIR/package-release.pub.
+          PACKAGE_PRIVATE_KEY_PEM: ${{ secrets.PACKAGE_PRIVATE_KEY_PEM }}
+          PACKAGE_PUBLIC_KEY_PEM: ${{ vars.PACKAGE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          [[ -n "${PACKAGE_PRIVATE_KEY_PEM:-}" ]] || {
+            echo "::error::secret PACKAGE_PRIVATE_KEY_PEM is not set"
+            exit 1
+          }
+          install -m 0700 -d "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PACKAGE_PRIVATE_KEY_PEM" > "$RUNNER_TEMP/keys/package.key"
+          chmod 0600 "$RUNNER_TEMP/keys/package.key"
+          # Derive the public half NOW, while the key is on disk: no later step
+          # may need the secret again (interpolating it into a later run: would
+          # print it under any shell trace).
+          openssl pkey -in "$RUNNER_TEMP/keys/package.key" -pubout -out "$RUNNER_TEMP/package.pub"
+
+          # Nothing checks that the key in the secret is the key the FLEET
+          # holds. Rotate the secret to a different Ed25519 key and every check
+          # still passes — sign-channel.sh self-verifies against whatever
+          # signed. The first thing to notice would be 100% of appliances
+          # refusing the channel, silently, for a day, on a release reported
+          # green. Compared as DER so PEM wrapping and trailing newlines do not
+          # matter.
+          if [[ -n "${PACKAGE_PUBLIC_KEY_PEM:-}" ]]; then
+            printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/fleet.pub"
+            if ! cmp -s <(openssl pkey -pubin -in "$RUNNER_TEMP/package.pub" -outform DER) \
+                        <(openssl pkey -pubin -in "$RUNNER_TEMP/fleet.pub" -outform DER); then
+              echo "::error::PACKAGE_PRIVATE_KEY_PEM is NOT the key published as vars.PACKAGE_PUBLIC_KEY_PEM."
+              echo "::error::Signing with it would make every appliance holding package-release.pub refuse this channel."
+              exit 1
+            fi
+            echo "the signing key is the key the fleet holds"
+          else
+            echo "::warning::vars.PACKAGE_PUBLIC_KEY_PEM is unset — cannot confirm the secret is the key the fleet holds."
+            echo "::warning::Set it under Settings > Secrets and variables > Actions > Variables; channel-signature.yml needs it too."
+          fi
+
+      - name: sign the channel
+        run: |
+          set -euo pipefail
+          # Re-pins updater_sha256 / backup_sha256 from this tree and mirrors the
+          # three restic pins out of lib/config.sh, THEN signs — which is why
+          # every rewrite above had to happen before this line.
+          PACKAGE_PRIVATE_KEY="$RUNNER_TEMP/keys/package.key" tools/sign-channel.sh
+
+      - name: drop the signing key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/keys/package.key" 2>/dev/null || true
+
+      - name: the signature verifies as an appliance would
+        env:
+          PACKAGE_PUBLIC_KEY_PEM: ${{ vars.PACKAGE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          # Raw detached Ed25519: exactly 64 bytes, no trailing newline. Anything
+          # else means something has touched the bytes the signature covers.
+          sz="$(stat -c %s channel.json.sig)"
+          if [[ "$sz" != 64 ]]; then
+            echo "::error::channel.json.sig is $sz bytes, expected 64."
+            exit 1
+          fi
+          # THE gate: the derived key is the one that just signed, and this is
+          # the same command verify_manifest_signature runs on the box.
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/package.pub" \
+            -sigfile channel.json.sig -in channel.json
+          # The second pass is the weaker one — channel-signature.yml soft-skips
+          # when the variable is unset, so it can never be the only gate — but it
+          # runs the exact command against the exact PEM the appliances hold.
+          if [[ -n "${PACKAGE_PUBLIC_KEY_PEM:-}" ]]; then
+            printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/fleet.pub"
+            openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/fleet.pub" \
+              -sigfile channel.json.sig -in channel.json
+          fi
+
+      - name: channel.json still says what we meant
+        env:
+          NEW_CHART: ${{ steps.plan.outputs.new_chart }}
+          NEW_APP: ${{ steps.plan.outputs.new_app }}
+          NEW_VLLM: ${{ steps.plan.outputs.new_vllm }}
+        run: |
+          set -euo pipefail
+          # sign-channel.sh rewrites fields with a line-oriented sed over the
+          # WHOLE file and reads the result back with `head -1`, so a
+          # field-shaped substring inside `notes` would be rewritten and the
+          # readback would not see it. This is the check that does.
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys
+
+          doc = json.loads(pathlib.Path("channel.json").read_text())
+          bad = []
+          for f, var in (("chart_version", "NEW_CHART"),
+                         ("app_version", "NEW_APP"),
+                         ("vllm_image", "NEW_VLLM")):
+              if doc[f] != os.environ[var]:
+                  bad.append(f"{f} is {doc[f]!r}, we meant {os.environ[var]!r}")
+          for f, path in (("updater_sha256", "update.sh"), ("backup_sha256", "backup.sh")):
+              want = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+              if doc[f] != want:
+                  bad.append(f"{f} is {doc[f]}, sha256({path}) is {want}")
+          if doc["channel"] != "stable":
+              bad.append(f'channel is {doc["channel"]!r}, not "stable"')
+          for k, v in doc.items():
+              if not isinstance(v, str) or not v:
+                  bad.append(f"{k} is empty or not a string")
+          if bad:
+              for b in bad:
+                  print("::error::" + b)
+              sys.exit("::error::channel.json does not match what this run intended.")
+          print("every field is what this run intended")
+          PY
+
+      - name: what the fleet will see
+        env:
+          CUR_CHART: ${{ steps.cur.outputs.chart }}
+          CUR_APP: ${{ steps.cur.outputs.app }}
+          CUR_VLLM: ${{ steps.cur.outputs.vllm }}
+          NEW_CHART: ${{ steps.plan.outputs.new_chart }}
+          NEW_APP: ${{ steps.plan.outputs.new_app }}
+          NEW_VLLM: ${{ steps.plan.outputs.new_vllm }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Channel roll"
+            echo
+            echo "| field | before | after |"
+            echo "|---|---|---|"
+            echo "| chart_version | \`$CUR_CHART\` | \`$NEW_CHART\` |"
+            echo "| app_version | \`$CUR_APP\` | \`$NEW_APP\` |"
+            echo "| vllm_image | \`$CUR_VLLM\` | \`$NEW_VLLM\` |"
+            echo
+            echo "Nothing auto-applies: appliances poll daily and notify."
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo
+              echo "> **DRY RUN** — nothing committed, nothing pushed. The signed pair, the derived"
+              echo "> public key and the diff are attached as an artifact. Check it yourself with:"
+              echo "> \`openssl pkeyutl -verify -rawin -pubin -inkey derived-public-key.pem -sigfile channel.json.sig -in channel.json\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: collect the dry-run artifact
+        if: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/out"
+          cp channel.json channel.json.sig "$RUNNER_TEMP/out/"
+          cp "$RUNNER_TEMP/package.pub" "$RUNNER_TEMP/out/derived-public-key.pem"
+          git --no-pager diff -- channel.json lib/config.sh values.yaml > "$RUNNER_TEMP/out/release.diff"
+          git --no-pager diff --stat > "$RUNNER_TEMP/out/diffstat.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: channel-${{ steps.plan.outputs.new_app }}-dryrun-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 14
+
+      - name: commit the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          CUR_CHART: ${{ steps.cur.outputs.chart }}
+          CUR_APP: ${{ steps.cur.outputs.app }}
+          CUR_VLLM: ${{ steps.cur.outputs.vllm }}
+          NEW_CHART: ${{ steps.plan.outputs.new_chart }}
+          NEW_APP: ${{ steps.plan.outputs.new_app }}
+          NEW_VLLM: ${{ steps.plan.outputs.new_vllm }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # ONE commit. raw.githubusercontent serves channel.json and
+          # channel.json.sig from independent cache entries: published a commit
+          # apart, there is a window where a box fetches the new manifest with
+          # the old signature, refuses the channel and waits a day.
+          git add channel.json channel.json.sig lib/config.sh values.yaml
+
+          # The signature is 64 raw bytes with no trailing newline, and this repo
+          # has no .gitattributes. Check the INDEX, not the worktree: if anything
+          # ever adds `* text=auto`, git would translate the blob on the way in
+          # and the committed signature would stop verifying while the local copy
+          # still did.
+          sz="$(git cat-file -s ':channel.json.sig')"
+          if [[ "$sz" != 64 ]]; then
+            echo "::error::channel.json.sig is $sz bytes in the index, expected 64 — something is translating it."
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "::error::nothing to commit — channel.json and its signature are unchanged."
+            exit 1
+          fi
+
+          if [[ "$NEW_APP" == "$CUR_APP" && "$NEW_CHART" == "$CUR_CHART" && "$NEW_VLLM" == "$CUR_VLLM" ]]; then
+            subject="chore(channel): re-sign the stable channel against this tree"
+          else
+            subject="chore(channel): roll the stable channel to app $NEW_APP + chart $NEW_CHART"
+          fi
+          body="$(printf '%s\n' \
+            "chart_version : $CUR_CHART -> $NEW_CHART" \
+            "app_version   : $CUR_APP -> $NEW_APP" \
+            "vllm_image    : $CUR_VLLM -> $NEW_VLLM" \
+            "" \
+            "lib/config.sh (CHART_VERSION, VLLM_IMAGE) and values.yaml's four app pins move" \
+            "with the channel so a box installed after this roll does not land on the" \
+            "previous version and get offered this one on its first poll." \
+            "" \
+            "updater_sha256, backup_sha256 and the three restic pins are recomputed from" \
+            "this tree by tools/sign-channel.sh; channel.json.sig verifies against the key" \
+            "published as vars.PACKAGE_PUBLIC_KEY_PEM. Nothing auto-applies: appliances" \
+            "poll daily and notify." \
+            "" \
+            "Published by .github/workflows/release-channel.yml, run $GITHUB_RUN_ID.")"
+          git commit -m "$subject" -m "$body"
+          git --no-pager log -1 --stat
+
+      - name: push to the default branch
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # The concurrency group serialises this workflow against itself, but a
+          # human merging a PR in the same minute is not in that group. Check,
+          # never --force.
+          git fetch origin "$GITHUB_REF_NAME"
+          if ! git merge-base --is-ancestor "origin/$GITHUB_REF_NAME" HEAD; then
+            echo "::error::$GITHUB_REF_NAME moved while this release was building. Re-run on the new tip."
+            exit 1
+          fi
+          if ! git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"; then
+            echo "::error::push refused. If $GITHUB_REF_NAME is branch-protected, GITHUB_TOKEN cannot push to it;"
+            echo "::error::push the commit from a branch and merge it by hand, or grant the workflow a token that can."
+            exit 1
+          fi
+          echo "::warning::a push made with GITHUB_TOKEN triggers no workflow, so ci.yml and channel-signature.yml will not run on the release commit. The equivalent checks ran in this job, against the key derived from the secret."
+
+      - name: the published pair verifies over the CDN
+        if: ${{ !inputs.dry_run }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          url="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/channel.json"
+          # raw.githubusercontent caches for a few minutes and serves the
+          # manifest and its signature from independent entries, so the pair can
+          # be briefly inconsistent. A box that hits that window refuses and
+          # retries tomorrow — fail-closed, not a release defect. So this warns,
+          # it does not gate. What it catches is the non-transient case.
+          for i in $(seq 1 10); do
+            if curl -fsSL -m 20 -H 'Cache-Control: no-cache' "$url" -o "$RUNNER_TEMP/c.json" \
+            && curl -fsSL -m 20 -H 'Cache-Control: no-cache' "$url.sig" -o "$RUNNER_TEMP/c.sig" \
+            && cmp -s "$RUNNER_TEMP/c.json" channel.json \
+            && openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/package.pub" \
+                 -sigfile "$RUNNER_TEMP/c.sig" -in "$RUNNER_TEMP/c.json" >/dev/null 2>&1; then
+              printf 'the published pair verifies over the CDN (after %ds)\n' "$(( (i - 1) * 30 ))"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::warning::five minutes after the push, raw.githubusercontent is still serving an old or mismatched pair. Re-check by hand:"
+          echo "::warning::  curl -fsSL $url -o /tmp/c.json; curl -fsSL $url.sig -o /tmp/c.sig"
+          echo "::warning::  openssl pkeyutl -verify -rawin -pubin -inkey package-release.pub -sigfile /tmp/c.sig -in /tmp/c.json"
