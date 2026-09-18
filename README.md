@@ -100,7 +100,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
-| `LLM_MODEL` | `nvidia/Gemma-4-26B-A4B-NVFP4` | generative model (HF id) |
+| `LLM_MODEL` | `nvidia/Qwen3.8-27B-NVFP4` | generative model (HF id) |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
 | `VLLM_IMAGE` | `vllm/vllm-openai:cu130-nightly` | vLLM image arm64/sm_121 (Docker Hub, no NGC login) |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
@@ -312,53 +312,61 @@ plumbing, not the AI path.
 ## Measured GB10 realities (read before tuning)
 
 Validated on Spark `aarch64 / GB10 / DGX OS 6.17 / 121 GiB unified`,
-Gemma-4-26B-A4B-NVFP4 under `vllm/vllm-openai:cu130-nightly` (vLLM 0.19.2rc1):
+nvidia/Qwen3.8-Flash-Next-NVFP4 under `vllm/vllm-openai:v0.29.0` plus the patch
+set in `llm/flash-next/` (2026-09-17/18).
 
-**Unified memory budget.** `gpu_memory_utilization` is NOT pre-allocated in
-VRAM (there is no VRAM on GB10) - vLLM uses it to compute the KV cache size
-after weights are loaded. With the defaults:
-- LLM `0.55` → weights 17.97 GiB + workspace + cudagraphs + **KV cache = 402,416 tokens** (fp8).
-- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → weights 15.5 GiB + KV 4 GiB
-  (29k tokens, 3.5 concurrent 8k requests) + graphs ≈ **20 GiB**. With the
-  fraction alone (the old 0.30) vLLM filled the whole share with KV cache:
-  18.75 GiB for chunk embedding, ~36 GiB per container. The explicit byte
-  budget skips the profiler, whose result on a unified pool depends on what
-  else is resident at start-up (that is why 0.25 used to fail cold).
-- Sum `0.75` → ~34 GiB of OS headroom on 121 GiB. The previous 0.85 left 12 GiB
-  and 10 GiB of swap in use at idle.
+**It does not fit as published.** The checkpoint is 123.5 GiB (experts 65.6 GiB
+in NVFP4, a 51B-parameter n-gram embedding table 47.7 GiB in FP8, attention /
+GDN / vision / MTP 10.2 GiB in BF16) for 121.6 GiB of RAM. vLLM's own
+`VLLM_PLE_CPU_OFFLOAD` moves the table to "host memory", which on a unified pool
+is the same memory. The appliance instead serves the table from the NVMe through
+`mmap` (a token reads 16 rows of it): **77.1 GiB of weights resident**, the rest
+of the pool for KV cache. That is a community patch set laid over the official
+image, vendored and documented in `llm/flash-next/README.md`.
 
-**Prefill rate (the real GB10 bottleneck).** ~Quadratic scaling on long contexts:
+**Unified memory budget** with the defaults, both models up:
+- LLM `0.71` → 77.1 GiB of weights + CUDA graphs + **KV cache 4-7 GiB** (bf16,
+  ~30 KiB/token): 1-2 requests of 131,072 tokens, or several shorter ones. 0.73
+  passed one day and failed vLLM's start-up free-memory check the next (the
+  host had grown 2 GiB); 0.70 could not seat a single 262k request.
+- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → ≈ **20 GiB** (weights 15.5, KV
+  4, graphs). Without the cap the embed took 36 GiB and Flash-Next did not fit
+  at all.
+- The box then runs at **117/121 GiB used with 7-10 GiB of swap in use**, and
+  `vmstat` shows pages read back from swap during every generation. The
+  installer sets `vm.swappiness=10`. This is a working configuration with no
+  headroom: a smaller embedding model (a 2B one, at the cost of re-indexing
+  every document in its dimension) or a second Spark is what turns it into a
+  comfortable one.
 
-| Input tokens | Cold prefill |
-|---|---|
-| 8.7k | 3.3s (2656 t/s) |
-| 26k | 13s |
-| 53k | 34s |
-| 106k | 124s |
-| 200k | **565s (≈9m30)** |
+**Kernels.** Native paths on sm_121: W4A4 NVFP4 experts through FlashInfer
+CUTLASS, FLASHINFER attention on the 12 full-attention layers, CUDA
+Gated-DeltaNet decode on the 36 linear-attention layers, Qwen Sparse Attention
+with the deterministic top-k kernel. fp8 KV cache is not available on the
+v0.29 base of the patch set (bf16 it is; fp8 would double the pool).
 
-This curve is due to the combination of Marlin weight-only FP4 (the only
-functional NVFP4 backend on sm_121 in vLLM 0.19) + the `TRITON_ATTN` attention
-backend (forced by Gemma 4's heterogeneous heads: `head_dim=256/512`). Native
-FP4 paths and `FLASH_ATTN` are not available today for this model on this
-platform.
+**Decode.** 6B active parameters make it the fastest of the three models tried
+on this box despite the swap: **26.7 t/s on French prose, 34.9 t/s on code**
+(MTP k=2, 61-74 % acceptance; 27B dense: 19.4 / 28.2; Gemma 4 MoE: 28-30).
+Random-token benchmarks read lower (17.7 t/s at 2k/200) because random n-grams
+defeat both the drafter and the page cache.
 
-**Concurrency and preemption.** At `max_num_seqs=2 + max_model_len=262144`,
-worst-case KV demand (`2×262144 = 524,288`) exceeds budget (`402,416`), but on
-2 cold concurrent 200k prompts measured: `Running: 2, Waiting: 0`, **no
-preemption**, KV usage < 6%. The practical bottleneck is prefill compute, not
-memory - `max_num_seqs > 2` brings nothing (the 2nd request slows down the 1st
-via chunked_prefill).
+**Prefill depends on the n-gram table's page-cache locality.** Repetitive text:
+68,834 tokens in 33 s (~2,060 t/s). Random tokens: 2k in 1.7 s, 16k in 11.7 s
+(27B: 0.85 s / 8.2 s). Real documents sit in between; a cold region of the table
+costs NVMe reads.
 
-**Critical prefix caching.** Observed hit rate 44-56% even on synthetic prompts
-with different seeds (shared French vocab). In production with a stable system
-prompt + RAG over fixed docs, expect 80%+. By far the best acceleration lever
-on this hardware.
+**Start-up.** 9 min 15 to load 77 GiB of weights with the plain safetensors
+loader (the mmap patch hooks that loader to drop the table shards, so
+fastsafetensors is not used here). torch.compile ~20 s and CUDA graphs ~7 s,
+both persisted under `$CACHE_DIR`. First boot adds the 133 GB download
+(~25 min); the container healthcheck allows 40 min.
 
-**First vLLM boot.** ~5 min cold (Inductor compile + cudagraph capture), ~3
-min on subsequent boots (compile cache at `~/.cache/vllm/torch_compile_cache`).
-Qwen3-VL-Embedding-8B weights download (15.5 GiB BF16) adds ~5-10 min on a
-fresh install.
+**Context.** `--max-model-len 131072`, the app's own cap. The native window is
+262,144 and the recipe reaches 1M with YaRN, but on one Spark next to the embed
+there is no KV for it: 262k needs 7.4 GiB for one request. For long-context
+work the 27B (PR #34) holds 819k tokens of fp8 KV at 0.45 — six 128k requests,
+or one 800k with YaRN.
 
 ## Wiring the AI (automatic)
 
@@ -368,20 +376,26 @@ is **wired automatically** through the chart values:
 ```yaml
 config:
   VLLM_BASE_URL:            http://<HOST_IP>:8000/v1   # nginx proxy
-  VLLM_MODEL_HIGH:          nvidia/Gemma-4-26B-A4B-NVFP4
-  VLLM_MODEL_LIGHT:         nvidia/Gemma-4-26B-A4B-NVFP4
-  VLLM_MODEL_VISION:        nvidia/Gemma-4-26B-A4B-NVFP4
+  VLLM_MODEL_HIGH:          nvidia/Qwen3.8-Flash-Next-NVFP4
+  VLLM_MODEL_LIGHT:         nvidia/Qwen3.8-Flash-Next-NVFP4
+  VLLM_MODEL_VISION:        nvidia/Qwen3.8-Flash-Next-NVFP4
   VLLM_MODEL_EMBEDDING:     Qwen/Qwen3-VL-Embedding-8B
   VLLM_EMBEDDING_DIMENSIONS: "4096"
-  VLLM_MAX_CONTEXT_WINDOW:   "200000"
+  VLLM_MAX_CONTEXT_WINDOW:   "131072"
 secrets:
   VLLM_API_KEY:             <random, generated by install.sh>
 ```
 
 When `VLLM_BASE_URL` is set, `chooseDefaultModel(role)` picks the local vLLM
 over Anthropic/OpenAI for every role (precedence `vllm → anthropic → openai`).
-Embedding and vision skip Anthropic; vision uses `VLLM_MODEL_VISION` (Gemma 4
-is multimodal).
+Embedding and vision skip Anthropic; vision uses `VLLM_MODEL_VISION`
+(Qwen3.8-Flash-Next is a native vision-language model; the NVFP4 build keeps
+its vision tower in BF16).
+
+The app seeds the model ids into Postgres when an organisation is created
+(`AIProvider` + `AIModel` rows) and agents store the id again in `Agent.model`.
+Changing `LLM_MODEL` on an installed box therefore also means updating those
+rows — the env vars only drive new organisations and the env fallback.
 
 ### Why an nginx proxy
 
@@ -409,7 +423,7 @@ to register a per-organization provider in the admin UI:
 
 | Provider (CUSTOM, OpenAI-compatible) | Base URL | Model | Key |
 |---|---|---|---|
-| Chat / vision (direct) | `http://<HOST_IP>:8001/v1` | `nvidia/Gemma-4-26B-A4B-NVFP4` | vLLM key shown |
+| Chat / vision (direct) | `http://<HOST_IP>:8001/v1` | `nvidia/Qwen3.8-Flash-Next-NVFP4` | vLLM key shown |
 | Embeddings (direct) | `http://<HOST_IP>:8002/v1` | `Qwen/Qwen3-VL-Embedding-8B` | vLLM key shown |
 | Unified (nginx)      | `http://<HOST_IP>:8000/v1` | either of the above | vLLM key shown |
 
@@ -478,7 +492,7 @@ channel.json                          fleet release manifest (chart_version / ap
 channel.json.sig                      Ed25519 signature over channel.json — required by any appliance holding the public key
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
-llm/tool_chat_template_gemma4.jinja   chat template required by --tool-call-parser=gemma4
+llm/flash-next/                       the vLLM patch set + entrypoint that make Qwen3.8-Flash-Next fit on one Spark (built on the box)
 llm/nginx.conf                        URL-path router unifying both vLLM behind a single endpoint
 tls/local-ca-issuer.yaml              local self-signed CA (cert-manager)
 dns/avahi-aliases.service             systemd unit publishing mDNS names

@@ -4,25 +4,70 @@
 # Docker host, wired to the Blackwell GPU and managed by a systemd unit.
 # =============================================================================
 
+# --- Flash-Next: the patched vLLM image, built on the box ---------------------
+# Qwen3.8-Flash-Next only fits on one Spark with its 47.7 GiB n-gram table served
+# from the NVMe by mmap — a vLLM patch set (llm/flash-next/, vendored from
+# blazux/qwen3.8-Flash-DGX) laid over the official v0.29.0 image. No registry
+# holds that image: it is built here, once per (base image, patch commit) tag.
+FLASH_NEXT_FILES=(Dockerfile UPSTREAM_COMMIT serve-flash-next.sh
+  src/vllm_ple_mmap.py src/patch_mamba_block_size.py src/patch_qsa_exact_topk.py
+  src/vllm_fp8_hybrid_modelopt.py src/patch_mtp_draft_vocab.py src/draft_vocab_65536.npy
+  src/patch_block_fp8_mtp.py src/patches/qwen-tool-preamble.patch)
+
+fetch_flash_next_files() {
+  local ctx="$DATA_DIR/llm/flash-next" f
+  mkdir -p "$ctx/src/patches"
+  for f in "${FLASH_NEXT_FILES[@]}"; do fetch "llm/flash-next/$f" > "$ctx/$f"; done
+  chmod 755 "$ctx/serve-flash-next.sh"
+}
+
+build_flash_next_image() {
+  local ctx="$DATA_DIR/llm/flash-next"
+  if docker image inspect "$VLLM_LLM_IMAGE" >/dev/null 2>&1; then
+    info "vLLM image $VLLM_LLM_IMAGE already built."
+    return 0
+  fi
+  log "Building $VLLM_LLM_IMAGE ($VLLM_IMAGE + the Flash-Next patch set, ~3 min)"
+  docker pull -q "$VLLM_IMAGE" >/dev/null
+  # stdout (the image id) is noise; stderr is where a failing step explains itself.
+  docker build -q -t "$VLLM_LLM_IMAGE" "$ctx" >/dev/null \
+    || die "docker build of $VLLM_LLM_IMAGE failed — see llm/flash-next/README.md"
+}
+
+# With Flash-Next up the box has no memory headroom (117/121 GiB used) and
+# 7-10 GiB of swap in use; at the default swappiness of 60 pages were read back
+# from swap during every generation. 10 is what the recipe measured for it.
+set_vllm_sysctl() {
+  printf 'vm.swappiness = 10\n' > /etc/sysctl.d/90-suite366-vllm.conf
+  sysctl -q -w vm.swappiness=10 >/dev/null 2>&1 || true
+}
+
 # --- 2. vLLM stack (Docker host) --------------------------------------------
 deploy_vllm() {
   log "vLLM ×2 + nginx proxy (Docker host, Blackwell GPU)"
-  mkdir -p "$MODELS_DIR" "$DATA_DIR/llm"
+  # $CACHE_DIR holds the JIT state the compose mounts into both vLLM containers
+  # (torch.compile artifacts, FlashInfer autotune + JIT cubins, Triton
+  # kernels). It is what turns a 257 s restart into a 96 s one; safe to wipe.
+  mkdir -p "$MODELS_DIR" "$DATA_DIR/llm" "$CACHE_DIR/vllm" "$CACHE_DIR/flashinfer" "$CACHE_DIR/triton"
   fetch "llm/docker-compose.yml"                > "$DATA_DIR/llm/docker-compose.yml"
-  # The Gemma 4 chat template is volume-mounted in the compose. Without this
-  # file next to it, --chat-template crashes at boot.
-  fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
   # nginx proxy config (static URL-path routing, no templating needed).
   fetch "llm/nginx.conf"                        > "$DATA_DIR/llm/nginx.conf"
+  # The generative container is Flash-Next specific: patched image + entrypoint
+  # (llm/flash-next/README.md), and a host swappiness measured for it.
+  fetch_flash_next_files
+  build_flash_next_image
+  set_vllm_sysctl
   local env_file="$DATA_DIR/llm/.env" env_old=""
   [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"
   local env_new
   env_new="$(cat <<EOF
 VLLM_IMAGE=$VLLM_IMAGE
+VLLM_LLM_IMAGE=$VLLM_LLM_IMAGE
 PROXY_IMAGE=$PROXY_IMAGE
 HF_TOKEN=${HF_TOKEN:-}
 VLLM_API_KEY=$VLLM_API_KEY
 MODELS_DIR=$MODELS_DIR
+CACHE_DIR=$CACHE_DIR
 BIND_IP=$SUITE_IP
 LLM_MODEL=$LLM_MODEL
 EMBED_MODEL=$EMBED_MODEL
@@ -82,7 +127,7 @@ EOF
   else
     info "vLLM config unchanged — leaving the running stack in place."
   fi
-  info "Downloading + loading models (may take several minutes)…"
+  info "Downloading + loading models (first boot: ~133 GB for Flash-Next, 25 min; then ~10 min to load)…"
   # Health-check on the stable internal IP: local, always reachable, offline-safe.
   if wait_http "http://$SUITE_IP:$LLM_PORT/health" "vLLM generative"; then
     warmup_chat "http://$SUITE_IP:$LLM_PORT" "$LLM_MODEL"
