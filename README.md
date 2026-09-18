@@ -318,11 +318,14 @@ Gemma-4-26B-A4B-NVFP4 under `vllm/vllm-openai:cu130-nightly` (vLLM 0.19.2rc1):
 VRAM (there is no VRAM on GB10) - vLLM uses it to compute the KV cache size
 after weights are loaded. With the defaults:
 - LLM `0.55` → weights 17.97 GiB + workspace + cudagraphs + **KV cache = 402,416 tokens** (fp8).
-- EMBED `0.30` → ~36 GiB raw budget, but ~14 GiB perceived as "workspace" (the
-  shared unified pool makes vLLM see the LLM's memory as workspace) →
-  effective KV cache ~4 GiB for `max_model_len=8192`. **0.25 fails cold**, 0.20
-  yields negative KV cache.
-- Sum `0.85` → ~18 GiB of OS headroom on 121 GiB (`free -h` ≈ 110/121 used idle).
+- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → weights 15.5 GiB + KV 4 GiB
+  (29k tokens, 3.5 concurrent 8k requests) + graphs ≈ **20 GiB**. With the
+  fraction alone (the old 0.30) vLLM filled the whole share with KV cache:
+  18.75 GiB for chunk embedding, ~36 GiB per container. The explicit byte
+  budget skips the profiler, whose result on a unified pool depends on what
+  else is resident at start-up (that is why 0.25 used to fail cold).
+- Sum `0.75` → ~34 GiB of OS headroom on 121 GiB. The previous 0.85 left 12 GiB
+  and 10 GiB of swap in use at idle.
 
 **Prefill rate (the real GB10 bottleneck).** ~Quadratic scaling on long contexts:
 
