@@ -179,10 +179,15 @@ remove_systemd_units() {
 remove_vllm_stack() {
   have docker || { info "Docker not present — skipping vLLM teardown."; return 0; }
   log "vLLM Docker stack"
+  # install.sh (lib/vllm.sh) lowers vm.swappiness for the Flash-Next engine.
+  rm -f /etc/sysctl.d/90-suite366-vllm.conf
   local compose="$DATA_DIR/llm/docker-compose.yml"
   if [[ -f "$compose" ]]; then
     ( cd "$DATA_DIR/llm" && docker compose down --remove-orphans >/dev/null 2>&1 ) \
       && info "docker compose down" || true
+    # The Flash-Next vLLM image is built on the box (no registry copy): drop it.
+    docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^suite366/vllm-flash-next:' \
+      | xargs -r docker image rm >/dev/null 2>&1 || true
   fi
   # Hard fallback by container name (idempotent — silent if already gone).
   docker rm -f suite366-vllm-llm suite366-vllm-embed suite366-vllm-proxy >/dev/null 2>&1 || true
