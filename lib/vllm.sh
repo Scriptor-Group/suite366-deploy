@@ -7,11 +7,11 @@
 # --- 2. vLLM stack (Docker host) --------------------------------------------
 deploy_vllm() {
   log "vLLM ×2 + nginx proxy (Docker host, Blackwell GPU)"
-  mkdir -p "$MODELS_DIR" "$DATA_DIR/llm"
+  # $CACHE_DIR holds the JIT state the compose mounts into both vLLM containers
+  # (torch.compile artifacts, FlashInfer autotune + JIT cubins, Triton
+  # kernels). It is what turns a 257 s restart into a 96 s one; safe to wipe.
+  mkdir -p "$MODELS_DIR" "$DATA_DIR/llm" "$CACHE_DIR/vllm" "$CACHE_DIR/flashinfer" "$CACHE_DIR/triton"
   fetch "llm/docker-compose.yml"                > "$DATA_DIR/llm/docker-compose.yml"
-  # The Gemma 4 chat template is volume-mounted in the compose. Without this
-  # file next to it, --chat-template crashes at boot.
-  fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
   # nginx proxy config (static URL-path routing, no templating needed).
   fetch "llm/nginx.conf"                        > "$DATA_DIR/llm/nginx.conf"
   local env_file="$DATA_DIR/llm/.env" env_old=""
@@ -23,6 +23,7 @@ PROXY_IMAGE=$PROXY_IMAGE
 HF_TOKEN=${HF_TOKEN:-}
 VLLM_API_KEY=$VLLM_API_KEY
 MODELS_DIR=$MODELS_DIR
+CACHE_DIR=$CACHE_DIR
 BIND_IP=$SUITE_IP
 LLM_MODEL=$LLM_MODEL
 EMBED_MODEL=$EMBED_MODEL

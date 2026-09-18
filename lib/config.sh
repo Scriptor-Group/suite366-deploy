@@ -144,14 +144,22 @@ NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
 
-LLM_MODEL="${LLM_MODEL:-nvidia/Gemma-4-26B-A4B-NVFP4}"
+# Generative model: NVIDIA's own ModelOpt quantisation of Qwen3.8-27B — MLP and
+# lm_head in NVFP4, attention and Gated-DeltaNet projections in FP8, vision
+# tower and MTP draft head in BF16 (21.9 GB). It is the checkpoint the vLLM
+# recipe lists as verified on dgx_spark_gb10, and its measured accuracy is
+# within a point of BF16 on the card's six benchmarks.
+LLM_MODEL="${LLM_MODEL:-nvidia/Qwen3.8-27B-NVFP4}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # vLLM image: MUST be arm64 + validated for Blackwell GB10/sm_121. Default is
-# the official Docker Hub image `vllm/vllm-openai:cu130-nightly` (cu13 + arm64
-# multi-arch, validated on DGX Spark — no `docker login` required). Alternative
-# if you want the NGC NVIDIA build, override with
-# VLLM_IMAGE=nvcr.io/nvidia/vllm:25.11-py3 (requires `docker login nvcr.io`).
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}"
+# the official Docker Hub RELEASE `vllm/vllm-openai:v0.29.0` (CUDA 13.0.2,
+# multi-arch, no `docker login`). A tagged release rather than a nightly: the
+# old `cu130-nightly` tag silently stopped moving on 2026-04-23 (vLLM 0.19,
+# Marlin weight-only FP4), while v0.29.0 selects the native W4A4 CUTLASS
+# NVFP4 kernel on sm_121 and carries the Gated-DeltaNet speculative fixes
+# (vllm#51812, #51674) the Qwen3.8 MTP head needs. Alternative if you want the
+# NGC build, override with VLLM_IMAGE=nvcr.io/nvidia/vllm:<tag> (docker login).
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
 # Tiny URL-path proxy unifying the two vLLM instances behind a single
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,
@@ -189,9 +197,11 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 # cache): we bound each one (sum < 1.0, headroom kept). The generative is
 # prioritized; embeddings get a smaller share.
 #
-# Values validated on Spark (fresh install test):
-#   LLM 0.55 -> KV cache = 402,416 tokens (fp8) -> fits max_model_len=262144 ×
-#     max_num_seqs=2 without preemption (measured, 0% swap).
+# Values validated on Spark (Qwen3.8-27B-NVFP4, vLLM v0.29.0, 2026-09-17):
+#   LLM 0.45 -> weights 20.8 GiB + KV cache = 818,650 tokens (fp8) = 3.1× a
+#     full 262,144-token request. Only 16 of the 64 layers carry a KV cache
+#     (the other 48 are linear attention with a fixed-size state), which is
+#     why a DENSE 27B needs a smaller share than the Gemma 4 MoE did (0.55).
 #   EMBED 0.20 + an explicit 4 GiB KV budget in the compose
 #     (--kv-cache-memory-bytes). The fraction alone was the wrong tool: at 0.30
 #     vLLM filled the whole share with KV cache (18.75 GiB, 136k tokens) for a
@@ -199,12 +209,13 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 #     profiler's result depends on whatever else sits in the unified pool at
 #     start-up. With the byte budget the profiler is skipped and the fraction
 #     only has to clear the start-up free-memory check. Measured: ~20 GiB.
-#   Sum 0.75 -> ~34 GiB of OS headroom on 121 GiB. The previous 0.85 left
-#     12 GiB and the box sat 10 GiB into swap at idle.
+#   Sum 0.65 -> ~45 GiB of OS headroom on 121 GiB (`free -h` ≈ 76/121 GiB
+#     used with both models warm). The previous 0.85 left 12 GiB and the box
+#     sat 10 GiB into swap at idle.
 #   max_num_seqs=2: above that, chunked_prefill collapses gen throughput
 #     (the bottleneck is GB10's prefill compute, not memory). 4 = no
 #     measurable improvement, just more OS pressure.
-LLM_GPU_MEM_UTIL="${LLM_GPU_MEM_UTIL:-0.55}"
+LLM_GPU_MEM_UTIL="${LLM_GPU_MEM_UTIL:-0.45}"
 EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.20}"
 LLM_MAX_NUM_SEQS="${LLM_MAX_NUM_SEQS:-2}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-262144}"
@@ -253,6 +264,9 @@ RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
 # 1 = do not install the backup layer at all.
 SKIP_BACKUP="${SKIP_BACKUP:-0}"
 MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
+# JIT caches mounted into the vLLM containers (torch.compile, FlashInfer,
+# Triton) — see llm/docker-compose.yml. Disposable; rebuilt in ~3 min if lost.
+CACHE_DIR="${CACHE_DIR:-$DATA_DIR/cache}"
 # Ed25519 PUBLIC key that signs OFFLINE update packages (built by
 # tools/build-offline-package.sh). Path to a PEM file — when the file is
 # ABSENT, `update.sh scan-usb` refuses every package, which is the correct

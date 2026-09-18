@@ -49,15 +49,15 @@
 #                              drive-app so it trusts OnlyOffice server-side
 #   ADMIN_EMAIL                default: admin@<DOMAIN>
 #   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve (defaults validated
-#                              on Spark: Gemma-4-26B-A4B-NVFP4 + Qwen3-VL-Embedding-8B)
+#                              on Spark: nvidia/Qwen3.8-27B-NVFP4 + Qwen3-VL-Embedding-8B)
 #   VLLM_IMAGE                 vLLM image arm64/Blackwell sm_121 (default
-#                              vllm/vllm-openai:cu130-nightly, see README)
+#                              vllm/vllm-openai:v0.29.0, see README)
 #   PROXY_IMAGE                URL-path proxy image (default nginx:alpine) —
 #                              unifies the 2 vLLM instances behind a single
 #                              OpenAI-compatible endpoint, wired into the
 #                              Suite 366 chart.
 #   LLM_GPU_MEM_UTIL,          fractions of the 121 GiB unified pool allocated
-#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0; defaults 0.55 / 0.20)
+#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0; defaults 0.45 / 0.20)
 #   LLM_MAX_NUM_SEQS,          generative tuning (defaults 2 / 262144 — covers
 #   LLM_MAX_MODEL_LEN          100% of prod traffic up to 256k tokens)
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
