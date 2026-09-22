@@ -2,11 +2,11 @@
   "channel": "stable",
   "chart_version": "0.10.0",
   "app_version": "1.11.7",
-  "vllm_image": "vllm/vllm-openai:cu130-nightly",
+  "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "9d3e876b439c6f1e1d92431a64c571a03790ad2922bcd70714eff70d470c28f3",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "app 1.11.3 -> 1.11.7, chart 0.10.0 unchanged. App: an org admin can now pick the appliance generative model from the settings, and the app seeds and reconciles a transcription model row (AIModel with supportsTranscription) as the org default, while never offering or picking a transcription row as a chat model. Deploy: the qwen27b profile serves Qwen3-ASR-1.7B on a third vLLM behind the same proxy (/v1/audio/* to vllm-stt, about 10 GiB resident), compose and STT_PORT default sanely on a .env written before transcription existed, and switch-model.sh keeps the generative rename off the transcription row. A profile with no transcription leaves VLLM_MODEL_TRANSCRIPTION empty and the app says no transcription model is configured instead of calling a route nothing serves."
+  "notes": "app 1.11.3 -> 1.11.7, chart 0.10.0 unchanged, vLLM image cu130-nightly -> v0.29.0. App: an org admin can now pick the appliance generative model from the settings, and the app seeds and reconciles a transcription model row (AIModel with supportsTranscription) as the org default, while never offering or picking a transcription row as a chat model. Deploy: the qwen27b profile serves Qwen3-ASR-1.7B on a third vLLM behind the same proxy (/v1/audio/* to vllm-stt, about 10 GiB resident), compose and STT_PORT default sanely on a .env written before transcription existed, and switch-model.sh keeps the generative rename off the transcription row. The vLLM image moves to the v0.29.0 release: the cu130-nightly tag stopped moving on 2026-04-23 (vLLM 0.19, Marlin weight-only FP4) while v0.29.0 selects the native NVFP4 kernel on sm_121 that the default qwen27b profile needs, and lib/config.sh has defaulted to it since the profiles landed. A box already running v0.29.0 sees no change; on a box still on the nightly, update.sh rewrites VLLM_IMAGE in llm/.env and the containers take it at their next restart. A profile with no transcription leaves VLLM_MODEL_TRANSCRIPTION empty and the app says no transcription model is configured instead of calling a route nothing serves."
 }

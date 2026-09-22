@@ -168,7 +168,7 @@ EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # NVFP4 kernel on sm_121 and carries the Gated-DeltaNet speculative fixes
 # (vllm#51812, #51674) the Qwen3.8 MTP head needs. This is the EMBED's image
 # and the base of the Flash-Next build; the gemma profile pins its own.
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}"
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
 # Flash-Next runs VLLM_IMAGE plus the patch set in llm/flash-next/ (vendored
 # from blazux/qwen3.8-Flash-DGX at the commit below). lib/vllm.sh builds it on
 # the box — no registry holds it — under a tag that names both inputs, so a new
