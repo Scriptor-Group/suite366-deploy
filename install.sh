@@ -56,6 +56,11 @@
 #   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve. LLM_MODEL defaults to
 #                              whatever LLM_PROFILE names; EMBED_MODEL defaults to
 #                              Qwen3-VL-Embedding-8B and is the same for all three.
+#   LLM_STT_MODEL              transcription model served by a third vLLM on
+#                              /v1/audio/transcriptions. Defaults to what the
+#                              profile allows (Qwen3-ASR-1.7B with qwen27b, none
+#                              with the other two); LLM_STT_MODEL= (empty)
+#                              turns it off.
 #   VLLM_IMAGE                 vLLM image arm64/Blackwell sm_121 (default
 #                              vllm/vllm-openai:v0.29.0, see README): the embed
 #                              runs it and the Flash-Next image is built on it.

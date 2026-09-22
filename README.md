@@ -328,6 +328,7 @@ measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
 | Prefill 69k tokens | 49 s | 33 s | 65 s at 62k |
 | Swap in use, idle | 0 | 7-10 GiB | 10 GiB |
 | vLLM | official v0.29.0 | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
+| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | none (no room) | none (not measured yet) |
 
 **`qwen27b` is the default** because it is the only one that leaves the box real
 headroom: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a full
@@ -367,6 +368,35 @@ and the `AIModel` / `Agent` rows in Postgres that every LLM call actually
 resolves. Miss the third and every call 404s while `docker ps` says healthy and
 every pod is `Running` — the same silent shape as the API-key drift in
 `lib/vllm-db.sh`.
+
+### Transcription
+
+A profile that leaves the memory for it also serves a **speech-to-text model**,
+in a third vLLM container (`suite366-vllm-stt`) behind the same proxy: the app's
+dictation, voice reports and meeting notes already speak the OpenAI
+`/v1/audio/transcriptions` route and only need a model to be named. Today that
+is `qwen27b` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
+automatically, 4.75 % WER on FLEURS French against 6.31 for Whisper-large-v3,
+and it takes the vocabulary hint the app sends with every window. Audio longer
+than 30 s is split by vLLM at the quietest point of each window, so a 5 min
+dictation is ten requests, not one. Measured on the test Spark: weights loaded
+in 43 s, about 10 GiB resident in all (the box goes from 86 to 97 GiB used),
+35 s of read French transcribed in 2.9 s through the proxy — WAV or webm/opus
+alike — and 5 s in 0.5 s.
+
+Two things to know about it. The container runs a **locally built image**
+(`suite366/vllm-stt:<base>-r<rev>`, `llm/stt/Dockerfile`): the arm64 vLLM image
+ships without `soundfile` and `PyAV` and decodes no audio at all, so one ~100 MB
+layer adds them — bump `LLM_STT_IMAGE_REV` in `llm/profiles.sh` whenever the
+Dockerfile changes. And the service sits behind a **compose profile**
+(`COMPOSE_PROFILES=stt` in `llm/.env`), so `switch-model.sh` can take it down
+before a bigger generative model starts and bring it back after a smaller one is
+healthy; the nginx route resolves it per request and simply answers 502 while it
+is absent. In the app the model is an `AIModel` row with `supportsTranscription`
+and the organisation's default; a switch to a profile without one disables the
+row and clears the default, so the UI says "no transcription model configured"
+instead of failing on a route nothing serves. `LLM_STT_MODEL=` (empty) at
+install turns it off for a box that needs the memory elsewhere.
 
 The new engine must report healthy before the chart or the database are touched.
 If it does not come up, `.env` is restored, the previous engine is brought back,
@@ -542,7 +572,8 @@ channel.json.sig                      Ed25519 signature over channel.json — re
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
 switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run]) — .env, chart values and the database
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
-llm/profiles.sh                       the three models and their measured budgets; the ONE table install.sh and switch-model.sh share
+llm/profiles.sh                       the three models and their measured budgets, and the transcription model each allows; the ONE table install.sh and switch-model.sh share
+llm/stt/Dockerfile                    the audio extras the arm64 vLLM image ships without; built on the box as suite366/vllm-stt
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
 llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
 llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box)

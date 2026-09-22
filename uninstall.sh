@@ -189,11 +189,11 @@ remove_vllm_stack() {
     ( cd "$DATA_DIR/llm" && docker compose down --remove-orphans >/dev/null 2>&1 ) \
       && info "docker compose down" || true
     # The Flash-Next vLLM image is built on the box (no registry copy): drop it.
-    docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^suite366/vllm-flash-next:' \
+    docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^suite366/vllm-(flash-next|stt):' \
       | xargs -r docker image rm >/dev/null 2>&1 || true
   fi
   # Hard fallback by container name (idempotent — silent if already gone).
-  docker rm -f suite366-vllm-llm suite366-vllm-embed suite366-vllm-proxy >/dev/null 2>&1 || true
+  docker rm -f suite366-vllm-llm suite366-vllm-embed suite366-vllm-stt suite366-vllm-proxy >/dev/null 2>&1 || true
 
   if [[ "$PRUNE_IMAGES" == "1" ]]; then
     # Only the images referenced by our compose .env, so we never yank an image

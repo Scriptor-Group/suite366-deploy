@@ -23,12 +23,13 @@ summary() {
     ai=$(cat <<AI
  Local AI (wired AUTOMATICALLY into Suite 366 via PR #325 env contract):
    • Unified endpoint (nginx)    : http://$SUITE_IP:$PROXY_PORT/v1
-       /v1/embeddings -> vllm-embed ; everything else -> vllm-llm.
+       /v1/embeddings -> vllm-embed ; /v1/audio/* -> vllm-stt ; everything else -> vllm-llm.
        ($SUITE_IP is the stable internal IP — reach it from the box; it is
         network-independent so the app keeps working across LAN changes/offline.)
    • Direct vLLM endpoints (debug, from the box):
        - Generative : http://$SUITE_IP:$LLM_PORT/v1   (model: $LLM_MODEL)
        - Embeddings : http://$SUITE_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)
+       - Transcription : ${LLM_STT_MODEL:+http://$SUITE_IP:$STT_PORT/v1 (model: $LLM_STT_MODEL)}${LLM_STT_MODEL:-none — the $LLM_PROFILE profile leaves no room for it}
    • API key (shared by vLLM + Suite 366): fingerprint $(printf '%s' "$VLLM_API_KEY" | sha256sum | cut -c1-12)
        In clear in $DATA_DIR/llm/.env (root-only) — not reprinted here, for the
        reason given for the backup key below.
