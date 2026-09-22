@@ -208,7 +208,13 @@ livekit:
       issuerKind: ClusterIssuer
 
 # --- Appliance host <-> app bridges ------------------------------------------
-# Two hostPath dirs are shared with the drive-app pod:
+# Five hostPath dirs are shared with the drive-app pod:
+#
+#  /opt/suite366/llm-state -> /appliance-llm  (APPLIANCE_LLM_DIR)
+#    switch-model.sh publishes state.json there (the three profiles, the active
+#    one, the engine's health, the switch status) and the app drops a
+#    switch-requested trigger a systemd .path unit picks up. Holds no secret:
+#    llm/.env, which carries the vLLM key, is NOT mounted into the pod.
 #
 #  /opt/suite366/updates  -> /appliance-update  (APPLIANCE_UPDATE_DIR)
 #    update.sh publishes state.json / apply.json there, and the app drops
@@ -246,9 +252,13 @@ extraEnv:
     value: /support-access
   - name: APPLIANCE_BACKUP_DIR
     value: /appliance-backup
+  - name: APPLIANCE_LLM_DIR
+    value: /appliance-llm
   - name: APPLIANCE_REMOTE_DIR
     value: /appliance-remote
 extraVolumeMounts:
+  - name: appliance-llm
+    mountPath: /appliance-llm
   - name: appliance-update
     mountPath: /appliance-update
   - name: support-access
@@ -258,6 +268,10 @@ extraVolumeMounts:
   - name: appliance-remote
     mountPath: /appliance-remote
 extraVolumes:
+  - name: appliance-llm
+    hostPath:
+      path: /opt/suite366/llm-state
+      type: DirectoryOrCreate
   - name: appliance-update
     hostPath:
       path: /opt/suite366/updates

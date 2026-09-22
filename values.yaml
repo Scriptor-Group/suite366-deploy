@@ -246,7 +246,7 @@ livekit:
       issuerKind: ClusterIssuer
 
 # --- Appliance host <-> app bridges ------------------------------------------
-# Two hostPath dirs are shared with the drive-app pod:
+# Five hostPath dirs are shared with the drive-app pod:
 #
 #  @DATA_DIR@/llm-state -> /appliance-llm  (APPLIANCE_LLM_DIR)
 #    switch-model.sh publishes state.json there (the three profiles, the active
