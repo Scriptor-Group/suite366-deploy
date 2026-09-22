@@ -1,7 +1,9 @@
-# Two vLLM instances + a tiny nginx proxy on the DGX Spark's Blackwell GPU
-# (GB10, sm_121). The proxy presents a SINGLE OpenAI-compatible endpoint
-# (port ${PROXY_PORT}) and routes by URL path:
+# Two vLLM instances (three with transcription) + a tiny nginx proxy on the DGX
+# Spark's Blackwell GPU (GB10, sm_121). The proxy presents a SINGLE
+# OpenAI-compatible endpoint (port ${PROXY_PORT}) and routes by URL path:
 #   • /v1/embeddings  -> vllm-embed (Qwen3-VL-Embedding-8B)
+#   • /v1/audio/*     -> vllm-stt   (Qwen3-ASR-1.7B, only for the profiles that
+#                                    leave room for it — a compose profile)
 #   • everything else -> vllm-llm   (the selected LLM profile, chat + vision + tools)
 # This matches the Suite 366 PR #325 env contract (single VLLM_BASE_URL,
 # role-specific VLLM_MODEL_*). The Suite 366 chart is wired automatically via
@@ -144,9 +146,66 @@ services:
       retries: 40
       start_period: 600s
 
+  # Transcription (speech-to-text): a third vLLM serving Qwen3-ASR-1.7B on
+  # /v1/audio/transcriptions, for the model profiles that leave the memory for
+  # it (llm/profiles.sh LLM_P_STT_MODEL). Behind a COMPOSE PROFILE: the service
+  # exists only when .env says COMPOSE_PROFILES=stt, which lib/vllm.sh and
+  # switch-model.sh write from the model profile. `docker compose up -d` (the
+  # systemd unit) then starts it or ignores it, and the nginx route to it
+  # resolves lazily, so its absence costs nothing and breaks nothing.
+  vllm-stt:
+    profiles: ["stt"]
+    # Built on the box by lib/vllm.sh: ${VLLM_IMAGE} + ./stt/ (the audio
+    # extras the arm64 image ships without — see llm/stt/Dockerfile).
+    image: ${VLLM_STT_IMAGE}
+    container_name: suite366-vllm-stt
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      VLLM_NO_USAGE_STATS: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - ${MODELS_DIR}:/root/.cache/huggingface
+      - ${CACHE_DIR}/vllm:/root/.cache/vllm
+      - ${CACHE_DIR}/flashinfer:/root/.cache/flashinfer
+      - ${CACHE_DIR}/triton:/root/.triton
+    ports:
+      - "${BIND_IP}:${STT_PORT}:8000"
+    command:
+      - ${STT_MODEL}
+      - --served-model-name=${STT_MODEL}
+      - --dtype=bfloat16
+      # Same pattern as the embed: an explicit KV budget, and a fraction that
+      # only has to clear vLLM's start-up free-memory check. The numbers and
+      # their reasoning live in llm/profiles.sh (LLM_STT_*).
+      - --gpu-memory-utilization=${STT_GPU_MEM_UTIL}
+      - --kv-cache-memory-bytes=${STT_KV_CACHE_BYTES}
+      - --max-model-len=${STT_MAX_MODEL_LEN}
+      - --max-num-seqs=${STT_MAX_NUM_SEQS}
+      - --load-format=fastsafetensors
+      - --host=0.0.0.0
+      - --port=8000
+    # After the LLM, for the same reason as the embed: one slice of the unified
+    # pool at a time.
+    depends_on:
+      vllm-llm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS -m 3 http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 40
+      # First boot downloads the 4.4 GB checkpoint (~1 min at 85 MB/s) and
+      # compiles; a warm restart is well under a minute.
+      start_period: 1200s
+
   # Tiny URL-path proxy: single OpenAI-compatible entry point routing to the
-  # two vLLM instances by URL path (/v1/embeddings -> vllm-embed, everything
-  # else -> vllm-llm). Suite 366 (PR #325) reads VLLM_BASE_URL = this proxy
+  # vLLM instances by URL path (/v1/embeddings -> vllm-embed, /v1/audio/* ->
+  # vllm-stt, everything else -> vllm-llm). Suite 366 (PR #325) reads VLLM_BASE_URL = this proxy
   # and selects a model per role via VLLM_MODEL_HIGH/_VISION/_EMBEDDING.
   vllm-proxy:
     image: ${PROXY_IMAGE}

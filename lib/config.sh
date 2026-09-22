@@ -203,6 +203,12 @@ llm_profile_apply "$LLM_PROFILE" "$VLLM_IMAGE" "$FLASH_NEXT_IMAGE"
 # operator's risk.
 LLM_MODEL="${LLM_MODEL:-$LLM_P_MODEL}"
 VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-$LLM_P_IMAGE}"
+# Transcription: a third vLLM, for the profiles that leave room for it. The
+# profile decides (llm/profiles.sh LLM_P_STT_MODEL); `LLM_STT_MODEL=` explicitly
+# empty turns it off on a box that needs the memory for something else — `-`
+# not `:-`, so that empty is an answer, as for LLM_MTP_TOKENS below.
+LLM_STT_MODEL="${LLM_STT_MODEL-$LLM_P_STT_MODEL}"
+VLLM_STT_IMAGE="${VLLM_STT_IMAGE:-$(llm_stt_image "$VLLM_IMAGE")}"
 # Tiny URL-path proxy unifying the two vLLM instances behind a single
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,
@@ -210,6 +216,7 @@ VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-$LLM_P_IMAGE}"
 PROXY_IMAGE="${PROXY_IMAGE:-nginx:1.31-alpine}"
 LLM_PORT="${LLM_PORT:-8001}"
 EMBED_PORT="${EMBED_PORT:-8002}"
+STT_PORT="${STT_PORT:-8003}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 # Embedding dimension served by the local embed model — exposed to the app
 # via VLLM_EMBEDDING_DIMENSIONS so pgvector indexes the right shape.

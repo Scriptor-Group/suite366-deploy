@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # =============================================================================
-# llm/profiles.sh — the three generative models the appliance can serve.
+# llm/profiles.sh — the three generative models the appliance can serve, and
+# the transcription model that rides along with the ones that leave room for it.
 #
 # SINGLE source of truth, sourced by two callers that cannot share code
 # otherwise: lib/config.sh at install time, and switch-model.sh on a running
@@ -21,11 +22,45 @@ llm_profile_known() { # llm_profile_known KEY
   case " $LLM_PROFILES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
 
+# --- Transcription (speech-to-text) -------------------------------------------
+# A THIRD vLLM next to the generative one and the embed, on the OpenAI
+# `/v1/audio/transcriptions` route the app already speaks (dictation, voice
+# reports, meeting notes — serveur/src/lib/agents/transcription-client.ts).
+# Qwen3-ASR-1.7B: 2.35B parameters, 4.4 GiB of BF16 weights, 30 languages with
+# automatic detection, 4.75 % WER on FLEURS French (Whisper-large-v3: 6.31), and
+# vLLM passes the app's vocabulary `prompt` to it as context — Voxtral's route
+# drops it, which is why Voxtral lost despite a better French score.
+#
+# Only the profiles that leave the room get it. qwen27b runs at 86/121 GiB with
+# the two other vLLMs up; flash-next at 116/121 with swap in use (no); gemma has
+# not been measured next to it (not yet — one line here when it has). One
+# transcription model for now: a profile names it, or leaves LLM_P_STT_MODEL
+# empty and the switch takes the container down.
+LLM_STT_MODEL_DEFAULT="Qwen/Qwen3-ASR-1.7B"
+# Bump when llm/stt/Dockerfile changes: the tag is how a box knows to rebuild.
+LLM_STT_IMAGE_REV="1"
+# Budgets, the same for every profile that serves it. With the KV budget
+# explicit, the fraction only has to clear vLLM's start-up check (free memory
+# >= fraction x total): 0.10 = 12 GiB. KV: ~112 KiB per token on this 28-layer,
+# 8-KV-head decoder, so 2 GiB seats ~18k tokens; a 30 s window is ~400 audio
+# tokens plus its transcript, and the route splits longer audio into 30 s
+# windows itself (llm/stt/Dockerfile explains the chunking). max_model_len has
+# to stay UNDER what the KV budget seats, or vLLM refuses to start.
+LLM_STT_GPU_MEM_UTIL="0.10"
+LLM_STT_KV_CACHE_BYTES="2147483648"
+LLM_STT_MAX_MODEL_LEN="8192"
+LLM_STT_MAX_NUM_SEQS="8"
+
+llm_stt_image() { # llm_stt_image BASE_IMAGE -> the tag of the locally built image
+  printf 'suite366/vllm-stt:%s-r%s' "${1##*:}" "$LLM_STT_IMAGE_REV"
+}
+
 # llm_profile_apply KEY BASE_IMAGE FLASH_NEXT_TAG
 #
 # Sets, for the caller, a LLM_P_* variable per knob: MODEL, IMAGE,
 # GPU_MEM_UTIL, MAX_MODEL_LEN, MAX_NUM_SEQS, CONTEXT_WINDOW, MTP_TOKENS,
-# NEEDS_BUILD (0|1), SWAPPINESS (empty = leave the host default).
+# NEEDS_BUILD (0|1), SWAPPINESS (empty = leave the host default),
+# STT_MODEL (the transcription model served next to it; empty = none).
 #
 # The LLM_P_ prefix is not decoration: it keeps the profile's values distinct
 # from the operator's, so install-time code can write `${LLM_MODEL:-$LLM_P_MODEL}`
@@ -57,6 +92,8 @@ llm_profile_apply() {
       LLM_P_MTP_TOKENS="3"
       LLM_P_NEEDS_BUILD="0"
       LLM_P_SWAPPINESS=""
+      # The only profile with the headroom for it today (34 GiB free measured).
+      LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       ;;
     flash-next)
       # 176B ultra-sparse MoE, 6B active. 123.5 GB on disk for 121.6 GiB of RAM:
@@ -79,6 +116,8 @@ llm_profile_apply() {
       # 117/121 GiB used and 7-10 GiB of swap in use once it is up; at the
       # default 60, pages were read back from swap during every generation.
       LLM_P_SWAPPINESS="10"
+      # 5 GiB free and swap already in use: nothing else fits beside it.
+      LLM_P_STT_MODEL=""
       ;;
     gemma)
       # The appliance's original model, kept so a box can go back to what it
@@ -101,6 +140,9 @@ llm_profile_apply() {
       LLM_P_MTP_TOKENS=""
       LLM_P_NEEDS_BUILD="0"
       LLM_P_SWAPPINESS=""
+      # Should fit (0.55 + 0.20 leaves ~20 GiB by the budgets) but has not been
+      # measured next to the transcription engine; off until it has.
+      LLM_P_STT_MODEL=""
       ;;
     *) return 1 ;;
   esac

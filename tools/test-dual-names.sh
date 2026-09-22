@@ -41,7 +41,7 @@ export LOCAL_APP_TLS_SECRET=drive-local-tls
 export LOCAL_OFFICE_TLS_SECRET=drive-onlyoffice-local-tls
 export LOCAL_LIVEKIT_TLS_SECRET=drive-livekit-local-tls
 export CLUSTER_ISSUER=suite366-local-ca HOST_IP=10.0.0.1 SUITE_IP=10.9.9.1
-export PROXY_PORT=8000 LLM_MODEL=m EMBED_MODEL=e VLLM_API_KEY=sk-test
+export PROXY_PORT=8000 LLM_MODEL=m EMBED_MODEL=e LLM_STT_MODEL=s VLLM_API_KEY=sk-test
 export VLLM_EMBEDDING_DIMENSIONS=1024 VLLM_MAX_CONTEXT_WINDOW=8192
 export SANDBOX_NAMESPACE=sandbox DATA_DIR=/opt/suite366
 export cert_annotation='suite366.ai/tls-mode: "pushed"' turn_cert_manager=false

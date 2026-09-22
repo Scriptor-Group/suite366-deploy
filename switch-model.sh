@@ -14,6 +14,15 @@
 # Miss (3) and every call 404s with `docker ps` healthy and every pod Running —
 # the same shape of failure as the API-key drift in lib/vllm-db.sh.
 #
+# A profile may also carry a TRANSCRIPTION model (llm/profiles.sh
+# LLM_P_STT_MODEL), served by a third container on /v1/audio/*. It follows the
+# same three places: STT_MODEL and COMPOSE_PROFILES in .env, the chart's
+# VLLM_MODEL_TRANSCRIPTION, and an "AIModel" row with supportsTranscription that
+# is the organisation's default. A profile without one takes the container
+# down BEFORE the new generative engine starts (it holds memory the bigger
+# model may need) and clears the rows, so the app says "no transcription model"
+# instead of calling a route nothing serves.
+#
 # Order is deliberate: the new engine must be HEALTHY before anything else is
 # touched. If it fails to come up, .env is restored, the previous engine is
 # brought back, and the chart and the database are never moved — the box ends
@@ -95,6 +104,7 @@ CUR_MODEL="$(env_get LLM_MODEL)"
 BASE_IMAGE="$(env_get VLLM_IMAGE)"
 [[ -n "$BASE_IMAGE" ]] || die "VLLM_IMAGE missing from $ENV_FILE — is this an installed appliance?"
 FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${BASE_IMAGE##*:}-${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
+STT_IMAGE="$(llm_stt_image "$BASE_IMAGE")"
 
 # Every model id the three profiles can produce: the scope of the Agent rewrite
 # below. An agent pointed at OpenAI or Anthropic must not be touched.
@@ -135,17 +145,25 @@ publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
       "$(json_str "$(docker inspect -f '{{.Config.Image}}' suite366-vllm-llm 2>/dev/null || true)")" \
       "$(json_str "$(docker inspect -f '{{.State.Status}}' suite366-vllm-llm 2>/dev/null || true)")" \
       "$(json_str "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' suite366-vllm-llm 2>/dev/null || true)")"
+    # The transcription engine: `model` is what .env says this box serves (empty
+    # = the active profile has none), state/health are the container's, empty
+    # when it does not exist.
+    printf '  "stt": {"model": %s, "state": %s, "health": %s},\n' \
+      "$(json_str "$(env_get STT_MODEL)")" \
+      "$(json_str "$(docker inspect -f '{{.State.Status}}' suite366-vllm-stt 2>/dev/null || true)")" \
+      "$(json_str "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' suite366-vllm-stt 2>/dev/null || true)")"
     printf '  "switch": {"status": %s, "target": %s, "message": %s, "updated_at": %s},\n' \
       "$(json_str "$st")" "$(json_str "$tgt")" "$(json_str "$msg")" "$(json_str "$(date -Is)")"
     printf '  "profiles": ['
     for p in $LLM_PROFILES; do
       ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
         local dl=false; if checkpoint_on_disk "$LLM_P_MODEL"; then dl=true; fi
-        printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s}' \
+        printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s, "stt_model": %s}' \
           "$( [[ "$first" == 1 ]] && printf '' || printf ',' )" \
           "$(json_str "$p")" "$(json_str "$LLM_P_MODEL")" "$(json_str "$(llm_profile_summary "$p")")" \
           "$LLM_P_CONTEXT_WINDOW" \
-          "$( [[ "$LLM_P_NEEDS_BUILD" == 1 ]] && printf true || printf false )" "$dl" )
+          "$( [[ "$LLM_P_NEEDS_BUILD" == 1 ]] && printf true || printf false )" "$dl" \
+          "$(json_str "$LLM_P_STT_MODEL")" )
       first=0
     done
     printf '\n  ]\n}\n'
@@ -207,7 +225,8 @@ EOF
     for p in $LLM_PROFILES; do
       ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
         mark=' '; if [[ "$p" == "$CUR_PROFILE" ]]; then mark='*'; fi
-        printf '%s%-11s %-34s %s\n' "$mark" "$p" "$LLM_P_MODEL" "$(llm_profile_summary "$p")" )
+        printf '%s%-11s %-34s %s%s\n' "$mark" "$p" "$LLM_P_MODEL" "$(llm_profile_summary "$p")" \
+          "${LLM_P_STT_MODEL:+ — with transcription ($LLM_P_STT_MODEL)}" )
     done
     printf '\n(* = active)  switch with: %s <profile>\n' "$0"
     exit 0 ;;
@@ -220,6 +239,13 @@ EOF
     printf 'chart values   %s\n' "$(sed -n 's/^  VLLM_MODEL_HIGH: "\(.*\)"/\1/p' "$VALUES" 2>/dev/null | head -1)"
     ctr="$(docker inspect -f '{{.Config.Image}} ({{.State.Status}}, {{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}})' suite366-vllm-llm 2>/dev/null || true)"
     printf 'container      %s\n' "${ctr:-absent}"
+    stt_model="$(env_get STT_MODEL)"
+    if [[ -n "$stt_model" ]]; then
+      stt_ctr="$(docker inspect -f '{{.State.Status}}, {{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' suite366-vllm-stt 2>/dev/null || true)"
+      printf 'transcription  %s (%s)\n' "$stt_model" "${stt_ctr:-container absent}"
+    else
+      printf 'transcription  none for this profile\n'
+    fi
     exit 0 ;;
 esac
 
@@ -234,6 +260,7 @@ info "image      $(env_get VLLM_LLM_IMAGE) -> $LLM_P_IMAGE"
 info "budgets    util=$LLM_P_GPU_MEM_UTIL max_model_len=$LLM_P_MAX_MODEL_LEN slots=$LLM_P_MAX_NUM_SEQS"
 info "app ctx    $LLM_P_CONTEXT_WINDOW tokens"
 info "swappiness ${LLM_P_SWAPPINESS:-host default}"
+info "transcription $(env_get STT_MODEL) -> ${LLM_P_STT_MODEL:-none}"
 
 if [[ "$CUR_PROFILE" == "$TARGET" && "$DRY_RUN" == 0 ]]; then
   info "Already on $TARGET — re-applying anyway (idempotent, recreates the container)."
@@ -242,8 +269,15 @@ fi
 # --- the SQL, built once so --dry-run can show exactly what would run --------
 # `\set` + `:'name'` so psql quotes the values; nothing here is user input, but
 # a model id with a quote in it would otherwise be a syntax error at best.
+# The transcription rows are scoped to THIS box's vLLM providers — the seed's
+# name, a row without baseUrl, or a baseUrl on our proxy — the same rule as the
+# app's own reconcile (vllm-provider.ts ownsVllmRow). A remote vLLM an admin
+# registered on purpose keeps its own model list. `SQL_STT_MODEL`, when set,
+# overrides the profile's value: the real run passes what actually came up.
 build_sql() {
-  local models_in="" m
+  local models_in="" m stt base_like
+  stt="${SQL_STT_MODEL-$LLM_P_STT_MODEL}"
+  base_like="http://$(env_get BIND_IP):$(env_get PROXY_PORT)/%"
   while IFS= read -r m; do
     if [[ -n "$m" ]]; then models_in+="$(printf "'%s'," "$m")"; fi
   done < <(all_profile_models)
@@ -251,6 +285,8 @@ build_sql() {
   cat <<SQL
 \set model '$LLM_P_MODEL'
 \set ctx $LLM_P_CONTEXT_WINDOW
+\set stt '$stt'
+\set base_like '$base_like'
 SELECT CASE WHEN to_regclass('"public"."AIModel"') IS NULL THEN 'off' ELSE 'on' END AS have_ai \gset
 \if :have_ai
 WITH m AS (
@@ -263,8 +299,50 @@ WITH m AS (
   UPDATE "public"."Agent" SET model = :'model'
    WHERE model IN ($models_in) AND model IS DISTINCT FROM :'model'
   RETURNING 1
+), ours AS (
+  SELECT id, "organizationId" FROM "public"."AIProvider"
+   WHERE provider = 'VLLM'
+     AND (name = 'vLLM Local' OR config->>'baseUrl' IS NULL OR config->>'baseUrl' LIKE :'base_like')
+), s_on AS (
+  -- The transcription row for this profile, created or re-enabled. Prisma
+  -- generates ids client-side, so the insert has to bring its own.
+  INSERT INTO "public"."AIModel"
+      (id, "providerId", "modelId", "displayName", "modelType",
+       "supportsTranscription", "supportsTools", "supportsVision", "isEnabled", "createdAt")
+  SELECT gen_random_uuid()::text, o.id, :'stt', :'stt', 'LLM', true, false, false, true, now()
+    FROM ours o WHERE :'stt' <> ''
+  ON CONFLICT ("providerId", "modelId") DO UPDATE
+     SET "isEnabled" = true, "supportsTranscription" = true
+  RETURNING id, "providerId"
+), s_off AS (
+  -- Every other transcription row of ours goes dark (all of them when the
+  -- profile has none): the UI must not offer a model nothing serves.
+  UPDATE "public"."AIModel" SET "isEnabled" = false
+   WHERE "supportsTranscription" = true AND "isEnabled" = true
+     AND "providerId" IN (SELECT id FROM ours)
+     AND "modelId" IS DISTINCT FROM :'stt'
+  RETURNING id
+), o_set AS (
+  -- The organisation's default, when it is unset or was one of ours. A default
+  -- an admin pointed at another provider (BYO Whisper, a system model) is kept.
+  UPDATE "public"."Organization" org SET "defaultTranscriptionModelId" = s.id
+    FROM s_on s JOIN ours p ON p.id = s."providerId"
+   WHERE org.id = p."organizationId"
+     AND org."defaultTranscriptionModelId" IS DISTINCT FROM s.id
+     AND (org."defaultTranscriptionModelId" IS NULL
+          OR org."defaultTranscriptionModelId" IN
+             (SELECT id FROM "public"."AIModel" WHERE "providerId" IN (SELECT id FROM ours)))
+  RETURNING 1
+), o_clear AS (
+  UPDATE "public"."Organization" org SET "defaultTranscriptionModelId" = NULL
+   WHERE :'stt' = ''
+     AND org."defaultTranscriptionModelId" IN
+         (SELECT id FROM "public"."AIModel" WHERE "providerId" IN (SELECT id FROM ours))
+  RETURNING 1
 )
-SELECT 'aimodel=' || (SELECT count(*) FROM m) || ' agent=' || (SELECT count(*) FROM a);
+SELECT 'aimodel=' || (SELECT count(*) FROM m) || ' agent=' || (SELECT count(*) FROM a)
+    || ' stt_on=' || (SELECT count(*) FROM s_on) || ' stt_off=' || (SELECT count(*) FROM s_off)
+    || ' stt_default=' || ((SELECT count(*) FROM o_set) + (SELECT count(*) FROM o_clear));
 \else
 \echo aimodel=no-table agent=no-table
 \endif
@@ -274,12 +352,20 @@ SQL
 if [[ "$DRY_RUN" == 1 ]]; then
   log "--dry-run: nothing will be changed"
   echo; info "llm/.env would become:"
-  printf '      LLM_PROFILE=%s\n      LLM_MODEL=%s\n      VLLM_LLM_IMAGE=%s\n      LLM_GPU_MEM_UTIL=%s\n      LLM_MAX_MODEL_LEN=%s\n      LLM_MAX_NUM_SEQS=%s\n      LLM_MTP_TOKENS=%s\n' \
-    "$TARGET" "$LLM_P_MODEL" "$LLM_P_IMAGE" "$LLM_P_GPU_MEM_UTIL" "$LLM_P_MAX_MODEL_LEN" "$LLM_P_MAX_NUM_SEQS" "$LLM_P_MTP_TOKENS"
+  printf '      LLM_PROFILE=%s\n      LLM_MODEL=%s\n      VLLM_LLM_IMAGE=%s\n      LLM_GPU_MEM_UTIL=%s\n      LLM_MAX_MODEL_LEN=%s\n      LLM_MAX_NUM_SEQS=%s\n      LLM_MTP_TOKENS=%s\n      STT_MODEL=%s\n      COMPOSE_PROFILES=%s\n' \
+    "$TARGET" "$LLM_P_MODEL" "$LLM_P_IMAGE" "$LLM_P_GPU_MEM_UTIL" "$LLM_P_MAX_MODEL_LEN" "$LLM_P_MAX_NUM_SEQS" "$LLM_P_MTP_TOKENS" \
+    "$LLM_P_STT_MODEL" "${LLM_P_STT_MODEL:+stt}"
   echo; info "values.yaml: VLLM_MODEL_{HIGH,LIGHT,VISION} -> $LLM_P_MODEL, VLLM_MAX_CONTEXT_WINDOW -> $LLM_P_CONTEXT_WINDOW"
+  info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
   echo; info "SQL:"; build_sql | sed 's/^/      /'
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
     echo; info "image build: $LLM_P_IMAGE (from $BASE_IMAGE + llm/flash-next/)"
+  fi
+  if [[ -n "$LLM_P_STT_MODEL" ]]; then
+    echo; info "image build: $STT_IMAGE (from $BASE_IMAGE + llm/stt/, unless already built)"
+    info "transcription container: suite366-vllm-stt up after the engine is healthy"
+  else
+    echo; info "transcription container: suite366-vllm-stt taken down before the engine starts"
   fi
   exit 0
 fi
@@ -304,6 +390,14 @@ elif ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
   log "Pulling $LLM_P_IMAGE"
   docker pull -q "$LLM_P_IMAGE" >/dev/null || die "docker pull $LLM_P_IMAGE failed."
 fi
+if [[ -n "$LLM_P_STT_MODEL" ]] && ! docker image inspect "$STT_IMAGE" >/dev/null 2>&1; then
+  [[ -f "$LLM_DIR/stt/Dockerfile" ]] \
+    || die "$LLM_DIR/stt/Dockerfile missing — cannot build $STT_IMAGE. Re-run install.sh."
+  log "Building $STT_IMAGE (the audio extras over $BASE_IMAGE, ~1 min)"
+  docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
+  docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$STT_IMAGE" "$LLM_DIR/stt" >/dev/null \
+    || die "docker build of $STT_IMAGE failed."
+fi
 
 # --- 2. .env, with the previous one kept for the rollback ---------------------
 ENV_BACKUP="$(mktemp)"; cp "$ENV_FILE" "$ENV_BACKUP"
@@ -325,6 +419,16 @@ set_env LLM_GPU_MEM_UTIL "$LLM_P_GPU_MEM_UTIL"
 set_env LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
 set_env LLM_MAX_NUM_SEQS "$LLM_P_MAX_NUM_SEQS"
 set_env LLM_MTP_TOKENS   "$LLM_P_MTP_TOKENS"
+# The transcription keys, ALL of them: a box installed before transcription
+# existed has none, and the compose interpolates every one.
+set_env VLLM_STT_IMAGE    "$STT_IMAGE"
+set_env STT_MODEL         "$LLM_P_STT_MODEL"
+set_env STT_PORT          "$(env_get STT_PORT)"
+set_env STT_GPU_MEM_UTIL  "$LLM_STT_GPU_MEM_UTIL"
+set_env STT_KV_CACHE_BYTES "$LLM_STT_KV_CACHE_BYTES"
+set_env STT_MAX_MODEL_LEN "$LLM_STT_MAX_MODEL_LEN"
+set_env STT_MAX_NUM_SEQS  "$LLM_STT_MAX_NUM_SEQS"
+set_env COMPOSE_PROFILES  "${LLM_P_STT_MODEL:+stt}"
 
 if [[ -n "$LLM_P_SWAPPINESS" ]]; then
   printf 'vm.swappiness = %s\n' "$LLM_P_SWAPPINESS" > "$VLLM_SYSCTL_FILE"
@@ -337,12 +441,21 @@ rollback() {
   warn "Rolling back to ${CUR_PROFILE:-the previous configuration}."
   cp "$ENV_BACKUP" "$ENV_FILE"
   if [[ "$SYSCTL_WAS_PRESENT" == 0 ]]; then rm -f "$VLLM_SYSCTL_FILE"; fi
-  ( cd "$LLM_DIR" && docker compose up -d vllm-llm >/dev/null 2>&1 ) || true
+  # The whole stack, not just vllm-llm: the restored .env decides whether the
+  # transcription container (taken down above when the target had none) comes
+  # back with the previous engine.
+  ( cd "$LLM_DIR" && docker compose up -d >/dev/null 2>&1 ) || true
   publish_state error "$TARGET" "the $TARGET engine did not come up; rolled back to ${CUR_PROFILE:-the previous model}"
   die "The $TARGET engine did not come up. The chart and the database were NOT touched, so the box is back where it started. Logs: docker logs suite366-vllm-llm"
 }
 
 # --- 3. bring the new engine up, and wait for it ------------------------------
+# A transcription engine the TARGET does not have goes down FIRST: it holds
+# ~9 GiB the bigger generative model may need to clear vLLM's start-up check.
+if [[ -z "$LLM_P_STT_MODEL" ]]; then
+  ( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
+  docker rm -f suite366-vllm-stt >/dev/null 2>&1 || true
+fi
 # From here the app's UI can follow along in state.json.
 publish_state running "$TARGET" "starting the $TARGET engine"
 log "Recreating suite366-vllm-llm on $TARGET"
@@ -366,6 +479,38 @@ done
 info "engine healthy."
 rm -f "$ENV_BACKUP"
 
+# --- 3b. the transcription engine, where the profile has one ------------------
+# Not a rollback condition: the generative model is up and serving. A
+# transcription engine that does not come up is reported, left OUT of the chart
+# values and the database (the app then says "no transcription model" rather
+# than calling a route nothing answers), and the switch goes on.
+STT_SERVED=""
+if [[ -n "$LLM_P_STT_MODEL" ]]; then
+  publish_state running "$TARGET" "starting the transcription engine ($LLM_P_STT_MODEL)"
+  log "Starting suite366-vllm-stt ($LLM_P_STT_MODEL)"
+  # Plain `up`, no --force-recreate: unchanged and already running, it stays.
+  if ( cd "$LLM_DIR" && docker compose --profile stt up -d vllm-stt >/dev/null ); then
+    stt_deadline=$(( $(date +%s) + 1800 ))
+    while :; do
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' suite366-vllm-stt 2>/dev/null || echo gone)"
+      state="$(docker inspect -f '{{.State.Status}}' suite366-vllm-stt 2>/dev/null || echo gone)"
+      if [[ "$health" == healthy ]]; then STT_SERVED="$LLM_P_STT_MODEL"; break; fi
+      if [[ "$state" != running ]]; then warn "transcription container state: $state"; break; fi
+      if [[ "$(date +%s)" -ge "$stt_deadline" ]]; then warn "transcription still $health after 30 min"; break; fi
+      publish_state running "$TARGET" "waiting for the transcription engine ($health)"
+      sleep 10
+    done
+  else
+    warn "docker compose could not start vllm-stt."
+  fi
+  if [[ -n "$STT_SERVED" ]]; then
+    info "transcription engine healthy."
+  else
+    warn "The transcription engine did not come up; the generative model is unaffected."
+    warn "  Transcription stays OFF in the app until it does. Logs: docker logs suite366-vllm-stt"
+  fi
+fi
+
 # --- 4. the chart values the app reads ----------------------------------------
 # From here the engine is ALREADY serving the new model. A failure below must be
 # reported with the command that finishes the job, never abort the script: dying
@@ -380,6 +525,14 @@ if [[ -f "$VALUES" ]]; then
     || warn "could not rewrite VLLM_MODEL_* in $VALUES"
   sed -i -E "s#^(\s*VLLM_MAX_CONTEXT_WINDOW:\s*).*#\1\"$LLM_P_CONTEXT_WINDOW\"#" "$VALUES" \
     || warn "could not rewrite VLLM_MAX_CONTEXT_WINDOW in $VALUES"
+  if grep -qE '^\s*VLLM_MODEL_TRANSCRIPTION:' "$VALUES"; then
+    sed -i -E "s#^(\s*VLLM_MODEL_TRANSCRIPTION:\s*).*#\1\"$STT_SERVED\"#" "$VALUES" \
+      || warn "could not rewrite VLLM_MODEL_TRANSCRIPTION in $VALUES"
+  else
+    # A box installed before transcription existed: give the app the key.
+    sed -i -E "/^\s*VLLM_MODEL_EMBEDDING:/a\\  VLLM_MODEL_TRANSCRIPTION: \"$STT_SERVED\"" "$VALUES" \
+      || warn "could not add VLLM_MODEL_TRANSCRIPTION to $VALUES"
+  fi
   chart_version="$(helm list -n "$NAMESPACE" --filter "^${RELEASE}$" -o json 2>/dev/null \
     | sed -n 's/.*"chart":"[^"]*-\([0-9][^"]*\)".*/\1/p' | head -1 || true)"
   if [[ -n "$chart_version" ]]; then
@@ -400,7 +553,8 @@ pg_deploy() {
   kc -n "$NAMESPACE" get deploy -o name 2>/dev/null \
     | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
 }
-log "Realigning the model id stored in Postgres"
+log "Realigning the model ids stored in Postgres"
+SQL_STT_MODEL="$STT_SERVED"
 pg="$(pg_deploy)"
 if [[ -z "$pg" ]]; then
   warn "No -postgres deployment found in ns $NAMESPACE — database NOT updated."
@@ -426,8 +580,25 @@ if [[ -n "$key" && -n "$ip" && -n "$port" ]]; then
     -d "{\"model\":\"$LLM_P_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":3}" \
     >/dev/null 2>&1 && info "warm-up ok." || warn "warm-up call failed (non-blocking)."
 fi
+if [[ -n "$STT_SERVED" && -n "$key" && -n "$ip" ]]; then
+  # Two seconds of a 440 Hz tone through the real route: the transcript is
+  # noise, the compiled kernels are what the first dictation would wait for.
+  wav="$(mktemp --suffix=.wav)"
+  python3 - "$wav" <<'PYW'
+import math, struct, sys
+sr = 16000; n = sr * 2
+pcm = b''.join(struct.pack('<h', int(3000 * math.sin(2 * math.pi * 440 * i / sr))) for i in range(n))
+hdr = (b'RIFF' + struct.pack('<I', 36 + len(pcm)) + b'WAVEfmt '
+       + struct.pack('<IHHIIHH', 16, 1, 1, sr, sr * 2, 2, 16) + b'data' + struct.pack('<I', len(pcm)))
+open(sys.argv[1], 'wb').write(hdr + pcm)
+PYW
+  curl -fsS -m 300 "http://$ip:$(env_get STT_PORT)/v1/audio/transcriptions" \
+    -H "Authorization: Bearer $key" -F "model=$STT_SERVED" -F "file=@$wav;type=audio/wav" \
+    >/dev/null 2>&1 && info "transcription warm-up ok." || warn "transcription warm-up failed (non-blocking)."
+  rm -f "$wav"
+fi
 
-publish_state success "$TARGET" "now serving $LLM_P_MODEL"
+publish_state success "$TARGET" "now serving $LLM_P_MODEL${STT_SERVED:+ + $STT_SERVED for transcription}"
 set -e
-log "Now serving $LLM_P_MODEL ($TARGET)."
+log "Now serving $LLM_P_MODEL ($TARGET)${STT_SERVED:+ with $STT_SERVED for transcription}."
 info "Check it end to end:  $0 status"

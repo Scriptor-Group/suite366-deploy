@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # =============================================================================
-# lib/vllm.sh — vLLM ×2 (generative + embeddings) + nginx unifying proxy on the
-# Docker host, wired to the Blackwell GPU and managed by a systemd unit.
+# lib/vllm.sh — vLLM ×2 (generative + embeddings), ×3 with transcription, +
+# nginx unifying proxy on the Docker host, wired to the Blackwell GPU and
+# managed by a systemd unit.
 # =============================================================================
 
 # --- Flash-Next: the patched vLLM image, built on the box ---------------------
@@ -37,6 +38,29 @@ build_flash_next_image() { # build_flash_next_image TAG
   # stdout (the image id) is noise; stderr is where a failing step explains itself.
   docker build -q -t "$tag" "$ctx" >/dev/null \
     || die "docker build of $tag failed — see llm/flash-next/README.md"
+}
+
+# --- Transcription: the audio extras, built over the base image ---------------
+# vllm/vllm-openai (arm64) decodes no audio at all without soundfile and PyAV
+# (llm/stt/Dockerfile has the evidence). One thin layer, built here at install
+# for the profiles that serve a transcription model, and by switch-model.sh
+# when a later switch turns it on. The Dockerfile is laid down whatever the
+# profile, for the same reason as the Flash-Next sources.
+fetch_stt_files() {
+  mkdir -p "$DATA_DIR/llm/stt"
+  fetch "llm/stt/Dockerfile" > "$DATA_DIR/llm/stt/Dockerfile"
+}
+
+build_stt_image() { # build_stt_image TAG
+  local tag="$1" ctx="$DATA_DIR/llm/stt"
+  if docker image inspect "$tag" >/dev/null 2>&1; then
+    info "vLLM transcription image $tag already built."
+    return 0
+  fi
+  log "Building $tag ($VLLM_IMAGE + the audio extras, ~1 min)"
+  docker pull -q "$VLLM_IMAGE" >/dev/null
+  docker build -q --build-arg "BASE_IMAGE=$VLLM_IMAGE" -t "$tag" "$ctx" >/dev/null \
+    || die "docker build of $tag failed — see llm/stt/Dockerfile"
 }
 
 # Only Flash-Next asks for this: with it up the box has no memory headroom
@@ -81,9 +105,11 @@ deploy_vllm() {
   fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
   chmod 755 "$DATA_DIR/llm/serve-llm.sh"
   fetch_flash_next_files
+  fetch_stt_files
   # `if`, not `[[ ]] &&`: as the last command of a function the && form
   # returns 1 when the test is false and `set -e` kills the install.
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_flash_next_image "$VLLM_LLM_IMAGE"; fi
+  if [[ -n "$LLM_STT_MODEL" ]]; then build_stt_image "$VLLM_STT_IMAGE"; fi
   apply_vllm_sysctl "$LLM_P_SWAPPINESS"
   # Arms the .path unit that lets an org admin switch model from the app, and
   # writes the first state.json the UI reads. Idempotent, re-run on every
@@ -114,13 +140,21 @@ LLM_MAX_NUM_SEQS=$LLM_MAX_NUM_SEQS
 LLM_MAX_MODEL_LEN=$LLM_MAX_MODEL_LEN
 LLM_MTP_TOKENS=${LLM_MTP_TOKENS:-}
 EMBED_MAX_MODEL_LEN=$EMBED_MAX_MODEL_LEN
+VLLM_STT_IMAGE=$VLLM_STT_IMAGE
+STT_MODEL=$LLM_STT_MODEL
+STT_PORT=$STT_PORT
+STT_GPU_MEM_UTIL=$LLM_STT_GPU_MEM_UTIL
+STT_KV_CACHE_BYTES=$LLM_STT_KV_CACHE_BYTES
+STT_MAX_MODEL_LEN=$LLM_STT_MAX_MODEL_LEN
+STT_MAX_NUM_SEQS=$LLM_STT_MAX_NUM_SEQS
+COMPOSE_PROFILES=${LLM_STT_MODEL:+stt}
 EOF
 )"
   ( umask 077; printf '%s\n' "$env_new" > "$env_file" )
 
   cat > /etc/systemd/system/suite366-vllm.service <<EOF
 [Unit]
-Description=Suite 366 — vLLM (generative + embeddings)
+Description=Suite 366 — vLLM (generative + embeddings, + transcription where the profile allows)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -174,6 +208,13 @@ EOF
   else
     warn "vLLM embeddings not ready yet (see: docker logs suite366-vllm-embed)."
   fi
+  if [[ -n "$LLM_STT_MODEL" ]]; then
+    if wait_http "http://$SUITE_IP:$STT_PORT/health" "vLLM transcription"; then
+      warmup_stt "http://$SUITE_IP:$STT_PORT" "$LLM_STT_MODEL"
+    else
+      warn "vLLM transcription not ready yet (see: docker logs suite366-vllm-stt)."
+    fi
+  fi
   # The nginx proxy only becomes healthy once both vLLM backends are healthy
   # (depends_on: service_healthy). nginx itself starts in ~1s.
   if wait_http "http://$SUITE_IP:$PROXY_PORT/health" "vLLM unified proxy"; then
@@ -193,6 +234,32 @@ warmup_chat() { # warmup_chat BASE_URL MODEL
     -H "Authorization: Bearer $VLLM_API_KEY" -H "Content-Type: application/json" \
     -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":3}" \
     >/dev/null 2>&1 && info "  generative warm." || warn "  generative warmup skipped (curl failed, non-blocking)."
+}
+# Two seconds of a 440 Hz tone: enough to run the encoder and the decoder once.
+# The transcript is noise; the point is the compiled kernels the first real
+# dictation would otherwise wait for.
+write_warmup_wav() { # write_warmup_wav PATH
+  python3 - "$1" <<'PYW'
+import math, struct, sys
+sr = 16000; n = sr * 2
+pcm = b''.join(struct.pack('<h', int(3000 * math.sin(2 * math.pi * 440 * i / sr))) for i in range(n))
+hdr = (b'RIFF' + struct.pack('<I', 36 + len(pcm)) + b'WAVEfmt '
+       + struct.pack('<IHHIIHH', 16, 1, 1, sr, sr * 2, 2, 16) + b'data' + struct.pack('<I', len(pcm)))
+open(sys.argv[1], 'wb').write(hdr + pcm)
+PYW
+}
+warmup_stt() { # warmup_stt BASE_URL MODEL
+  local base="$1" model="$2" wav
+  info "Warming up transcription JIT…"
+  wav="$(mktemp --suffix=.wav)"
+  if write_warmup_wav "$wav" && curl -fsS -m 300 "$base/v1/audio/transcriptions" \
+       -H "Authorization: Bearer $VLLM_API_KEY" \
+       -F "model=$model" -F "file=@$wav;type=audio/wav" >/dev/null 2>&1; then
+    info "  transcription warm."
+  else
+    warn "  transcription warmup skipped (curl failed, non-blocking)."
+  fi
+  rm -f "$wav"
 }
 warmup_embed() { # warmup_embed BASE_URL MODEL
   local base="$1" model="$2"

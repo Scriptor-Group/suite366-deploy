@@ -90,6 +90,14 @@ config:
   VLLM_MODEL_LIGHT: "@LLM_MODEL@"
   VLLM_MODEL_VISION: "@LLM_MODEL@"
   VLLM_MODEL_EMBEDDING: "@EMBED_MODEL@"
+  # Transcription model (speech-to-text), served by a third vLLM behind the
+  # same proxy (/v1/audio/* -> vllm-stt) for the model profiles that leave the
+  # memory for it. EMPTY when the active profile has none: the app then says
+  # "no transcription model configured" instead of calling a route nothing
+  # serves. The app seeds it as an AIModel row with supportsTranscription and
+  # makes it the organisation's default; switch-model.sh keeps the rows in
+  # step with this value on every switch.
+  VLLM_MODEL_TRANSCRIPTION: "@STT_MODEL@"
   VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
   # Max context window (tokens) the app advertises for the local model, so
   # prompt assembly / truncation sizes correctly. install.sh substitutes
