@@ -36,7 +36,7 @@ global:
 # image.repository stays at the chart default (ghcr.io/scriptor-group/suite-366);
 # the GHCR packages are public so no imagePullSecrets are needed.
 image:
-  tag: "1.11.3"
+  tag: "1.11.7"
 
 replicas: 1
 podAntiAffinity:
@@ -349,9 +349,9 @@ sandbox:
   # Pinned to the current release (chart defaults are :latest). pullPolicy
   # IfNotPresent overrides the chart's Always so runner/api restart offline.
   api:
-    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.11.3
+    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.11.7
     pullPolicy: IfNotPresent
-  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.3
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.7
   # Tune sessions/limits if the GB10 unified memory budget is tight — defaults
   # aim at 20 pods × 512 MB.
 
@@ -368,7 +368,7 @@ sandbox:
     # bien cette image (matrice `Build sandbox` du workflow Publish Public
     # Image), donc `latest` n'a plus de raison d'être — et sur une appliance
     # censée redémarrer hors-ligne, c'est le seul tag qui ne garantit rien.
-    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.3
+    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.7
     # IfNotPresent : redémarrage offline (l'image est pré-pullée par install.sh)
     pullPolicy: IfNotPresent
     storageClass: local-path
