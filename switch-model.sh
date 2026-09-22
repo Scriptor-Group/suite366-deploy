@@ -291,8 +291,11 @@ build_sql() {
 SELECT CASE WHEN to_regclass('"public"."AIModel"') IS NULL THEN 'off' ELSE 'on' END AS have_ai \gset
 \if :have_ai
 WITH m AS (
+  -- The transcription row is modelType LLM too (the app has no STT type; the
+  -- flag is what distinguishes it): without the exclusion this rename hits it
+  -- on the second run and dies on the (providerId, modelId) unique key.
   UPDATE "public"."AIModel" SET "modelId" = :'model', "displayName" = :'model', "contextWindow" = :ctx
-   WHERE "modelType" = 'LLM'
+   WHERE "modelType" = 'LLM' AND "supportsTranscription" = false
      AND "providerId" IN (SELECT id FROM "public"."AIProvider" WHERE provider = 'VLLM')
      AND ("modelId" IS DISTINCT FROM :'model' OR "contextWindow" IS DISTINCT FROM :ctx)
   RETURNING 1
@@ -565,14 +568,20 @@ if [[ -z "$pg" ]]; then
 else
   # stdin is redirected explicitly: `kubectl exec -i` reads the caller's stdin
   # and would swallow the rest of this script if it arrived through a pipe.
+  # stderr is KEPT: a statement that fails (a constraint, a missing column after
+  # a schema change) must be named, not reported as "could not reach Postgres".
+  sql_err="$(mktemp)"
   out="$(build_sql | kc -n "$NAMESPACE" exec -i "deploy/$pg" -- \
-          sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -tAq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' 2>/dev/null)" || out=""
+          sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -tAq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' 2>"$sql_err")" || out=""
   case "$out" in
     *no-table*) warn "No AIModel table yet (the app's migrations have not run) — nothing to realign." ;;
     aimodel=*)  info "database: $out" ;;
-    "")         warn "Could not reach Postgres in deploy/$pg — database NOT updated." ;;
+    "")         warn "Postgres realignment FAILED in deploy/$pg — database NOT updated."
+                grep -vE '^command terminated' "$sql_err" | tail -3 | sed 's/^/      /' >&2
+                warn "  Re-run: $0 $TARGET   (idempotent once the cause is fixed)" ;;
     *)          warn "Unexpected psql output: $out" ;;
   esac
+  rm -f "$sql_err"
 fi
 
 # --- 6. warm the JIT so the first user does not pay for it --------------------

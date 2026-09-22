@@ -210,6 +210,9 @@ contains "dry-run qwen27b : SQL — modèle passé à psql"  "$d" "\\set stt '$S
 contains "dry-run qwen27b : SQL — défaut d'organisation" "$d" 'SET "defaultTranscriptionModelId" = s.id'
 contains "dry-run qwen27b : SQL — bornée à NOS providers vLLM" "$d" "http://10.99.0.1:8000/%"
 contains "dry-run qwen27b : SQL — id fourni (Prisma ne le génère que côté client)" "$d" "gen_random_uuid()::text"
+# Trouvé à la deuxième bascule réelle : la ligne STT est modelType LLM elle aussi,
+# et le renommage du modèle génératif la percutait sur la clé unique.
+contains "dry-run : le renommage LLM épargne la ligne de transcription" "$d" '"modelType" = '"'"'LLM'"'"' AND "supportsTranscription" = false'
 # Vers un profil sans transcription : tout s'éteint, rien ne reste à moitié allumé.
 contains "dry-run flash-next : STT_MODEL vidé"          "$f" "STT_MODEL="$'\n'
 contains "dry-run flash-next : profil compose désactivé" "$f" "COMPOSE_PROFILES="$'\n'
