@@ -382,21 +382,38 @@ jobs:
           # without the full matrix green on this exact SHA is how a broken
           # backup agent reaches the fleet with a signature saying it is fine.
           # (--jq is gh's built-in expression evaluator, not the jq binary.)
+          #
+          # A release run posts its OWN check run on this commit, and that one
+          # is in_progress by definition while this step reads the list — so the
+          # gate has to skip itself or it fails every real publish. Skipping it
+          # by job name is what broke: the name was `release` while this lived
+          # in its own workflow, and became `channel` when the two were merged
+          # into one (#37). Nothing caught it, because a dry run downgrades this
+          # step to a warning and a dry run is how the workflow gets tested.
+          # The run ID cannot drift that way, and it also covers the sibling
+          # `package` job — so match on details_url, which carries it.
           runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
-                    --jq '.check_runs[] | [.name, .status, (.conclusion // "-")] | @tsv' || true)"
+                    --jq '.check_runs[] | [.name, .status, (.conclusion // "-"), (.details_url // "-")] | @tsv' || true)"
           rc=0
-          if [[ -z "$runs" ]]; then
+          seen=0
+          while IFS=$'\t' read -r name status concl url; do
+            [[ -z "$name" ]] && continue
+            if [[ "$url" == *"/actions/runs/$GITHUB_RUN_ID/"* ]]; then
+              printf '  skip    %s (this release run)\n' "$name"
+              continue
+            fi
+            seen=1
+            case "$status:$concl" in
+              completed:success|completed:neutral|completed:skipped) printf '  ok      %s\n' "$name" ;;
+              completed:*) echo "::error::check '$name' concluded $concl on this commit."; rc=1 ;;
+              *) echo "::error::check '$name' is still $status — wait for CI, then re-run."; rc=1 ;;
+            esac
+          done <<<"$runs"
+          # Emptiness is checked AFTER the filter: a commit whose only check run
+          # is this release job is a commit CI has not seen either.
+          if [[ $seen -eq 0 ]]; then
             echo "::error::no check run reported on $GITHUB_SHA — refusing to sign a commit CI has not seen."
             rc=1
-          else
-            while IFS=$'\t' read -r name status concl; do
-              [[ "$name" == "release" ]] && continue
-              case "$status:$concl" in
-                completed:success|completed:neutral|completed:skipped) printf '  ok      %s\n' "$name" ;;
-                completed:*) echo "::error::check '$name' concluded $concl on this commit."; rc=1 ;;
-                *) echo "::error::check '$name' is still $status — wait for CI, then re-run."; rc=1 ;;
-              esac
-            done <<<"$runs"
           fi
           if [[ $rc -ne 0 && "$DRY_RUN" == "true" ]]; then
             echo "::warning::CI is not green on this commit; continuing because this is a dry run."
