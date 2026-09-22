@@ -157,7 +157,12 @@ services:
     profiles: ["stt"]
     # Built on the box by lib/vllm.sh: ${VLLM_IMAGE} + ./stt/ (the audio
     # extras the arm64 image ships without — see llm/stt/Dockerfile).
-    image: ${VLLM_STT_IMAGE}
+    # The `:-` defaults below exist for ONE reason: a box whose .env predates
+    # transcription. Compose warns on every unset variable at each boot and
+    # refuses `--profile stt` outright without an image; the service is off on
+    # such a box anyway. llm/profiles.sh is the authority for the values —
+    # lib/vllm.sh and switch-model.sh write all of them into .env.
+    image: ${VLLM_STT_IMAGE:-suite366/vllm-stt:unset}
     container_name: suite366-vllm-stt
     restart: unless-stopped
     gpus: all
@@ -174,18 +179,18 @@ services:
       - ${CACHE_DIR}/flashinfer:/root/.cache/flashinfer
       - ${CACHE_DIR}/triton:/root/.triton
     ports:
-      - "${BIND_IP}:${STT_PORT}:8000"
+      - "${BIND_IP}:${STT_PORT:-8003}:8000"
     command:
-      - ${STT_MODEL}
-      - --served-model-name=${STT_MODEL}
+      - ${STT_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      - --served-model-name=${STT_MODEL:-Qwen/Qwen3-ASR-1.7B}
       - --dtype=bfloat16
       # Same pattern as the embed: an explicit KV budget, and a fraction that
       # only has to clear vLLM's start-up free-memory check. The numbers and
       # their reasoning live in llm/profiles.sh (LLM_STT_*).
-      - --gpu-memory-utilization=${STT_GPU_MEM_UTIL}
-      - --kv-cache-memory-bytes=${STT_KV_CACHE_BYTES}
-      - --max-model-len=${STT_MAX_MODEL_LEN}
-      - --max-num-seqs=${STT_MAX_NUM_SEQS}
+      - --gpu-memory-utilization=${STT_GPU_MEM_UTIL:-0.10}
+      - --kv-cache-memory-bytes=${STT_KV_CACHE_BYTES:-2147483648}
+      - --max-model-len=${STT_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${STT_MAX_NUM_SEQS:-8}
       - --load-format=fastsafetensors
       - --host=0.0.0.0
       - --port=8000

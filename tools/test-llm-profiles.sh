@@ -119,10 +119,10 @@ head_ "llm/docker-compose.yml + nginx.conf + stt/Dockerfile"
 C="$(cat "$REPO_ROOT/llm/docker-compose.yml")"
 contains "compose : service vllm-stt"                 "$C" "container_name: suite366-vllm-stt"
 contains "compose : derrière le profil compose stt"   "$C" 'profiles: ["stt"]'
-contains "compose : image construite localement"      "$C" 'image: ${VLLM_STT_IMAGE}'
-contains "compose : budget KV explicite"              "$C" -- '--kv-cache-memory-bytes=${STT_KV_CACHE_BYTES}'
-contains "compose : max_model_len borné"              "$C" -- '--max-model-len=${STT_MAX_MODEL_LEN}'
-contains "compose : port dédié"                       "$C" '${BIND_IP}:${STT_PORT}:8000'
+contains "compose : image construite localement"      "$C" 'image: ${VLLM_STT_IMAGE:-'
+contains "compose : budget KV explicite"              "$C" -- '--kv-cache-memory-bytes=${STT_KV_CACHE_BYTES:-'
+contains "compose : max_model_len borné"              "$C" -- '--max-model-len=${STT_MAX_MODEL_LEN:-'
+contains "compose : port dédié"                       "$C" '${BIND_IP}:${STT_PORT:-8003}:8000'
 # Le proxy ne doit PAS dépendre du service : un depends_on activerait le profil
 # de force et le conteneur tournerait pour tous les modèles.
 proxy_block="$(sed -n '/^  vllm-proxy:/,$p' "$REPO_ROOT/llm/docker-compose.yml")"
