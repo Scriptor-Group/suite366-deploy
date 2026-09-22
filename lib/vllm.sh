@@ -71,6 +71,11 @@ deploy_vllm() {
   # the deploy repo: the profile table, the entrypoint that knows every
   # profile's flags, and Gemma's chat template (mounted by the compose for all
   # three, read by one).
+  # switch-model.sh lives at $DATA_DIR, next to update.sh and backup.sh, because
+  # it is an OPERATOR script: `sudo /opt/suite366/switch-model.sh`. Without this
+  # a box could read the profile table and never act on it.
+  fetch "switch-model.sh"                       > "$DATA_DIR/switch-model.sh"
+  chmod 750 "$DATA_DIR/switch-model.sh"
   fetch "llm/profiles.sh"                       > "$DATA_DIR/llm/profiles.sh"
   fetch "llm/serve-llm.sh"                      > "$DATA_DIR/llm/serve-llm.sh"
   fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
@@ -80,6 +85,11 @@ deploy_vllm() {
   # returns 1 when the test is false and `set -e` kills the install.
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_flash_next_image "$VLLM_LLM_IMAGE"; fi
   apply_vllm_sysctl "$LLM_P_SWAPPINESS"
+  # Arms the .path unit that lets an org admin switch model from the app, and
+  # writes the first state.json the UI reads. Idempotent, re-run on every
+  # install — the fleet converges here, `update.sh` never replays deploy_vllm.
+  "$DATA_DIR/switch-model.sh" install-units \
+    || warn "could not arm the model-switch trigger (the CLI still works)."
   local env_file="$DATA_DIR/llm/.env" env_old=""
   [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"
   local env_new

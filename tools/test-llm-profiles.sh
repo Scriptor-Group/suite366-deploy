@@ -144,5 +144,32 @@ contains "dry-run flash-next : swappiness 10"    "$f" "swappiness 10"
 absent   "dry-run qwen27b : aucun build"         "$d" "image build:"
 rm -rf "$BOX"
 
+# --- 4. le pont vers l'app : state.json ---------------------------------------
+head_ "switch-model.sh publish-state (pont UI)"
+BOX2="$(mktemp -d)"; mkdir -p "$BOX2/llm" "$BOX2/models/hub/models--nvidia--Qwen3.8-27B-NVFP4"
+cp "$REPO_ROOT/llm/profiles.sh" "$BOX2/llm/"
+printf 'VLLM_IMAGE=%s\nLLM_PROFILE=qwen27b\nLLM_MODEL=nvidia/Qwen3.8-27B-NVFP4\nMODELS_DIR=%s/models\n' \
+  "$BASE" "$BOX2" > "$BOX2/llm/.env"
+DATA_DIR="$BOX2" LLM_STATE_DIR="$BOX2/llm-state" bash "$REPO_ROOT/switch-model.sh" publish-state >/dev/null 2>&1
+STATE="$BOX2/llm-state/state.json"
+if [[ -f "$STATE" ]]; then ok "state.json est écrit"; else ko "state.json est écrit"; fi
+if python3 -m json.tool "$STATE" >/dev/null 2>&1; then ok "state.json est du JSON valide"; else ko "state.json est du JSON valide"; fi
+probe() { python3 -c "import json,sys; d=json.load(open('$STATE')); print($1)" 2>/dev/null; }
+check "state : profil actif"           "$(probe 'd["active"]')" "qwen27b"
+check "state : les trois profils"      "$(probe 'len(d["profiles"])')" "3"
+check "state : statut de bascule au repos" "$(probe 'd["switch"]["status"]')" "idle"
+# Ce que l'UI doit pouvoir dire à l'admin AVANT qu'il clique : ce modèle est-il
+# déjà sur le disque, ou est-ce 133 Go à télécharger ?
+check "state : checkpoint présent détecté" "$(probe '[p for p in d["profiles"] if p["key"]=="qwen27b"][0]["downloaded"]')" "True"
+check "state : checkpoint absent détecté"  "$(probe '[p for p in d["profiles"] if p["key"]=="flash-next"][0]["downloaded"]')" "False"
+check "state : flash-next demande un build" "$(probe '[p for p in d["profiles"] if p["key"]=="flash-next"][0]["needs_build"]')" "True"
+# Aucun secret ne doit transiter par le répertoire partagé avec le pod.
+if grep -rqi "api.key\|sk-" "$BOX2/llm-state/" 2>/dev/null; then
+  ko "le répertoire partagé ne contient aucun secret"
+else
+  ok "le répertoire partagé ne contient aucun secret"
+fi
+rm -rf "$BOX2"
+
 printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -181,6 +181,9 @@ remove_vllm_stack() {
   log "vLLM Docker stack"
   # install.sh (lib/vllm.sh) lowers vm.swappiness for the Flash-Next engine.
   rm -f /etc/sysctl.d/90-suite366-vllm.conf
+  # …and arms the unit that lets the app request a model switch.
+  systemctl disable --now suite366-llm-switch.path >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/suite366-llm-switch.path /etc/systemd/system/suite366-llm-switch.service
   local compose="$DATA_DIR/llm/docker-compose.yml"
   if [[ -f "$compose" ]]; then
     ( cd "$DATA_DIR/llm" && docker compose down --remove-orphans >/dev/null 2>&1 ) \

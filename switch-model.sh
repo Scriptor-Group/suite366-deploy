@@ -26,9 +26,21 @@
 #   /opt/suite366/switch-model.sh <profile> --dry-run
 #                                                print the plan and the SQL,
 #                                                change nothing
+#   /opt/suite366/switch-model.sh publish-state  refresh state.json for the app
+#   /opt/suite366/switch-model.sh consume-trigger  run the switch the app asked for
+#   /opt/suite366/switch-model.sh install-units  (re)install the .path unit
+#
+# App <-> host bridge ($DATA_DIR/llm-state, hostPath-mounted into drive-app at
+# /appliance-llm — see values.yaml `extraVolumes`):
+#   state.json        written here     — the three profiles, the active one,
+#                                        the engine's health, the switch status
+#   switch-requested  written by the app — line 1 the profile, line 2 the admin
+# The pod runs as uid/gid 1001 and k8s does NOT apply fsGroup to hostPath
+# volumes, so the dir is root:1001 mode 0770 (group-writable for the trigger).
+# It holds NO secret: llm/.env with the vLLM key stays out of the pod's reach.
 #
 # Env overrides: DATA_DIR, NAMESPACE, RELEASE, CHART_REF, KUBECONFIG_PATH,
-# PG_DEPLOY, VLLM_SYSCTL_FILE.
+# PG_DEPLOY, VLLM_SYSCTL_FILE, LLM_STATE_DIR.
 # =============================================================================
 set -euo pipefail
 
@@ -42,6 +54,11 @@ PG_DEPLOY="${PG_DEPLOY:-}"
 LLM_DIR="$DATA_DIR/llm"
 ENV_FILE="$LLM_DIR/.env"
 VALUES="$DATA_DIR/values.yaml"
+# Shared with drive-app. Same ownership rule as $DATA_DIR/updates (update.sh).
+LLM_STATE_DIR="${LLM_STATE_DIR:-$DATA_DIR/llm-state}"
+STATE_JSON="$LLM_STATE_DIR/state.json"
+TRIGGER="$LLM_STATE_DIR/switch-requested"
+APP_GID=1001
 
 c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
 log()  { printf "${c_g}==>${c_0} ${c_b}%s${c_0}\n" "$*"; }
@@ -61,6 +78,7 @@ for arg in "$@"; do
   esac
 done
 [[ -n "$TARGET" ]] || { TARGET=list; }
+REQUESTED_BY=""
 
 [[ -f "$LLM_DIR/profiles.sh" ]] \
   || die "$LLM_DIR/profiles.sh missing — this box predates model profiles. Re-run install.sh."
@@ -87,7 +105,103 @@ all_profile_models() {
   done
 }
 
+ensure_state_dir() {
+  mkdir -p "$LLM_STATE_DIR"
+  chown "root:$APP_GID" "$LLM_STATE_DIR" 2>/dev/null || true
+  chmod 0770 "$LLM_STATE_DIR" 2>/dev/null || true
+}
+
+json_str() { # json_str VALUE -> a JSON string literal, escaped
+  printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
+
+checkpoint_on_disk() { # checkpoint_on_disk HF_ID
+  local models_dir; models_dir="$(env_get MODELS_DIR)"
+  [[ -n "$models_dir" ]] || return 1
+  [[ -d "$models_dir/hub/models--${1//\//--}" ]]
+}
+
+# state.json — the app reads this and never runs anything itself. Written via
+# tmp+rename so a reader never sees a half-written file.
+publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
+  local st="${1:-idle}" tgt="${2:-}" msg="${3:-}" tmp p first=1
+  ensure_state_dir
+  tmp="$(mktemp)"
+  {
+    printf '{\n  "schema": 1,\n'
+    printf '  "updated_at": %s,\n' "$(json_str "$(date -Is)")"
+    printf '  "active": %s,\n' "$(json_str "$(env_get LLM_PROFILE)")"
+    printf '  "engine": {"image": %s, "state": %s, "health": %s},\n' \
+      "$(json_str "$(docker inspect -f '{{.Config.Image}}' suite366-vllm-llm 2>/dev/null || true)")" \
+      "$(json_str "$(docker inspect -f '{{.State.Status}}' suite366-vllm-llm 2>/dev/null || true)")" \
+      "$(json_str "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' suite366-vllm-llm 2>/dev/null || true)")"
+    printf '  "switch": {"status": %s, "target": %s, "message": %s, "updated_at": %s},\n' \
+      "$(json_str "$st")" "$(json_str "$tgt")" "$(json_str "$msg")" "$(json_str "$(date -Is)")"
+    printf '  "profiles": ['
+    for p in $LLM_PROFILES; do
+      ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
+        local dl=false; if checkpoint_on_disk "$LLM_P_MODEL"; then dl=true; fi
+        printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s}' \
+          "$( [[ "$first" == 1 ]] && printf '' || printf ',' )" \
+          "$(json_str "$p")" "$(json_str "$LLM_P_MODEL")" "$(json_str "$(llm_profile_summary "$p")")" \
+          "$LLM_P_CONTEXT_WINDOW" \
+          "$( [[ "$LLM_P_NEEDS_BUILD" == 1 ]] && printf true || printf false )" "$dl" )
+      first=0
+    done
+    printf '\n  ]\n}\n'
+  } > "$tmp"
+  chmod 0644 "$tmp"; mv -f "$tmp" "$STATE_JSON"
+}
+
 case "$TARGET" in
+  publish-state)
+    publish_state idle
+    info "state published to $STATE_JSON"
+    exit 0 ;;
+  install-units)
+    [[ $EUID -eq 0 ]] || die "run me as root."
+    ensure_state_dir
+    cat > /etc/systemd/system/suite366-llm-switch.service <<EOF
+[Unit]
+Description=Suite 366 — switch the generative model (triggered from the app UI)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$DATA_DIR/switch-model.sh consume-trigger
+TimeoutStartSec=0
+EOF
+    cat > /etc/systemd/system/suite366-llm-switch.path <<EOF
+[Unit]
+Description=Suite 366 — watch for model-switch requests from the app
+
+[Path]
+PathExists=$TRIGGER
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now suite366-llm-switch.path >/dev/null 2>&1 \
+      || warn "could not enable the switch path unit (systemd offline?)."
+    publish_state idle
+    info "App-trigger unit armed (watching $TRIGGER)."
+    exit 0 ;;
+  consume-trigger)
+    [[ $EUID -eq 0 ]] || die "run me as root."
+    [[ -f "$TRIGGER" ]] || { info "no pending request."; exit 0; }
+    # Read THEN delete: a request that fails must not replay on the next boot.
+    want="$(sed -n 1p "$TRIGGER" | tr -dc 'a-z0-9-' | head -c 32)"
+    REQUESTED_BY="$(sed -n 2p "$TRIGGER" | tr -d '\r\n' | head -c 200)"
+    rm -f "$TRIGGER"
+    if ! llm_profile_known "$want"; then
+      publish_state error "$want" "unknown profile requested"
+      die "trigger asked for an unknown profile: '$want'"
+    fi
+    info "request from ${REQUESTED_BY:-unknown}: switch to $want"
+    TARGET="$want"
+    ;;
   list)
     printf '%-12s %-34s %s\n' PROFILE MODEL NOTES
     for p in $LLM_PROFILES; do
@@ -224,10 +338,13 @@ rollback() {
   cp "$ENV_BACKUP" "$ENV_FILE"
   if [[ "$SYSCTL_WAS_PRESENT" == 0 ]]; then rm -f "$VLLM_SYSCTL_FILE"; fi
   ( cd "$LLM_DIR" && docker compose up -d vllm-llm >/dev/null 2>&1 ) || true
+  publish_state error "$TARGET" "the $TARGET engine did not come up; rolled back to ${CUR_PROFILE:-the previous model}"
   die "The $TARGET engine did not come up. The chart and the database were NOT touched, so the box is back where it started. Logs: docker logs suite366-vllm-llm"
 }
 
 # --- 3. bring the new engine up, and wait for it ------------------------------
+# From here the app's UI can follow along in state.json.
+publish_state running "$TARGET" "starting the $TARGET engine"
 log "Recreating suite366-vllm-llm on $TARGET"
 ( cd "$LLM_DIR" && docker compose up -d --force-recreate vllm-llm >/dev/null ) || rollback
 
@@ -240,6 +357,10 @@ while :; do
   if [[ "$health" == healthy ]]; then break; fi
   if [[ "$state" != running ]]; then warn "container state: $state"; rollback; fi
   if [[ "$(date +%s)" -ge "$deadline" ]]; then warn "still $health after 60 min"; rollback; fi
+  # Republished every tick: a Flash-Next first boot is a ~133 GB download, and
+  # the admin watching the UI needs the engine's real state, not the one the
+  # previous container had when the switch started.
+  publish_state running "$TARGET" "waiting for the $TARGET engine ($health)"
   sleep 10
 done
 info "engine healthy."
@@ -306,6 +427,7 @@ if [[ -n "$key" && -n "$ip" && -n "$port" ]]; then
     >/dev/null 2>&1 && info "warm-up ok." || warn "warm-up call failed (non-blocking)."
 fi
 
+publish_state success "$TARGET" "now serving $LLM_P_MODEL"
 set -e
 log "Now serving $LLM_P_MODEL ($TARGET)."
 info "Check it end to end:  $0 status"
