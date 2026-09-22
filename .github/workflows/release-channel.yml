@@ -105,6 +105,7 @@ jobs:
     permissions:
       contents: write   # commit + push the release
       checks: read      # read CI's verdict on this commit
+      actions: write    # dispatch ci.yml on the commit this job pushes
     steps:
       # The signature pins the update.sh and backup.sh IN THIS TREE, and the
       # fleet fetches them from beside the manifest. Releasing from a feature
@@ -331,20 +332,34 @@ jobs:
 
           # The same four expressions update.sh applies on the box when it rolls
           # the app pins (update.sh, "rewriting values.yaml pins").
-          sed -i "s|^  tag: \".*\"|  tag: \"$NEW_APP\"|" values.yaml
-          sed -i "s|\(suite-366-sandbox-api:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
-          sed -i "s|\(suite-366-sandbox-runner:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
-          sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$NEW_APP|" values.yaml
+          #
+          # The golden render that hosts-verify diffs against is values.yaml
+          # after substitution, so it carries those same four pins — and a roll
+          # that moves one file and not the other leaves CI red on the release
+          # commit, on a fixture nobody edited. (Unnoticed until now because the
+          # release commit gets no CI of its own; it surfaces on the NEXT run,
+          # at the gate.) Rewriting it with the same four expressions keeps the
+          # fixture honest: any OTHER drift in the render still fails the test,
+          # which a blanket UPDATE_GOLDEN=1 would have swallowed.
+          golden=tools/testdata/values-plain.rendered.yaml
+          for f in values.yaml "$golden"; do
+            sed -i "s|^  tag: \".*\"|  tag: \"$NEW_APP\"|" "$f"
+            sed -i "s|\(suite-366-sandbox-api:\)[^\"[:space:]]*|\1$NEW_APP|" "$f"
+            sed -i "s|\(suite-366-sandbox-runner:\)[^\"[:space:]]*|\1$NEW_APP|" "$f"
+            sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$NEW_APP|" "$f"
+          done
 
           rc=0
-          got="$(sed -n 's/^  tag: "\(.*\)"/\1/p' values.yaml | head -1)"
-          [[ "$got" == "$NEW_APP" ]] || { echo "::error::values.yaml image.tag is $got, expected $NEW_APP"; rc=1; }
-          for img in suite-366-sandbox-api suite-366-sandbox-runner suite-366-workbench-runner; do
-            got="$(sed -n "s|.*$img:\([^\"[:space:]]*\).*|\1|p" values.yaml | head -1)"
-            [[ "$got" == "$NEW_APP" ]] || { echo "::error::values.yaml pins $img:$got, expected $NEW_APP"; rc=1; }
+          for f in values.yaml "$golden"; do
+            got="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$f" | head -1)"
+            [[ "$got" == "$NEW_APP" ]] || { echo "::error::$f image.tag is $got, expected $NEW_APP"; rc=1; }
+            for img in suite-366-sandbox-api suite-366-sandbox-runner suite-366-workbench-runner; do
+              got="$(sed -n "s|.*$img:\([^\"[:space:]]*\).*|\1|p" "$f" | head -1)"
+              [[ "$got" == "$NEW_APP" ]] || { echo "::error::$f pins $img:$got, expected $NEW_APP"; rc=1; }
+            done
+            echo "  $f app pins -> $NEW_APP"
           done
-          echo "  values.yaml app pins -> $NEW_APP"
-          git --no-pager diff --stat -- lib/config.sh values.yaml
+          git --no-pager diff --stat -- lib/config.sh values.yaml "$golden"
           exit $rc
 
       - name: every tracked script parses
@@ -413,6 +428,7 @@ jobs:
           # is this release job is a commit CI has not seen either.
           if [[ $seen -eq 0 ]]; then
             echo "::error::no check run reported on $GITHUB_SHA — refusing to sign a commit CI has not seen."
+            echo "::error::A release commit is pushed with GITHUB_TOKEN and gets no push event of its own, so this is what a second roll in a row looks like. Run: gh workflow run ci.yml --ref $GITHUB_REF_NAME, wait for it, then re-run this."
             rc=1
           fi
           if [[ $rc -ne 0 && "$DRY_RUN" == "true" ]]; then
@@ -572,7 +588,8 @@ jobs:
           install -d "$RUNNER_TEMP/out"
           cp channel.json channel.json.sig "$RUNNER_TEMP/out/"
           cp "$RUNNER_TEMP/package.pub" "$RUNNER_TEMP/out/derived-public-key.pem"
-          git --no-pager diff -- channel.json lib/config.sh values.yaml > "$RUNNER_TEMP/out/release.diff"
+          git --no-pager diff -- channel.json lib/config.sh values.yaml \
+            tools/testdata/values-plain.rendered.yaml > "$RUNNER_TEMP/out/release.diff"
           git --no-pager diff --stat > "$RUNNER_TEMP/out/diffstat.txt"
 
       - uses: actions/upload-artifact@v4
@@ -600,7 +617,8 @@ jobs:
           # channel.json.sig from independent cache entries: published a commit
           # apart, there is a window where a box fetches the new manifest with
           # the old signature, refuses the channel and waits a day.
-          git add channel.json channel.json.sig lib/config.sh values.yaml
+          git add channel.json channel.json.sig lib/config.sh values.yaml \
+                  tools/testdata/values-plain.rendered.yaml
 
           # The signature is 64 raw bytes with no trailing newline, and this repo
           # has no .gitattributes. Check the INDEX, not the worktree: if anything
@@ -660,7 +678,26 @@ jobs:
             exit 1
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "::warning::a push made with GITHUB_TOKEN triggers no workflow, so ci.yml and channel-signature.yml will not run on the release commit. The equivalent checks ran in this job, against the key derived from the secret."
+          echo "::warning::a push made with GITHUB_TOKEN triggers no workflow, so ci.yml and channel-signature.yml do not run on the release commit by themselves. The equivalent checks ran in this job, against the key derived from the secret."
+
+      # An explicit dispatch is not the push event, so it is not caught by the
+      # no-recursion rule the warning above describes. It matters beyond
+      # tidiness: `CI is green on this commit` reads the check runs of the tip,
+      # and a release commit carrying none stops the NEXT release with "no check
+      # run reported" — a second roll in a row (a channel fix right after a
+      # roll, exactly when you are in a hurry) is blocked until someone kicks CI
+      # by hand. Best effort: if the token cannot dispatch, say what to run.
+      - name: kick CI on the release commit
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if gh workflow run ci.yml --ref "$GITHUB_REF_NAME"; then
+            echo "dispatched ci.yml on $GITHUB_REF_NAME"
+          else
+            echo "::warning::could not dispatch ci.yml. The release stands, but the commit carries no check run, so the next release will refuse to sign until CI has seen it. Run: gh workflow run ci.yml --ref $GITHUB_REF_NAME"
+          fi
 
       - name: the published pair verifies over the CDN
         if: ${{ !inputs.dry_run }}
