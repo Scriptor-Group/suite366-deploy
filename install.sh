@@ -48,20 +48,28 @@
 #   TLS_CA_FILE                TLS_MODE=provided: the issuing CA, mounted into
 #                              drive-app so it trusts OnlyOffice server-side
 #   ADMIN_EMAIL                default: admin@<DOMAIN>
-#   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve (defaults validated
-#                              on Spark: nvidia/Qwen3.8-Flash-Next-NVFP4 + Qwen3-VL-Embedding-8B)
+#   LLM_PROFILE                which generative model to serve: qwen27b
+#                              (default), flash-next or gemma. Each carries its
+#                              own image, memory budget and vLLM flags — see
+#                              llm/profiles.sh and README "Choosing a model".
+#                              Change it later with switch-model.sh, no reinstall.
+#   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve. LLM_MODEL defaults to
+#                              whatever LLM_PROFILE names; EMBED_MODEL defaults to
+#                              Qwen3-VL-Embedding-8B and is the same for all three.
 #   VLLM_IMAGE                 vLLM image arm64/Blackwell sm_121 (default
-#                              vllm/vllm-openai:v0.29.0, see README); the
-#                              generative container runs it plus the Flash-Next
-#                              patch set, built on the box as VLLM_LLM_IMAGE
+#                              vllm/vllm-openai:v0.29.0, see README): the embed
+#                              runs it and the Flash-Next image is built on it.
+#                              The gemma profile pins its own (vLLM 0.19).
 #   PROXY_IMAGE                URL-path proxy image (default nginx:alpine) —
 #                              unifies the 2 vLLM instances behind a single
 #                              OpenAI-compatible endpoint, wired into the
 #                              Suite 366 chart.
 #   LLM_GPU_MEM_UTIL,          fractions of the 121 GiB unified pool allocated
-#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0; defaults 0.71 / 0.20)
-#   LLM_MAX_NUM_SEQS,          generative tuning (defaults 2 / 131072 — the app
-#   LLM_MAX_MODEL_LEN          caps prompts at 128k; see README for the KV maths)
+#   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0). The generative side is
+#                              profile-driven (0.45 / 0.71 / 0.55); the embed is
+#                              0.20 for all three, with an explicit 4 GiB KV cap.
+#   LLM_MAX_NUM_SEQS,          generative tuning (2 slots for all three; context
+#   LLM_MAX_MODEL_LEN          262144 or 131072 per profile — see README)
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
 #   VLLM_EMBEDDING_DIMENSIONS  embedding vector dimension served by the local
 #                              model (default 4096 = Qwen3-VL-Embedding-8B)

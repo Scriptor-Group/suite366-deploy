@@ -9,6 +9,11 @@
 # from the NVMe by mmap — a vLLM patch set (llm/flash-next/, vendored from
 # blazux/qwen3.8-Flash-DGX) laid over the official v0.29.0 image. No registry
 # holds that image: it is built here, once per (base image, patch commit) tag.
+#
+# The patch SOURCES are laid down whatever the active profile, and the image is
+# built only for the profile that needs it: switching to Flash-Next later must
+# not require reaching the deploy repo again, on a box that may have no route
+# to it.
 FLASH_NEXT_FILES=(Dockerfile UPSTREAM_COMMIT serve-flash-next.sh
   src/vllm_ple_mmap.py src/patch_mamba_block_size.py src/patch_qsa_exact_topk.py
   src/vllm_fp8_hybrid_modelopt.py src/patch_mtp_draft_vocab.py src/draft_vocab_65536.npy
@@ -21,25 +26,35 @@ fetch_flash_next_files() {
   chmod 755 "$ctx/serve-flash-next.sh"
 }
 
-build_flash_next_image() {
-  local ctx="$DATA_DIR/llm/flash-next"
-  if docker image inspect "$VLLM_LLM_IMAGE" >/dev/null 2>&1; then
-    info "vLLM image $VLLM_LLM_IMAGE already built."
+build_flash_next_image() { # build_flash_next_image TAG
+  local tag="$1" ctx="$DATA_DIR/llm/flash-next"
+  if docker image inspect "$tag" >/dev/null 2>&1; then
+    info "vLLM image $tag already built."
     return 0
   fi
-  log "Building $VLLM_LLM_IMAGE ($VLLM_IMAGE + the Flash-Next patch set, ~3 min)"
+  log "Building $tag ($VLLM_IMAGE + the Flash-Next patch set, ~3 min)"
   docker pull -q "$VLLM_IMAGE" >/dev/null
   # stdout (the image id) is noise; stderr is where a failing step explains itself.
-  docker build -q -t "$VLLM_LLM_IMAGE" "$ctx" >/dev/null \
-    || die "docker build of $VLLM_LLM_IMAGE failed — see llm/flash-next/README.md"
+  docker build -q -t "$tag" "$ctx" >/dev/null \
+    || die "docker build of $tag failed — see llm/flash-next/README.md"
 }
 
-# With Flash-Next up the box has no memory headroom (117/121 GiB used) and
-# 7-10 GiB of swap in use; at the default swappiness of 60 pages were read back
-# from swap during every generation. 10 is what the recipe measured for it.
-set_vllm_sysctl() {
-  printf 'vm.swappiness = 10\n' > /etc/sysctl.d/90-suite366-vllm.conf
-  sysctl -q -w vm.swappiness=10 >/dev/null 2>&1 || true
+# Only Flash-Next asks for this: with it up the box has no memory headroom
+# (117/121 GiB used) and 7-10 GiB of swap in use, and at the default swappiness
+# of 60 pages were read back from swap during every generation. The other two
+# profiles leave the host default alone — and REMOVE the drop-in, so a box that
+# switched away does not keep a tuning meant for a model it no longer runs.
+VLLM_SYSCTL_FILE="${VLLM_SYSCTL_FILE:-/etc/sysctl.d/90-suite366-vllm.conf}"
+apply_vllm_sysctl() { # apply_vllm_sysctl [SWAPPINESS]  (empty = restore default)
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    [[ -f "$VLLM_SYSCTL_FILE" ]] || return 0
+    rm -f "$VLLM_SYSCTL_FILE"
+    info "vm.swappiness drop-in removed (this profile does not need it)."
+    return 0
+  fi
+  printf 'vm.swappiness = %s\n' "$want" > "$VLLM_SYSCTL_FILE"
+  sysctl -q -w "vm.swappiness=$want" >/dev/null 2>&1 || true
 }
 
 # --- 2. vLLM stack (Docker host) --------------------------------------------
@@ -52,17 +67,26 @@ deploy_vllm() {
   fetch "llm/docker-compose.yml"                > "$DATA_DIR/llm/docker-compose.yml"
   # nginx proxy config (static URL-path routing, no templating needed).
   fetch "llm/nginx.conf"                        > "$DATA_DIR/llm/nginx.conf"
-  # The generative container is Flash-Next specific: patched image + entrypoint
-  # (llm/flash-next/README.md), and a host swappiness measured for it.
+  # The three things switch-model.sh needs on the box to change model without
+  # the deploy repo: the profile table, the entrypoint that knows every
+  # profile's flags, and Gemma's chat template (mounted by the compose for all
+  # three, read by one).
+  fetch "llm/profiles.sh"                       > "$DATA_DIR/llm/profiles.sh"
+  fetch "llm/serve-llm.sh"                      > "$DATA_DIR/llm/serve-llm.sh"
+  fetch "llm/tool_chat_template_gemma4.jinja"   > "$DATA_DIR/llm/tool_chat_template_gemma4.jinja"
+  chmod 755 "$DATA_DIR/llm/serve-llm.sh"
   fetch_flash_next_files
-  build_flash_next_image
-  set_vllm_sysctl
+  # `if`, not `[[ ]] &&`: as the last command of a function the && form
+  # returns 1 when the test is false and `set -e` kills the install.
+  if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_flash_next_image "$VLLM_LLM_IMAGE"; fi
+  apply_vllm_sysctl "$LLM_P_SWAPPINESS"
   local env_file="$DATA_DIR/llm/.env" env_old=""
   [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"
   local env_new
   env_new="$(cat <<EOF
 VLLM_IMAGE=$VLLM_IMAGE
 VLLM_LLM_IMAGE=$VLLM_LLM_IMAGE
+LLM_PROFILE=$LLM_PROFILE
 PROXY_IMAGE=$PROXY_IMAGE
 HF_TOKEN=${HF_TOKEN:-}
 VLLM_API_KEY=$VLLM_API_KEY
@@ -78,6 +102,7 @@ LLM_GPU_MEM_UTIL=$LLM_GPU_MEM_UTIL
 EMBED_GPU_MEM_UTIL=$EMBED_GPU_MEM_UTIL
 LLM_MAX_NUM_SEQS=$LLM_MAX_NUM_SEQS
 LLM_MAX_MODEL_LEN=$LLM_MAX_MODEL_LEN
+LLM_MTP_TOKENS=${LLM_MTP_TOKENS:-}
 EMBED_MAX_MODEL_LEN=$EMBED_MAX_MODEL_LEN
 EOF
 )"
@@ -127,7 +152,7 @@ EOF
   else
     info "vLLM config unchanged — leaving the running stack in place."
   fi
-  info "Downloading + loading models (first boot: ~133 GB for Flash-Next, 25 min; then ~10 min to load)…"
+  info "Downloading + loading models ($LLM_PROFILE; first boot for Flash-Next is ~133 GB, 25 min, then ~10 min to load)…"
   # Health-check on the stable internal IP: local, always reachable, offline-safe.
   if wait_http "http://$SUITE_IP:$LLM_PORT/health" "vLLM generative"; then
     warmup_chat "http://$SUITE_IP:$LLM_PORT" "$LLM_MODEL"

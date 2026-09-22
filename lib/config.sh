@@ -144,15 +144,21 @@ NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
 
-# Generative model: Qwen3.8-Flash-Next in NVIDIA's ModelOpt quantisation —
-# a 176B-parameter ultra-sparse MoE (512 experts, 10 routed per token, 6B
-# active) with a 51B n-gram embedding table, native vision, in-checkpoint MTP
-# head, 262k context. 123.5 GiB on disk: experts 65.6 GiB (NVFP4), n-gram
-# table 47.7 GiB (FP8), attention/GDN/vision/MTP 10.2 GiB (BF16). It does NOT
-# fit in the GB10's 121.6 GiB as published: the appliance serves the n-gram
-# table from the NVMe through a patched vLLM (llm/flash-next/), which leaves
-# ~77 GiB of weights resident. Measured 2026-09-17/18 on the test Spark.
-LLM_MODEL="${LLM_MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"
+# --- Generative model: one of three measured profiles ------------------------
+# The appliance can serve three models and switch between them without a
+# reinstall. LLM_PROFILE picks one; llm/profiles.sh holds the whole recipe
+# (model id, image, memory budgets, context window) and llm/serve-llm.sh the
+# vLLM flags. `switch-model.sh` changes it on a running box.
+#
+#   qwen27b     dense 27B NVFP4 — 262k context, ~20 t/s, real headroom
+#   flash-next  MoE 176B-A6B    — 131k context, ~30 t/s, runs at the memory wall
+#   gemma       MoE 26B-A4B     — 262k context, ~29 t/s, what the appliance shipped with
+#
+# Default qwen27b: the only one of the three that leaves the box headroom.
+# Flash-Next is faster and stronger but sits at 117/121 GiB with 7-10 GiB of
+# swap in use; Gemma is pinned to a vLLM that stopped moving in April. Both
+# remain one `switch-model.sh` away — see README "Choosing a model".
+LLM_PROFILE="${LLM_PROFILE:-qwen27b}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # vLLM image: MUST be arm64 + validated for Blackwell GB10/sm_121. Default is
 # the official Docker Hub RELEASE `vllm/vllm-openai:v0.29.0` (CUDA 13.0.2,
@@ -160,15 +166,43 @@ EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # old `cu130-nightly` tag silently stopped moving on 2026-04-23 (vLLM 0.19,
 # Marlin weight-only FP4), while v0.29.0 selects the native W4A4 CUTLASS
 # NVFP4 kernel on sm_121 and carries the Gated-DeltaNet speculative fixes
-# (vllm#51812, #51674) the Qwen3.8 MTP head needs. Alternative if you want the
-# NGC build, override with VLLM_IMAGE=nvcr.io/nvidia/vllm:<tag> (docker login).
+# (vllm#51812, #51674) the Qwen3.8 MTP head needs. This is the EMBED's image
+# and the base of the Flash-Next build; the gemma profile pins its own.
 VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
-# The generative container runs VLLM_IMAGE plus the Flash-Next patch set
-# (llm/flash-next/, vendored from blazux/qwen3.8-Flash-DGX at the commit below).
-# lib/vllm.sh builds it on the box — no registry holds it — under a tag that
-# names both inputs, so a new base image or a refreshed patch set rebuilds.
+# Flash-Next runs VLLM_IMAGE plus the patch set in llm/flash-next/ (vendored
+# from blazux/qwen3.8-Flash-DGX at the commit below). lib/vllm.sh builds it on
+# the box — no registry holds it — under a tag that names both inputs, so a new
+# base image or a refreshed patch set rebuilds.
 FLASH_NEXT_PATCHES_COMMIT="${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
-VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-suite366/vllm-flash-next:${VLLM_IMAGE##*:}-$FLASH_NEXT_PATCHES_COMMIT}"
+FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${VLLM_IMAGE##*:}-$FLASH_NEXT_PATCHES_COMMIT"
+
+# llm/profiles.sh is DATA, not a lib/ module: switch-model.sh has to read the
+# same table on a running box, where lib/ was never installed. Load it the way
+# install.sh's load_module() does — through a temp file, never process
+# substitution, so a failed download is an error rather than an empty table
+# silently accepted under `set -o pipefail`.
+load_llm_profiles() {
+  local rel="llm/profiles.sh" tmp
+  if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/$rel" ]]; then
+    # shellcheck disable=SC1090
+    source "$SCRIPT_DIR/$rel"; return 0
+  fi
+  tmp="$(mktemp)"
+  curl -fsSL "${BASE_URL:?BASE_URL unset}/$rel" -o "$tmp" \
+    || die "Failed to download $rel from $BASE_URL (network? wrong BASE_URL?)."
+  # shellcheck disable=SC1090
+  source "$tmp"; rm -f "$tmp"
+}
+load_llm_profiles
+llm_profile_known "$LLM_PROFILE" \
+  || die "Unknown LLM_PROFILE '$LLM_PROFILE'. Known profiles: $LLM_PROFILES."
+llm_profile_apply "$LLM_PROFILE" "$VLLM_IMAGE" "$FLASH_NEXT_IMAGE"
+
+# The profile supplies the defaults; an explicit override still wins, which is
+# how a box runs a model at settings we never measured — on purpose, and at the
+# operator's risk.
+LLM_MODEL="${LLM_MODEL:-$LLM_P_MODEL}"
+VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-$LLM_P_IMAGE}"
 # Tiny URL-path proxy unifying the two vLLM instances behind a single
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,
@@ -182,7 +216,8 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 VLLM_EMBEDDING_DIMENSIONS="${VLLM_EMBEDDING_DIMENSIONS:-4096}"
 # Max context window (tokens) the app advertises for the local model — exposed
 # via VLLM_MAX_CONTEXT_WINDOW so prompt assembly / truncation sizes correctly.
-VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-131072}"
+# Profile-driven: 200k for the two 262k-capable models, 131k for Flash-Next.
+VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-$LLM_P_CONTEXT_WINDOW}"
 
 # Verdict of the post-install check on the vLLM key stored in Postgres — the
 # fifth and only authoritative copy of it (see lib/vllm-db.sh). Defaulted here
@@ -206,29 +241,23 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 # cache): we bound each one (sum < 1.0, headroom kept). The generative is
 # prioritized; embeddings get a smaller share.
 #
-# Values measured on Spark (Qwen3.8-Flash-Next-NVFP4, patched vLLM v0.29.0,
-# 2026-09-18), with the embed running next to it:
-#   LLM 0.71 -> 77.1 GiB of weights resident (the 47.7 GiB n-gram table stays
-#     on the NVMe) + KV cache ~4-7 GiB (bf16, ~30 KiB/token) = 1 to 2 requests
-#     of 131,072 tokens, or several shorter ones. 0.73 failed vLLM's start-up
-#     free-memory check the day after it worked (the host had grown 2 GiB);
-#     0.70 could not seat a single 262k request. This model is memory-starved
-#     on one Spark by construction: `free` shows 117/121 GiB used and 7-10 GiB
-#     of swap in use once it is up. It is a working configuration, not a
-#     comfortable one — see README "Measured GB10 realities".
+# The GENERATIVE side is profile-driven (llm/profiles.sh carries each model's
+# measured fraction, context and slot count, with the reasoning next to it).
+# Only the embed is fixed here, because it runs unchanged under all three.
+#
 #   EMBED 0.20 + an explicit 4 GiB KV budget in the compose
-#     (--kv-cache-memory-bytes): ~20 GiB. Without the cap the embed took 36 GiB
-#     and Flash-Next did not fit at all.
-#   Sum 0.91 -> zero OS headroom; vm.swappiness=10 (lib/vllm.sh) keeps the
-#     engines out of the swap file as far as possible.
-#   max_num_seqs=2: the KV pool holds 1-2 full requests; more slots only grow
-#     the CUDA graphs (measured: 4 slots cost 3 GiB of KV).
-#   max_model_len=131072: the app caps prompts there anyway, and 262k needs
-#     7.4 GiB of KV for ONE request, which 0.70 cannot provide.
-LLM_GPU_MEM_UTIL="${LLM_GPU_MEM_UTIL:-0.71}"
+#     (--kv-cache-memory-bytes): ~20 GiB. The fraction alone was the wrong tool:
+#     at 0.30 vLLM filled the whole share with KV cache (18.75 GiB, 136k tokens)
+#     for a workload that embeds chunks of a few hundred tokens, and lower
+#     fractions were fragile because the profiler's result depends on whatever
+#     else sits in the unified pool at start-up. With the byte budget the
+#     profiler is skipped and the fraction only has to clear the start-up
+#     free-memory check. Without this cap Flash-Next did not fit at all.
+LLM_GPU_MEM_UTIL="${LLM_GPU_MEM_UTIL:-$LLM_P_GPU_MEM_UTIL}"
+LLM_MAX_NUM_SEQS="${LLM_MAX_NUM_SEQS:-$LLM_P_MAX_NUM_SEQS}"
+LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-$LLM_P_MAX_MODEL_LEN}"
+LLM_MTP_TOKENS="${LLM_MTP_TOKENS-$LLM_P_MTP_TOKENS}"
 EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.20}"
-LLM_MAX_NUM_SEQS="${LLM_MAX_NUM_SEQS:-2}"
-LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-131072}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"

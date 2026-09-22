@@ -100,14 +100,15 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
-| `LLM_MODEL` | `nvidia/Qwen3.8-27B-NVFP4` | generative model (HF id) |
+| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `flash-next` or `gemma` (cf. § Choosing a model) |
+| `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
-| `VLLM_IMAGE` | `vllm/vllm-openai:cu130-nightly` | vLLM image arm64/sm_121 (Docker Hub, no NGC login) |
+| `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next is built on it (the `gemma` profile pins its own) |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
-| `LLM_GPU_MEM_UTIL` | `0.55` | share of the unified pool for the generative |
-| `EMBED_GPU_MEM_UTIL` | `0.30` | share of the unified pool for embeddings |
+| `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
+| `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
 | `LLM_MAX_NUM_SEQS` | `2` | max concurrent streams on the generative (cf. § GB10 realities) |
-| `LLM_MAX_MODEL_LEN` | `262144` | max context length (generative) |
+| `LLM_MAX_MODEL_LEN` | *from the profile* | max context length (262144 / 131072 / 262144) |
 | `EMBED_MAX_MODEL_LEN` | `8192` | max length for embeddings (enough for RAG chunks) |
 | `VLLM_EMBEDDING_DIMENSIONS` | `4096` | embedding vector dimension (Qwen3-VL-Embedding-8B) |
 | `ASSUME_YES` | `0` | accept defaults without prompting |
@@ -309,64 +310,111 @@ runs, but local-AI calls fail until a real vLLM - or a CUSTOM provider in the
 admin UI - is pointed at it. This mode validates the k3s / chart / TLS / mDNS
 plumbing, not the AI path.
 
+## Choosing a model
+
+The appliance serves ONE generative model at a time, out of three that were each
+measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
+`switch-model.sh` changes it afterwards without a reinstall.
+
+| | `qwen27b` *(default)* | `flash-next` | `gemma` |
+|---|---|---|---|
+| Model | Qwen3.8-27B-NVFP4 | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
+| Shape | dense 27B hybrid | MoE 176B, 6B active | MoE 26B, 4B active |
+| On disk | 21.9 GB | 123.5 GB | 18 GB |
+| Resident | 20.8 GiB | 77.1 GiB | 18.0 GiB |
+| Context served | 262,144 | 131,072 | 262,144 |
+| Decode, French prose | 19-20 t/s | 26.7 t/s | 28-30 t/s |
+| Decode, code | ~30 t/s | 34.9 t/s | not measured |
+| Prefill 69k tokens | 49 s | 33 s | 65 s at 62k |
+| Swap in use, idle | 0 | 7-10 GiB | 10 GiB |
+| vLLM | official v0.29.0 | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
+
+**`qwen27b` is the default** because it is the only one that leaves the box real
+headroom: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a full
+262k request) and zero swap at idle. It is also the slowest of the three to
+decode, which is physics: 20.8 GiB over the GB10's 273 GB/s is 12 t/s, and the
+in-checkpoint MTP head recovers it to 19-20.
+
+**`flash-next` is the strongest and the fastest, and it runs at the wall.** The
+checkpoint is 123.5 GiB for 121.6 GiB of RAM; it only fits because the 47.7 GiB
+n-gram table is served from the NVMe by `mmap` instead of being loaded (a token
+reads 16 rows of it), which is a community patch set vendored and documented in
+`llm/flash-next/README.md`. Once up, `free` shows 117/121 GiB used and 7-10 GiB
+of swap in use, and `vmstat` reads 0.3-0.8 MB/s back from swap during every
+generation. It works; it has no margin. On one Spark, next to the 8B embedding
+model, treat it as a demo rather than a service — an embed of 5 GiB or less, or
+a second Spark, is what would make it comfortable.
+
+**`gemma` is what the appliance shipped with**, kept so a box can go back. Note
+its vLLM pin: the `cu130-nightly` tag stopped moving on 2026-04-23 (vLLM 0.19,
+Marlin weight-only FP4) and Gemma 4 has never been exercised under v0.29.0 here,
+so the profile ships the combination that was measured rather than an untested
+one. That is also why it decodes faster than the dense 27B while being a weaker
+model: 4B active parameters against 27B.
+
+### Switching
+
+```bash
+sudo /opt/suite366/switch-model.sh list            # the three, and which is active
+sudo /opt/suite366/switch-model.sh status          # what this box runs right now
+sudo /opt/suite366/switch-model.sh qwen27b --dry-run
+sudo /opt/suite366/switch-model.sh qwen27b
+```
+
+A model id lives in **three** places that have to agree, and the script moves all
+three: `llm/.env` (what vLLM serves), `values.yaml` → the ConfigMap the app reads,
+and the `AIModel` / `Agent` rows in Postgres that every LLM call actually
+resolves. Miss the third and every call 404s while `docker ps` says healthy and
+every pod is `Running` — the same silent shape as the API-key drift in
+`lib/vllm-db.sh`.
+
+The new engine must report healthy before the chart or the database are touched.
+If it does not come up, `.env` is restored, the previous engine is brought back,
+and nothing else moved: the box ends the run where it started.
+
+Switching to `flash-next` builds its patched image on the box if it is missing
+(~3 min) and lowers `vm.swappiness` to 10; switching away removes that drop-in.
+The first start on a model whose checkpoint is not on disk downloads it
+(~133 GB for Flash-Next, 25 min at 85 MB/s).
+
 ## Measured GB10 realities (read before tuning)
 
-Validated on Spark `aarch64 / GB10 / DGX OS 6.17 / 121 GiB unified`,
-nvidia/Qwen3.8-Flash-Next-NVFP4 under `vllm/vllm-openai:v0.29.0` plus the patch
-set in `llm/flash-next/` (2026-09-17/18).
+**Unified memory is one pool.** `gpu_memory_utilization` is NOT pre-allocated in
+VRAM — there is no VRAM on a GB10. vLLM uses it to compute the KV cache size
+after weights are loaded, out of a pool shared with the OS, the page cache and
+the container runtime. Two consequences bit us:
 
-**It does not fit as published.** The checkpoint is 123.5 GiB (experts 65.6 GiB
-in NVFP4, a 51B-parameter n-gram embedding table 47.7 GiB in FP8, attention /
-GDN / vision / MTP 10.2 GiB in BF16) for 121.6 GiB of RAM. vLLM's own
-`VLLM_PLE_CPU_OFFLOAD` moves the table to "host memory", which on a unified pool
-is the same memory. The appliance instead serves the table from the NVMe through
-`mmap` (a token reads 16 rows of it): **77.1 GiB of weights resident**, the rest
-of the pool for KV cache. That is a community patch set laid over the official
-image, vendored and documented in `llm/flash-next/README.md`.
+- The profiler charges the process for whatever the rest of the machine
+  allocates while it runs. Raising Flash-Next from 0.70 to 0.73 (+3.6 GiB)
+  returned only +0.6 GiB of KV cache, and 0.73 passed one day and failed vLLM's
+  start-up free-memory check the next.
+- A fraction is the wrong tool for the embedding model. At 0.30 vLLM turned the
+  whole share into KV cache (18.75 GiB, 136k tokens, 16 concurrent 8k requests)
+  to embed chunks of a few hundred tokens. `--kv-cache-memory-bytes 4GiB` skips
+  the profiler entirely: the container drops from ~36 GiB to ~20 GiB, and the
+  fraction only has to clear the start-up check. Without that cap Flash-Next did
+  not fit at all. This applies to all three profiles and is why `EMBED_GPU_MEM_UTIL`
+  is 0.20 and not 0.30.
 
-**Unified memory budget** with the defaults, both models up:
-- LLM `0.71` → 77.1 GiB of weights + CUDA graphs + **KV cache 4-7 GiB** (bf16,
-  ~30 KiB/token): 1-2 requests of 131,072 tokens, or several shorter ones. 0.73
-  passed one day and failed vLLM's start-up free-memory check the next (the
-  host had grown 2 GiB); 0.70 could not seat a single 262k request.
-- EMBED `0.20` + `--kv-cache-memory-bytes 4GiB` → ≈ **20 GiB** (weights 15.5, KV
-  4, graphs). Without the cap the embed took 36 GiB and Flash-Next did not fit
-  at all.
-- The box then runs at **117/121 GiB used with 7-10 GiB of swap in use**, and
-  `vmstat` shows pages read back from swap during every generation. The
-  installer sets `vm.swappiness=10`. This is a working configuration with no
-  headroom: a smaller embedding model (a 2B one, at the cost of re-indexing
-  every document in its dimension) or a second Spark is what turns it into a
-  comfortable one.
+**Kernels.** On sm_121, vLLM v0.29.0 selects the native W4A4 NVFP4 path
+(`FlashInferCutlassNvFp4LinearKernel`), FP8 FlashInfer for the attention
+projections and the `FLASHINFER` attention backend. The `cu130-nightly` tag the
+appliance used to run is vLLM 0.19, which only knew the Marlin weight-only path:
+it dequantised FP4 to FP16 and never touched the FP4 tensor cores. That is the
+single biggest reason the two Qwen profiles pin a release rather than a nightly.
 
-**Kernels.** Native paths on sm_121: W4A4 NVFP4 experts through FlashInfer
-CUTLASS, FLASHINFER attention on the 12 full-attention layers, CUDA
-Gated-DeltaNet decode on the 36 linear-attention layers, Qwen Sparse Attention
-with the deterministic top-k kernel. fp8 KV cache is not available on the
-v0.29 base of the patch set (bf16 it is; fp8 would double the pool).
+**Start-up.** `--load-format fastsafetensors` loads the 27B's weights in 12 s
+instead of 114. It is NOT used for Flash-Next: the mmap patch hooks the default
+loader, and that model's 9 min 15 of loading cannot be cached. What IS cached
+for all three is the JIT state under `$CACHE_DIR` (torch.compile artifacts, the
+FlashInfer autotune sweep, Triton kernels): a restart on an unchanged config is
+96-106 s instead of 257. Change a flag that alters the compiled graph and the
+next start is cold again.
 
-**Decode.** 6B active parameters make it the fastest of the three models tried
-on this box despite the swap: **26.7 t/s on French prose, 34.9 t/s on code**
-(MTP k=2, 61-74 % acceptance; 27B dense: 19.4 / 28.2; Gemma 4 MoE: 28-30).
-Random-token benchmarks read lower (17.7 t/s at 2k/200) because random n-grams
-defeat both the drafter and the page cache.
-
-**Prefill depends on the n-gram table's page-cache locality.** Repetitive text:
-68,834 tokens in 33 s (~2,060 t/s). Random tokens: 2k in 1.7 s, 16k in 11.7 s
-(27B: 0.85 s / 8.2 s). Real documents sit in between; a cold region of the table
-costs NVMe reads.
-
-**Start-up.** 9 min 15 to load 77 GiB of weights with the plain safetensors
-loader (the mmap patch hooks that loader to drop the table shards, so
-fastsafetensors is not used here). torch.compile ~20 s and CUDA graphs ~7 s,
-both persisted under `$CACHE_DIR`. First boot adds the 133 GB download
-(~25 min); the container healthcheck allows 40 min.
-
-**Context.** `--max-model-len 131072`, the app's own cap. The native window is
-262,144 and the recipe reaches 1M with YaRN, but on one Spark next to the embed
-there is no KV for it: 262k needs 7.4 GiB for one request. For long-context
-work the 27B (PR #34) holds 819k tokens of fp8 KV at 0.45 — six 128k requests,
-or one 800k with YaRN.
+**Concurrency.** `max_num_seqs=2` on every profile. Above that, chunked prefill
+collapses generation throughput on the 27B (the bottleneck is the GB10's prefill
+compute, not memory), and on Flash-Next more slots only grow the CUDA graphs —
+measured, 4 slots cost 3 GiB of KV cache the model does not have.
 
 ## Wiring the AI (automatic)
 
@@ -481,6 +529,7 @@ tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a 
 tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 tools/test-local-certs.sh             self-test: the LAN certs name a real issuer, and a re-run never replaces a working certificate
 tools/test-vllm-db.sh                 self-test: a key change reaches the database row, a stale row fails the install, a loading model does not
+tools/test-llm-profiles.sh            self-test: the three profiles resolve to what was measured, and a switch moves all three copies of the model id
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
@@ -491,8 +540,12 @@ uninstall.sh                          clean uninstaller — reverses install.sh 
 channel.json                          fleet release manifest (chart_version / app_version / vllm_image / updater_sha256) polled by update.sh
 channel.json.sig                      Ed25519 signature over channel.json — required by any appliance holding the public key
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
-llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker)
-llm/flash-next/                       the vLLM patch set + entrypoint that make Qwen3.8-Flash-Next fit on one Spark (built on the box)
+switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run]) — .env, chart values and the database
+llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
+llm/profiles.sh                       the three models and their measured budgets; the ONE table install.sh and switch-model.sh share
+llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
+llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
+llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box)
 llm/nginx.conf                        URL-path router unifying both vLLM behind a single endpoint
 tls/local-ca-issuer.yaml              local self-signed CA (cert-manager)
 dns/avahi-aliases.service             systemd unit publishing mDNS names
