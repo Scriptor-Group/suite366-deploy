@@ -101,6 +101,7 @@ env_get() { # env_get KEY -> value from llm/.env, or empty
 }
 CUR_PROFILE="$(env_get LLM_PROFILE)"
 CUR_MODEL="$(env_get LLM_MODEL)"
+STT_PORT_CUR="$(env_get STT_PORT)"
 BASE_IMAGE="$(env_get VLLM_IMAGE)"
 [[ -n "$BASE_IMAGE" ]] || die "VLLM_IMAGE missing from $ENV_FILE — is this an installed appliance?"
 FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${BASE_IMAGE##*:}-${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
@@ -352,9 +353,9 @@ SQL
 if [[ "$DRY_RUN" == 1 ]]; then
   log "--dry-run: nothing will be changed"
   echo; info "llm/.env would become:"
-  printf '      LLM_PROFILE=%s\n      LLM_MODEL=%s\n      VLLM_LLM_IMAGE=%s\n      LLM_GPU_MEM_UTIL=%s\n      LLM_MAX_MODEL_LEN=%s\n      LLM_MAX_NUM_SEQS=%s\n      LLM_MTP_TOKENS=%s\n      STT_MODEL=%s\n      COMPOSE_PROFILES=%s\n' \
+  printf '      LLM_PROFILE=%s\n      LLM_MODEL=%s\n      VLLM_LLM_IMAGE=%s\n      LLM_GPU_MEM_UTIL=%s\n      LLM_MAX_MODEL_LEN=%s\n      LLM_MAX_NUM_SEQS=%s\n      LLM_MTP_TOKENS=%s\n      STT_MODEL=%s\n      STT_PORT=%s\n      COMPOSE_PROFILES=%s\n' \
     "$TARGET" "$LLM_P_MODEL" "$LLM_P_IMAGE" "$LLM_P_GPU_MEM_UTIL" "$LLM_P_MAX_MODEL_LEN" "$LLM_P_MAX_NUM_SEQS" "$LLM_P_MTP_TOKENS" \
-    "$LLM_P_STT_MODEL" "${LLM_P_STT_MODEL:+stt}"
+    "$LLM_P_STT_MODEL" "${STT_PORT_CUR:-8003}" "${LLM_P_STT_MODEL:+stt}"
   echo; info "values.yaml: VLLM_MODEL_{HIGH,LIGHT,VISION} -> $LLM_P_MODEL, VLLM_MAX_CONTEXT_WINDOW -> $LLM_P_CONTEXT_WINDOW"
   info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
   echo; info "SQL:"; build_sql | sed 's/^/      /'
@@ -423,7 +424,9 @@ set_env LLM_MTP_TOKENS   "$LLM_P_MTP_TOKENS"
 # existed has none, and the compose interpolates every one.
 set_env VLLM_STT_IMAGE    "$STT_IMAGE"
 set_env STT_MODEL         "$LLM_P_STT_MODEL"
-set_env STT_PORT          "$(env_get STT_PORT)"
+# A box installed before transcription has no STT_PORT: found by running this
+# for real — the empty value sent the warm-up to port 80, i.e. Traefik's 404.
+set_env STT_PORT          "${STT_PORT_CUR:-8003}"
 set_env STT_GPU_MEM_UTIL  "$LLM_STT_GPU_MEM_UTIL"
 set_env STT_KV_CACHE_BYTES "$LLM_STT_KV_CACHE_BYTES"
 set_env STT_MAX_MODEL_LEN "$LLM_STT_MAX_MODEL_LEN"

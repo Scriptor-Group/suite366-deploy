@@ -32,10 +32,13 @@ llm_profile_known() { # llm_profile_known KEY
 # drops it, which is why Voxtral lost despite a better French score.
 #
 # Only the profiles that leave the room get it. qwen27b runs at 86/121 GiB with
-# the two other vLLMs up; flash-next at 116/121 with swap in use (no); gemma has
-# not been measured next to it (not yet — one line here when it has). One
-# transcription model for now: a profile names it, or leaves LLM_P_STT_MODEL
-# empty and the switch takes the container down.
+# the two other vLLMs up and at 97/121 with this one added (measured 2026-09-22:
+# 4.5 GiB of weights loaded in 43 s, ~10 GiB resident in all, 35 s of French
+# transcribed in 2.9 s through the proxy, 5 s in 0.5 s); flash-next sits at
+# 116/121 with swap in use (no); gemma has not been measured next to it (not
+# yet — one line here when it has). One transcription model for now: a profile
+# names it, or leaves LLM_P_STT_MODEL empty and the switch takes the container
+# down.
 LLM_STT_MODEL_DEFAULT="Qwen/Qwen3-ASR-1.7B"
 # Bump when llm/stt/Dockerfile changes: the tag is how a box knows to rebuild.
 LLM_STT_IMAGE_REV="1"

@@ -328,7 +328,7 @@ measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
 | Prefill 69k tokens | 49 s | 33 s | 65 s at 62k |
 | Swap in use, idle | 0 | 7-10 GiB | 10 GiB |
 | vLLM | official v0.29.0 | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
-| Transcription | Qwen3-ASR-1.7B | none (no room) | none (not measured yet) |
+| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | none (no room) | none (not measured yet) |
 
 **`qwen27b` is the default** because it is the only one that leaves the box real
 headroom: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a full
@@ -379,7 +379,10 @@ is `qwen27b` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
 automatically, 4.75 % WER on FLEURS French against 6.31 for Whisper-large-v3,
 and it takes the vocabulary hint the app sends with every window. Audio longer
 than 30 s is split by vLLM at the quietest point of each window, so a 5 min
-dictation is ten requests, not one.
+dictation is ten requests, not one. Measured on the test Spark: weights loaded
+in 43 s, about 10 GiB resident in all (the box goes from 86 to 97 GiB used),
+35 s of read French transcribed in 2.9 s through the proxy — WAV or webm/opus
+alike — and 5 s in 0.5 s.
 
 Two things to know about it. The container runs a **locally built image**
 (`suite366/vllm-stt:<base>-r<rev>`, `llm/stt/Dockerfile`): the arm64 vLLM image

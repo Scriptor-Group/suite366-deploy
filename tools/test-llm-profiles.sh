@@ -199,6 +199,9 @@ absent   "dry-run qwen27b : aucun build de l'image Flash-Next" "$d" "image build
 head_ "switch-model.sh : transcription"
 contains "dry-run qwen27b : STT_MODEL dans .env"        "$d" "STT_MODEL=$STT_MODEL"
 contains "dry-run qwen27b : profil compose stt activé"  "$d" "COMPOSE_PROFILES=stt"
+# La fausse box date d'avant la transcription (pas de STT_PORT) : le port doit
+# tomber sur 8003, pas sur vide — le vide envoyait le warm-up sur le 80 de Traefik.
+contains "dry-run qwen27b : STT_PORT par défaut sur une box d'avant" "$d" "STT_PORT=8003"
 contains "dry-run qwen27b : image des extras audio"     "$d" "image build: $STT"
 contains "dry-run qwen27b : conteneur démarré après le moteur" "$d" "suite366-vllm-stt up after the engine is healthy"
 contains "dry-run qwen27b : chart informé"              "$d" "VLLM_MODEL_TRANSCRIPTION -> $STT_MODEL"
