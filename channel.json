@@ -1,7 +1,7 @@
 {
   "channel": "stable",
   "chart_version": "0.10.0",
-  "app_version": "1.11.7",
+  "app_version": "1.11.8",
   "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "51f6be878c8cc8fa2b84d4988f092fecec6da3e5625543e9e0fc1d8210cf6b97",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
@@ -9,5 +9,5 @@
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Same app 1.11.7 and chart 0.10.0. The host layer now travels with the update: switch-model.sh, the model profiles, the compose, the nginx proxy config, the container entrypoint and the image build contexts are one signed bundle (host_layer_sha256), laid down by update.sh and converged in place. A box updated from an older install gets the model page, the backup page and remote access wired like a fresh install, its vLLM systemd unit gains the CDI refresh, Gemma stays on its pinned cu130-nightly while the base image is v0.29.0, and the embed gets its 4 GiB KV cap. A box on the previous updater installs the new one at the end of its next apply and is then offered the host layer on its next check."
+  "notes": "app 1.11.7 -> 1.11.8, chart 0.10.0 and vLLM image v0.29.0 unchanged. App: the AI versions the attached file instead of creating a copy, a tunable execution budget and a safe slide insert for small models in the sandbox, and the agents now say when a targetFileId matches no file. Deploy: the host layer travels with the update as one signed bundle (host_layer_sha256) laid down by update.sh and converged in place, so a box updated from an older install gets the model page, the backup page and remote access without a reinstall; its vLLM unit gains the CDI refresh, Gemma stays on its pinned cu130-nightly while the base image is v0.29.0, and the embed gets its 4 GiB KV cap. A box on the previous updater installs the new one at the end of this apply and is then offered the host layer on its next check."
 }
