@@ -766,6 +766,13 @@ EOF
 # before switch-model.sh can keep it in step. Its value follows the profile
 # the box runs (llm/profiles.sh), which is why the host layer is laid down
 # BEFORE this runs.
+#
+# So does `sandbox.workbench`: the per-user workbench landed in the template on
+# 2026-08-05 and the chart defaults it OFF, so every box installed before that
+# date runs 1.11.x with `workbenchEnabled: false` and no way to turn it on from
+# an update — the pin rewrite above only touches lines that exist. The block is
+# added whole when absent, pinned on the app version this apply installs, and
+# never edited when present: an admin who turned it off keeps it off.
 detect_stt_model() { # -> the transcription model the box's profile serves, or empty
   local envf="$DATA_DIR/llm/.env" profiles="$DATA_DIR/llm/profiles.sh" prof model
   [[ -f "$envf" && -f "$profiles" ]] || return 0
@@ -791,11 +798,12 @@ ensure_appliance_values() {
     return 1
   fi
   stt="$(detect_stt_model)"
-  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" python3 - "$vals" <<'PY'
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" python3 - "$vals" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 data_dir = os.environ["DATA_DIR"]
 stt = os.environ.get("STT_MODEL", "")
+app_version = os.environ.get("APP_VERSION", "")
 text = open(path, encoding="utf-8").read()
 lines = text.split("\n")
 if lines and lines[-1] == "":
@@ -843,6 +851,31 @@ for kind in ("extraEnv", "extraVolumeMounts", "extraVolumes"):
         if marker(kind, b) not in body:
             ins.extend(item(kind, b)); added += 1
     lines[i + 1:i + 1] = ins
+# sandbox.workbench: the whole block, as the template renders it, when the
+# sandbox block has none. Placed right after `runnerImage:` (or after the key
+# line) so it reads like a fresh render; two-space children of `sandbox:`.
+si, sj = region("sandbox")
+if si is not None and app_version and not any(re.match(r"^  workbench:", l) for l in lines[si:sj]):
+    at = si + 1
+    for k in range(si + 1, sj):
+        if re.match(r"^  runnerImage:", lines[k]):
+            at = k + 1
+    lines[at:at] = [
+        "  workbench:",
+        "    enabled: true",
+        "    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:" + app_version,
+        "    pullPolicy: IfNotPresent",
+        "    storageClass: local-path",
+        "    resourceQuota:",
+        '      pods: "10"',
+        '      requestsCpu: "4"',
+        '      requestsMemory: "4Gi"',
+        '      limitsCpu: "20"',
+        '      limitsMemory: "40Gi"',
+        '      persistentVolumeClaims: "30"',
+        '      requestsStorage: "300Gi"',
+    ]
+    added += 1
 ci, cj = region("config")
 if ci is not None:
     if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):
@@ -960,6 +993,25 @@ apply_host_layer() { # apply_host_layer STAGED(0|1) VLLM_MOVED(0|1)
   fi
 }
 
+# One helm roll, from whichever source is in play. Offline: the chart comes
+# from the signed package as a local .tgz, so no `--version` (the archive IS
+# the version) and no OCI pull.
+roll_release() { # roll_release CHART_VERSION
+  local vals="$DATA_DIR/values.yaml" chart_args=()
+  if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+    local pkg_charts=( "$OFFLINE_PKG"/chart/*.tgz )
+    [[ -f "${pkg_charts[0]:-}" ]] || die "staged package has no chart archive."
+    chart_args=( "${pkg_charts[0]}" )
+    info "chart from package: $(basename "${pkg_charts[0]}")"
+  else
+    chart_args=( "$CHART_REF" --version "$1" )
+  fi
+  helm upgrade "$RELEASE" "${chart_args[@]}" \
+    -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
+    --wait --timeout 15m \
+    || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
+}
+
 apply_exit_trap() {
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -981,6 +1033,17 @@ do_apply() {
   if up_to_date; then
     log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}, host layer ${cur_host:0:12}) — nothing to apply."
     rm -f "$MARKER"
+    # values.yaml can lag the template while every version matches: a box
+    # installed before a block existed (the bridges, the workbench) stays
+    # without it until something else moves. Converge it here too, and roll the
+    # release when it changed — this is what a manual `apply` on an up-to-date
+    # box is for.
+    if [[ -n "${cur_chart:-}" ]] && ensure_appliance_values; then
+      log "helm upgrade $RELEASE: chart $cur_chart (values.yaml converged)"
+      roll_release "$cur_chart"
+      kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
+        || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
+    fi
     write_state_json 0
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
     install_units
@@ -1043,22 +1106,8 @@ do_apply() {
   if ensure_appliance_values; then values_changed=1; fi
   [[ "$chart_diff" == 1 ]] || target_chart="${cur_chart:-$want_chart}"
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 || "$values_changed" == 1 ]]; then
-    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml bridges')"
-    # Offline: the chart comes from the signed package as a local .tgz, so no
-    # `--version` (the archive IS the version) and no OCI pull.
-    local chart_args=()
-    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
-      local pkg_charts=( "$OFFLINE_PKG"/chart/*.tgz )
-      [[ -f "${pkg_charts[0]:-}" ]] || die "staged package has no chart archive."
-      chart_args=( "${pkg_charts[0]}" )
-      info "chart from package: $(basename "${pkg_charts[0]}")"
-    else
-      chart_args=( "$CHART_REF" --version "$target_chart" )
-    fi
-    helm upgrade "$RELEASE" "${chart_args[@]}" \
-      -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
-      --wait --timeout 15m \
-      || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
+    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml converged')"
+    roll_release "$target_chart"
   fi
 
   log "Health check"
