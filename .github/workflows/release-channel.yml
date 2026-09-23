@@ -484,6 +484,10 @@ jobs:
           # Re-pins updater_sha256 / backup_sha256 from this tree and mirrors the
           # three restic pins out of lib/config.sh, THEN signs — which is why
           # every rewrite above had to happen before this line.
+          # The bundle is regenerated from this tree first: sign-channel.sh pins
+          # its hash, and a stale committed copy would pin files the fleet is
+          # not meant to receive (CI fails on staleness, this makes it moot).
+          tools/bundle-host-layer.sh
           PACKAGE_PRIVATE_KEY="$RUNNER_TEMP/keys/package.key" tools/sign-channel.sh
 
       - name: drop the signing key
@@ -536,7 +540,8 @@ jobs:
                          ("vllm_image", "NEW_VLLM")):
               if doc[f] != os.environ[var]:
                   bad.append(f"{f} is {doc[f]!r}, we meant {os.environ[var]!r}")
-          for f, path in (("updater_sha256", "update.sh"), ("backup_sha256", "backup.sh")):
+          for f, path in (("updater_sha256", "update.sh"), ("backup_sha256", "backup.sh"),
+                          ("host_layer_sha256", "host-layer.sh")):
               want = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
               if doc[f] != want:
                   bad.append(f"{f} is {doc[f]}, sha256({path}) is {want}")
@@ -617,7 +622,7 @@ jobs:
           # channel.json.sig from independent cache entries: published a commit
           # apart, there is a window where a box fetches the new manifest with
           # the old signature, refuses the channel and waits a day.
-          git add channel.json channel.json.sig lib/config.sh values.yaml \
+          git add channel.json channel.json.sig host-layer.sh lib/config.sh values.yaml \
                   tools/testdata/values-plain.rendered.yaml
 
           # The signature is 64 raw bytes with no trailing newline, and this repo

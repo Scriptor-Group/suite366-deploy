@@ -35,7 +35,8 @@
 #   ├── docker-images/*.tar    loaded into the Docker daemon (vLLM/compose stack)
 #   ├── bin/restic             the pinned restic (an air-gapped box cannot fetch it)
 #   ├── scripts/update.sh      the updater this package expects
-#   └── scripts/backup.sh      the backup agent this package expects
+#   ├── scripts/backup.sh      the backup agent this package expects
+#   └── scripts/host-layer.sh  the host layer (switch-model.sh + llm/) it converges
 #
 # ONE signature, over SHA256SUMS. Every other file earns trust from a checksum
 # line inside that signed list, so there is no ambiguity about which signature
@@ -217,6 +218,11 @@ install -m 0644 "$REPO_ROOT/update.sh" "$PKG/scripts/update.sh"
 bash -n "$PKG/scripts/update.sh" || die "bundled update.sh does not parse."
 install -m 0644 "$REPO_ROOT/backup.sh" "$PKG/scripts/backup.sh"
 bash -n "$PKG/scripts/backup.sh" || die "bundled backup.sh does not parse."
+# The host layer (switch-model.sh + llm/): what update.sh lays down and
+# converges, so an air-gapped box gets the model switch and the transcription
+# from the same signed package as the app.
+install -m 0644 "$REPO_ROOT/host-layer.sh" "$PKG/scripts/host-layer.sh"
+bash -n "$PKG/scripts/host-layer.sh" || die "bundled host-layer.sh does not parse."
 
 # --- restic -------------------------------------------------------------------
 # Version and checksums come from lib/config.sh, so the package and a networked

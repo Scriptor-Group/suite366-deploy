@@ -38,6 +38,16 @@
 #   /opt/suite366/switch-model.sh publish-state  refresh state.json for the app
 #   /opt/suite366/switch-model.sh consume-trigger  run the switch the app asked for
 #   /opt/suite366/switch-model.sh install-units  (re)install the .path unit
+#   /opt/suite366/switch-model.sh converge       make the host side match the
+#                                                files present WITHOUT changing
+#                                                the model: fill llm/.env from the
+#                                                profile, recreate what the compose
+#                                                changed, reload the proxy, rewrite
+#                                                the units, publish state.json.
+#                                                What update.sh runs after laying
+#                                                down a new host layer.
+#   /opt/suite366/switch-model.sh install-vllm-unit
+#                                                (re)write suite366-vllm.service
 #
 # App <-> host bridge ($DATA_DIR/llm-state, hostPath-mounted into drive-app at
 # /appliance-llm — see values.yaml `extraVolumes`):
@@ -59,6 +69,8 @@ RELEASE="${RELEASE:-drive}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
 VLLM_SYSCTL_FILE="${VLLM_SYSCTL_FILE:-/etc/sysctl.d/90-suite366-vllm.conf}"
+# Where the units go; the self-test points it at a temp dir.
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 PG_DEPLOY="${PG_DEPLOY:-}"
 LLM_DIR="$DATA_DIR/llm"
 ENV_FILE="$LLM_DIR/.env"
@@ -99,6 +111,23 @@ env_get() { # env_get KEY -> value from llm/.env, or empty
   [[ -f "$ENV_FILE" ]] || return 0
   sed -n "s/^$1=//p" "$ENV_FILE" | head -1
 }
+env_has() { # env_has KEY -> the key is present (even empty)
+  [[ -f "$ENV_FILE" ]] && grep -q "^$1=" "$ENV_FILE"
+}
+ENV_CHANGES=0
+set_env() { # set_env KEY VALUE — replace in place, append when absent
+  local k="$1" v="$2"
+  if env_has "$k"; then
+    [[ "$(env_get "$k")" == "$v" ]] && return 0
+    sed -i "s|^$k=.*|$k=$v|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
+  fi
+  ENV_CHANGES=$((ENV_CHANGES + 1))
+}
+set_env_default() { # set_env_default KEY VALUE — only when the key is absent
+  env_has "$1" || set_env "$1" "$2"
+}
 CUR_PROFILE="$(env_get LLM_PROFILE)"
 CUR_MODEL="$(env_get LLM_MODEL)"
 STT_PORT_CUR="$(env_get STT_PORT)"
@@ -113,6 +142,127 @@ all_profile_models() {
   local p
   for p in $LLM_PROFILES; do
     ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE" && printf '%s\n' "$LLM_P_MODEL" )
+  done
+}
+
+# The profile a model id belongs to, for a box whose .env predates profiles
+# (it has LLM_MODEL, no LLM_PROFILE). Empty when no profile serves that model.
+profile_for_model() { # profile_for_model HF_ID
+  local p
+  for p in $LLM_PROFILES; do
+    if ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE" && [[ "$LLM_P_MODEL" == "$1" ]] ); then
+      printf '%s' "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+# The systemd unit that brings the compose stack up at boot. ONE template, used
+# by install.sh (lib/vllm.sh) and by `converge`: a box installed before the CDI
+# refresh landed still has a unit without the ExecStartPre, and its containers
+# lose CUDA on the boot that shifts /dev/nvidia-uvm's major.
+install_vllm_unit() {
+  local cdi_spec="${CDI_SPEC:-/etc/cdi/nvidia.yaml}"
+  cat > "$SYSTEMD_DIR/suite366-vllm.service" <<EOF
+[Unit]
+Description=Suite 366 — vLLM (generative + embeddings, + transcription where the profile allows)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$LLM_DIR
+# /dev/nvidia-uvm's major is allocated dynamically at each boot while
+# /etc/cdi/nvidia.yaml pins it, so refresh the spec before the containers are
+# created: devices are injected at creation, and a boot that shifted the major
+# otherwise hands them a node on the wrong char device — nvidia-smi still works
+# inside the container, torch.cuda.init() does not, and vLLM crash-loops.
+# This lives here rather than in NVIDIA's nvidia-cdi-refresh.service because of
+# ordering: that unit is After=multi-user.target, so it runs after this stack —
+# and on a box where plymouth-quit-wait hangs (DGX OS, \`quiet splash\`), the
+# target is never reached and it never runs at all.
+# Best-effort (leading -): never hold the stack down when the spec is fine.
+ExecStartPre=-/usr/bin/nvidia-ctk cdi generate --output=$cdi_spec
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable suite366-vllm.service >/dev/null 2>&1 || true
+}
+
+# Build what the profile needs and the box lacks. Shared by a switch and by
+# converge; both die on a failed build because nothing below could start.
+ensure_profile_images() {
+  if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
+    if docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
+      info "image $LLM_P_IMAGE already built."
+    else
+      [[ -f "$LLM_DIR/flash-next/Dockerfile" ]] \
+        || die "$LLM_DIR/flash-next/ missing — cannot build $LLM_P_IMAGE. Re-run install.sh."
+      log "Building $LLM_P_IMAGE (~3 min)"
+      docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
+      docker build -q -t "$LLM_P_IMAGE" "$LLM_DIR/flash-next" >/dev/null \
+        || die "docker build of $LLM_P_IMAGE failed."
+    fi
+  elif ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
+    log "Pulling $LLM_P_IMAGE"
+    docker pull -q "$LLM_P_IMAGE" >/dev/null || die "docker pull $LLM_P_IMAGE failed."
+  fi
+  if [[ -n "$LLM_P_STT_MODEL" ]] && ! docker image inspect "$STT_IMAGE" >/dev/null 2>&1; then
+    [[ -f "$LLM_DIR/stt/Dockerfile" ]] \
+      || die "$LLM_DIR/stt/Dockerfile missing — cannot build $STT_IMAGE. Re-run install.sh."
+    log "Building $STT_IMAGE (the audio extras over $BASE_IMAGE, ~1 min)"
+    docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
+    docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$STT_IMAGE" "$LLM_DIR/stt" >/dev/null \
+      || die "docker build of $STT_IMAGE failed."
+  fi
+}
+
+# The transcription keys, ALL of them: a box installed before transcription
+# existed has none, and the compose interpolates every one.
+set_env_stt_keys() {
+  set_env VLLM_STT_IMAGE    "$STT_IMAGE"
+  set_env STT_MODEL         "$LLM_P_STT_MODEL"
+  # Found by running this for real: an empty STT_PORT sent the warm-up to port
+  # 80, i.e. Traefik's 404.
+  set_env STT_PORT          "${STT_PORT_CUR:-8003}"
+  set_env STT_GPU_MEM_UTIL  "$LLM_STT_GPU_MEM_UTIL"
+  set_env STT_KV_CACHE_BYTES "$LLM_STT_KV_CACHE_BYTES"
+  set_env STT_MAX_MODEL_LEN "$LLM_STT_MAX_MODEL_LEN"
+  set_env STT_MAX_NUM_SEQS  "$LLM_STT_MAX_NUM_SEQS"
+  set_env COMPOSE_PROFILES  "${LLM_P_STT_MODEL:+stt}"
+}
+
+# nginx reads its config once at start; a new nginx.conf laid down under the
+# running proxy is invisible until told. A reload is zero-downtime and a no-op
+# when nothing changed.
+reload_proxy() {
+  docker inspect suite366-vllm-proxy >/dev/null 2>&1 || return 0
+  if docker exec suite366-vllm-proxy nginx -t >/dev/null 2>&1; then
+    docker exec suite366-vllm-proxy nginx -s reload >/dev/null 2>&1 \
+      && info "proxy config reloaded." || warn "proxy reload failed (non-blocking)."
+  else
+    warn "the proxy refuses the new nginx.conf — left running on the old one."
+  fi
+}
+
+wait_healthy() { # wait_healthy CONTAINER MINUTES LABEL -> 0 healthy, 1 not
+  local ctr="$1" deadline label="$3" health state
+  deadline=$(( $(date +%s) + $2 * 60 ))
+  while :; do
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$ctr" 2>/dev/null || echo gone)"
+    state="$(docker inspect -f '{{.State.Status}}' "$ctr" 2>/dev/null || echo gone)"
+    [[ "$health" == healthy ]] && return 0
+    [[ "$state" == running ]] || { warn "$label container state: $state"; return 1; }
+    [[ "$(date +%s)" -lt "$deadline" ]] || { warn "$label still $health after $2 min"; return 1; }
+    publish_state running "${TARGET_LABEL:-}" "waiting for the $label ($health)"
+    sleep 10
   done
 }
 
@@ -173,14 +323,75 @@ publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
 }
 
 case "$TARGET" in
-  publish-state)
-    publish_state idle
-    info "state published to $STATE_JSON"
+  install-vllm-unit)
+    [[ $EUID -eq 0 || "${SWITCH_MODEL_SELFTEST:-0}" == 1 ]] || die "run me as root."
+    install_vllm_unit
+    info "suite366-vllm.service written and enabled."
     exit 0 ;;
-  install-units)
-    [[ $EUID -eq 0 ]] || die "run me as root."
+  converge)
+    # The self-test (tools/test-host-layer.sh) runs this as a user with docker,
+    # systemctl and sysctl stubbed; nothing else may set the variable.
+    [[ $EUID -eq 0 || "${SWITCH_MODEL_SELFTEST:-0}" == 1 ]] || die "run me as root."
+    command -v docker >/dev/null || die "docker not found."
+    [[ -f "$LLM_DIR/docker-compose.yml" ]] || die "$LLM_DIR/docker-compose.yml missing."
+    log "Converging the host side of the vLLM stack (no model change)"
+    TARGET_LABEL="$CUR_PROFILE"
+    prof="$CUR_PROFILE"
+    if [[ -z "$prof" ]]; then
+      # A box from before profiles: .env names the model, not the recipe.
+      prof="$(profile_for_model "$CUR_MODEL" || true)"
+      [[ -n "$prof" ]] && info "profile for $CUR_MODEL: $prof (this box predates profiles)"
+    fi
+    if [[ -z "$prof" ]] || ! llm_profile_known "$prof"; then
+      warn "no profile serves '${CUR_MODEL:-<no LLM_MODEL>}' — the compose and .env are left as they are."
+      warn "  Pick a profile to move this box onto the current stack: $0 <profile>"
+      install_vllm_unit
+      TARGET=install-units; publish_state idle
+      exit 0
+    fi
+    llm_profile_apply "$prof" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
+    TARGET_LABEL="$prof"
+    # .env: the profile is authoritative for what it defines (image, MTP head,
+    # transcription); budgets an operator may have tuned are only filled in
+    # when missing; keys the old compose never had get their defaults.
+    set_env_default LLM_PROFILE       "$prof"
+    set_env         VLLM_LLM_IMAGE    "$LLM_P_IMAGE"
+    set_env_default LLM_GPU_MEM_UTIL  "$LLM_P_GPU_MEM_UTIL"
+    set_env_default LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
+    set_env_default LLM_MAX_NUM_SEQS  "$LLM_P_MAX_NUM_SEQS"
+    set_env         LLM_MTP_TOKENS    "$LLM_P_MTP_TOKENS"
+    set_env_default EMBED_GPU_MEM_UTIL "0.20"
+    set_env_default EMBED_MAX_MODEL_LEN "8192"
+    set_env_default CACHE_DIR         "$DATA_DIR/cache"
+    set_env_stt_keys
+    cache_dir="$(env_get CACHE_DIR)"
+    mkdir -p "$cache_dir/vllm" "$cache_dir/flashinfer" "$cache_dir/triton"
+    info ".env: $ENV_CHANGES key(s) written"
+    ensure_profile_images
+    if [[ -n "$LLM_P_SWAPPINESS" ]]; then
+      printf 'vm.swappiness = %s\n' "$LLM_P_SWAPPINESS" > "$VLLM_SYSCTL_FILE"
+      sysctl -q -w "vm.swappiness=$LLM_P_SWAPPINESS" >/dev/null 2>&1 || true
+    else
+      rm -f "$VLLM_SYSCTL_FILE"
+    fi
+    install_vllm_unit
+    # Containers whose definition changed are recreated, the others left alone;
+    # a transcription container the profile has no room for is taken down.
+    if [[ -z "$LLM_P_STT_MODEL" ]]; then
+      ( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
+    fi
+    publish_state running "$prof" "applying the host layer ($prof)"
+    log "docker compose up -d (recreates only what changed)"
+    ( cd "$LLM_DIR" && docker compose up -d ) || die "docker compose up failed — see docker compose logs in $LLM_DIR"
+    if wait_healthy suite366-vllm-llm 30 "engine"; then info "engine healthy."; else warn "engine not healthy — check: docker logs suite366-vllm-llm"; fi
+    if [[ -n "$LLM_P_STT_MODEL" ]]; then
+      if wait_healthy suite366-vllm-stt 30 "transcription engine"; then info "transcription engine healthy."; else warn "transcription engine not healthy — check: docker logs suite366-vllm-stt"; fi
+    fi
+    reload_proxy
+    # The app-trigger unit and state.json, exactly as install-units does.
+    TARGET=install-units
     ensure_state_dir
-    cat > /etc/systemd/system/suite366-llm-switch.service <<EOF
+    cat > "$SYSTEMD_DIR/suite366-llm-switch.service" <<EOF
 [Unit]
 Description=Suite 366 — switch the generative model (triggered from the app UI)
 After=docker.service
@@ -191,7 +402,41 @@ Type=oneshot
 ExecStart=$DATA_DIR/switch-model.sh consume-trigger
 TimeoutStartSec=0
 EOF
-    cat > /etc/systemd/system/suite366-llm-switch.path <<EOF
+    cat > "$SYSTEMD_DIR/suite366-llm-switch.path" <<EOF
+[Unit]
+Description=Suite 366 — watch for model-switch requests from the app
+
+[Path]
+PathExists=$TRIGGER
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now suite366-llm-switch.path >/dev/null 2>&1 \
+      || warn "could not enable the switch path unit (systemd offline?)."
+    publish_state idle
+    log "Host side converged on profile $prof ($LLM_P_MODEL${LLM_P_STT_MODEL:+ + $LLM_P_STT_MODEL})."
+    exit 0 ;;
+  publish-state)
+    publish_state idle
+    info "state published to $STATE_JSON"
+    exit 0 ;;
+  install-units)
+    [[ $EUID -eq 0 ]] || die "run me as root."
+    ensure_state_dir
+    cat > "$SYSTEMD_DIR/suite366-llm-switch.service" <<EOF
+[Unit]
+Description=Suite 366 — switch the generative model (triggered from the app UI)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$DATA_DIR/switch-model.sh consume-trigger
+TimeoutStartSec=0
+EOF
+    cat > "$SYSTEMD_DIR/suite366-llm-switch.path" <<EOF
 [Unit]
 Description=Suite 366 — watch for model-switch requests from the app
 
@@ -378,44 +623,14 @@ export KUBECONFIG="$KUBECONFIG_PATH"
 command -v docker >/dev/null || die "docker not found."
 [[ -f "$LLM_DIR/docker-compose.yml" ]] || die "$LLM_DIR/docker-compose.yml missing."
 
-# --- 1. the image this profile needs -----------------------------------------
-if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
-  if docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
-    info "image $LLM_P_IMAGE already built."
-  else
-    [[ -f "$LLM_DIR/flash-next/Dockerfile" ]] \
-      || die "$LLM_DIR/flash-next/ missing — cannot build $LLM_P_IMAGE. Re-run install.sh."
-    log "Building $LLM_P_IMAGE (~3 min)"
-    docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
-    docker build -q -t "$LLM_P_IMAGE" "$LLM_DIR/flash-next" >/dev/null \
-      || die "docker build of $LLM_P_IMAGE failed."
-  fi
-elif ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
-  log "Pulling $LLM_P_IMAGE"
-  docker pull -q "$LLM_P_IMAGE" >/dev/null || die "docker pull $LLM_P_IMAGE failed."
-fi
-if [[ -n "$LLM_P_STT_MODEL" ]] && ! docker image inspect "$STT_IMAGE" >/dev/null 2>&1; then
-  [[ -f "$LLM_DIR/stt/Dockerfile" ]] \
-    || die "$LLM_DIR/stt/Dockerfile missing — cannot build $STT_IMAGE. Re-run install.sh."
-  log "Building $STT_IMAGE (the audio extras over $BASE_IMAGE, ~1 min)"
-  docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
-  docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$STT_IMAGE" "$LLM_DIR/stt" >/dev/null \
-    || die "docker build of $STT_IMAGE failed."
-fi
+# --- 1. the images this profile needs ----------------------------------------
+ensure_profile_images
 
 # --- 2. .env, with the previous one kept for the rollback ---------------------
 ENV_BACKUP="$(mktemp)"; cp "$ENV_FILE" "$ENV_BACKUP"
 SYSCTL_WAS_PRESENT=0
 if [[ -f "$VLLM_SYSCTL_FILE" ]]; then SYSCTL_WAS_PRESENT=1; fi
 
-set_env() { # set_env KEY VALUE — replace in place, append when absent
-  local k="$1" v="$2"
-  if grep -q "^$k=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s|^$k=.*|$k=$v|" "$ENV_FILE"
-  else
-    printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
-  fi
-}
 set_env LLM_PROFILE      "$TARGET"
 set_env LLM_MODEL        "$LLM_P_MODEL"
 set_env VLLM_LLM_IMAGE   "$LLM_P_IMAGE"
@@ -423,18 +638,12 @@ set_env LLM_GPU_MEM_UTIL "$LLM_P_GPU_MEM_UTIL"
 set_env LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
 set_env LLM_MAX_NUM_SEQS "$LLM_P_MAX_NUM_SEQS"
 set_env LLM_MTP_TOKENS   "$LLM_P_MTP_TOKENS"
-# The transcription keys, ALL of them: a box installed before transcription
-# existed has none, and the compose interpolates every one.
-set_env VLLM_STT_IMAGE    "$STT_IMAGE"
-set_env STT_MODEL         "$LLM_P_STT_MODEL"
-# A box installed before transcription has no STT_PORT: found by running this
-# for real — the empty value sent the warm-up to port 80, i.e. Traefik's 404.
-set_env STT_PORT          "${STT_PORT_CUR:-8003}"
-set_env STT_GPU_MEM_UTIL  "$LLM_STT_GPU_MEM_UTIL"
-set_env STT_KV_CACHE_BYTES "$LLM_STT_KV_CACHE_BYTES"
-set_env STT_MAX_MODEL_LEN "$LLM_STT_MAX_MODEL_LEN"
-set_env STT_MAX_NUM_SEQS  "$LLM_STT_MAX_NUM_SEQS"
-set_env COMPOSE_PROFILES  "${LLM_P_STT_MODEL:+stt}"
+set_env_stt_keys
+# A box from before the JIT caches or before profiles: give the compose every
+# key it interpolates, with the installer's defaults.
+set_env_default CACHE_DIR "$DATA_DIR/cache"
+set_env_default EMBED_MAX_MODEL_LEN "8192"
+mkdir -p "$(env_get CACHE_DIR)/vllm" "$(env_get CACHE_DIR)/flashinfer" "$(env_get CACHE_DIR)/triton"
 
 if [[ -n "$LLM_P_SWAPPINESS" ]]; then
   printf 'vm.swappiness = %s\n' "$LLM_P_SWAPPINESS" > "$VLLM_SYSCTL_FILE"
