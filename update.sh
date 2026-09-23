@@ -95,6 +95,15 @@ MARKER="$DATA_DIR/update-available"
 # backup.sh is converged here, under the same signature rules as update.sh.
 BACKUP_URL="${BACKUP_URL:-${MANIFEST_URL%/*}/backup.sh}"
 BACKUP_AGENT="$DATA_DIR/backup.sh"
+# The HOST LAYER — switch-model.sh, the model profiles, the compose, the nginx
+# proxy config, the container entrypoint and the image build contexts — travels
+# as ONE bundle (host-layer.sh, tools/bundle-host-layer.sh), pinned in
+# channel.json as host_layer_sha256 under the same signature as this script and
+# backup.sh. The stamp records the bundle a box carries; a channel that pins a
+# different one is an update, applied by laying the bundle down and running
+# `switch-model.sh converge`. See stage_host_layer_online / apply_host_layer.
+HOST_LAYER_URL="${HOST_LAYER_URL:-${MANIFEST_URL%/*}/host-layer.sh}"
+HOST_LAYER_STAMP="$DATA_DIR/llm/.host-layer.sha256"
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
 BACKUP_ENV="${BACKUP_ENV:-$BACKUP_DIR/backup.env}"
 RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
@@ -192,12 +201,14 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   "current": {
     "chart": "$(json_esc "${cur_chart:-}")",
     "app": "$(json_esc "${cur_app:-}")",
-    "vllm": "$(json_esc "${cur_vllm:-}")"
+    "vllm": "$(json_esc "${cur_vllm:-}")",
+    "host_layer": "$(json_esc "${cur_host:-}")"
   },
   "target": {
     "chart": "$(json_esc "${want_chart:-}")",
     "app": "$(json_esc "${want_app:-}")",
-    "vllm": "$(json_esc "${want_vllm:-}")"
+    "vllm": "$(json_esc "${want_vllm:-}")",
+    "host_layer": "$(json_esc "${want_host:-}")"
   },
   "sources": {
     "online": {
@@ -258,6 +269,15 @@ read_current_state() {
   cur_vllm=""
   [[ -f "$DATA_DIR/llm/.env" ]] && cur_vllm="$(sed -n 's/^VLLM_IMAGE=//p' "$DATA_DIR/llm/.env" | head -1)"
 
+  # The host layer only means something on a box that runs the vLLM stack
+  # (llm/.env exists); a SKIP_VLLM box must never see it as a pending update.
+  # No stamp = a box from before the bundle existed: stale by definition.
+  host_applicable=0; cur_host=""
+  if [[ -f "$DATA_DIR/llm/.env" ]]; then
+    host_applicable=1
+    [[ -s "$HOST_LAYER_STAMP" ]] && cur_host="$(head -1 "$HOST_LAYER_STAMP" | tr -dc 'a-f0-9')"
+  fi
+
   # App release train = the image tag of the RUNNING drive-app deployment.
   # Do NOT read it from the values.yaml pins: apply rewrites those BEFORE the
   # helm upgrade, so if the upgrade fails the pins are ahead of reality and a
@@ -289,7 +309,7 @@ ver_gt() { # ver_gt A B
 fetch_manifest_online() {
   online_reachable=0; online_error=""; online_signed=0
   online_chart=""; online_app=""; online_vllm=""; online_channel=""; online_notes=""
-  online_updater_sha=""; online_backup_sha=""
+  online_updater_sha=""; online_backup_sha=""; online_host_sha=""
   online_restic_ver=""; online_restic_sha=""
   log "Fetching channel manifest"
   info "$MANIFEST_URL"
@@ -318,6 +338,7 @@ fetch_manifest_online() {
   online_notes="$(json_get notes            <<<"$manifest")"
   online_updater_sha="$(json_get updater_sha256 <<<"$manifest")"
   online_backup_sha="$(json_get backup_sha256  <<<"$manifest")"
+  online_host_sha="$(json_get host_layer_sha256 <<<"$manifest")"
   online_restic_ver="$(json_get restic_version <<<"$manifest")"
   case "$(uname -m)" in
     aarch64) online_restic_sha="$(json_get restic_sha256_arm64 <<<"$manifest")" ;;
@@ -376,7 +397,7 @@ verify_manifest_signature() { # verify_manifest_signature FILE
 # --- Target state: source 2, a staged offline package --------------------------
 load_offline_source() {
   usb_status=none; usb_error=""; usb_label=""
-  usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_channel=""; usb_verified_at=""
+  usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_channel=""; usb_verified_at=""; usb_host_sha=""
   [[ -f "$OFFLINE_SRC" ]] || return 0
   local src; src="$(cat "$OFFLINE_SRC" 2>/dev/null)" || return 0
   usb_status="$(json_get status      <<<"$src")"
@@ -388,6 +409,7 @@ load_offline_source() {
   usb_vllm="$(json_get vllm_image    <<<"$src")"
   usb_notes="$(json_get notes        <<<"$src")"
   usb_verified_at="$(json_get verified_at <<<"$src")"
+  usb_host_sha="$(json_get host_layer_sha256 <<<"$src")"
   usb_status="${usb_status:-none}"
   # A staged package whose content vanished (manual cleanup, disk wipe) must not
   # keep advertising itself.
@@ -410,6 +432,7 @@ write_offline_source() { # write_offline_source STATUS ERROR
   "app_version": "$(json_esc "${usb_app:-}")",
   "vllm_image": "$(json_esc "${usb_vllm:-}")",
   "notes": "$(json_esc "${usb_notes:-}")",
+  "host_layer_sha256": "$(json_esc "${usb_host_sha:-}")",
   "verified_at": "$(json_esc "${usb_verified_at:-}")"
 }
 EOF
@@ -428,7 +451,7 @@ resolve_target() {
   [[ "${usb_status:-none}" == "ready" ]] && usb_ok=1
 
   UPDATE_SOURCE=none
-  channel=""; want_chart=""; want_app=""; want_vllm=""; notes=""
+  channel=""; want_chart=""; want_app=""; want_vllm=""; want_host=""; notes=""
 
   if [[ "$online_ok" == 1 && "$usb_ok" == 1 ]]; then
     if ver_gt "$usb_app" "$online_app"; then UPDATE_SOURCE=usb; else UPDATE_SOURCE=online; fi
@@ -438,14 +461,16 @@ resolve_target() {
 
   case "$UPDATE_SOURCE" in
     online) channel="$online_channel"; want_chart="$online_chart"
-            want_app="$online_app";    want_vllm="$online_vllm"; notes="$online_notes" ;;
+            want_app="$online_app";    want_vllm="$online_vllm"; notes="$online_notes"
+            want_host="${online_host_sha:-}" ;;
     usb)    channel="${usb_channel:-offline}"; want_chart="$usb_chart"
-            want_app="$usb_app";       want_vllm="$usb_vllm";    notes="$usb_notes" ;;
+            want_app="$usb_app";       want_vllm="$usb_vllm";    notes="$usb_notes"
+            want_host="${usb_host_sha:-}" ;;
   esac
 }
 
 compute_diffs() {
-  chart_diff=0; vllm_diff=0; app_diff=0; summary_line=""
+  chart_diff=0; vllm_diff=0; app_diff=0; host_diff=0; summary_line=""
   if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
     warn "No usable update source (network unreachable, no verified offline package)."
     return 0
@@ -455,6 +480,10 @@ compute_diffs() {
   info "chart  running : ${cur_chart:-unknown}    target : ${want_chart:-?}"
   info "app    running : ${cur_app:-unknown}    target : ${want_app:-unchanged}"
   info "vLLM   running : ${cur_vllm:-unknown}    target : ${want_vllm:-unchanged}"
+  if [[ "${host_applicable:-0}" == 1 ]]; then
+    local _ch="${cur_host:-}" _wh="${want_host:-}"
+    info "host   layer   : ${_ch:0:12}${_ch:-none (pre-bundle box)}    target : ${_wh:0:12}${_wh:-unpinned}"
+  fi
 
   # STRICTLY NEWER, not merely different. The channel is rolled deliberately and
   # the installer's own default runs ahead of it between rolls, so a box
@@ -472,6 +501,10 @@ compute_diffs() {
   # The vLLM image is a tag, not a version: `cu130-nightly` does not order, so
   # difference is the only signal available and a change is always a roll.
   if [[ -n "$want_vllm" && -n "$cur_vllm" && "$cur_vllm" != "$want_vllm" ]]; then vllm_diff=1; fi
+  # The host layer is a content hash, like the vLLM image a tag: different is
+  # the only signal, and a channel that pins one this box does not carry — or a
+  # box that carries none — is an update. Only where the vLLM stack runs.
+  if [[ "${host_applicable:-0}" == 1 && -n "${want_host:-}" && "${cur_host:-}" != "${want_host:-}" ]]; then host_diff=1; fi
 
   # A channel BEHIND the box is not an update, but it is worth saying out loud:
   # it usually means the channel has not been rolled since this box was built,
@@ -492,6 +525,7 @@ compute_diffs() {
   [[ "$chart_diff" == 1 ]] && parts+=("chart ${cur_chart:-?} -> $want_chart")
   [[ "$app_diff"   == 1 ]] && parts+=("app ${cur_app:-?} -> $want_app")
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
+  [[ "$host_diff"  == 1 ]] && parts+=("host layer (model switch, transcription) -> ${want_host:0:12}")
   [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
 }
@@ -505,7 +539,7 @@ survey() {
   compute_diffs
 }
 
-up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 ]]; }
+up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 && "${host_diff:-0}" == 0 ]]; }
 
 # --- Offline package: verification + staging -----------------------------------
 # Layout produced by tools/build-offline-package.sh:
@@ -537,7 +571,7 @@ pkg_root() { # pkg_root MOUNT  -> prints the package root
 pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   local root="$1" f
   pkg_error=""
-  pkg_chart=""; pkg_app=""; pkg_vllm=""; pkg_channel=""; pkg_notes=""; pkg_min_from=""
+  pkg_chart=""; pkg_app=""; pkg_vllm=""; pkg_channel=""; pkg_notes=""; pkg_min_from=""; pkg_host_sha=""
 
   if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
     pkg_error="no package signing key on this appliance ($PACKAGE_PUBLIC_KEY)"; return 1
@@ -580,6 +614,12 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   pkg_vllm="$(json_get vllm_image        <<<"$mf")"
   pkg_notes="$(json_get notes            <<<"$mf")"
   pkg_min_from="$(json_get min_from_version <<<"$mf")"
+  # Optional: packages built before the host layer existed ship none. Its hash
+  # is what the stamp on the box is compared with, and SHA256SUMS already vouches
+  # for the file.
+  if [[ -s "$root/scripts/host-layer.sh" ]]; then
+    pkg_host_sha="$(sha256sum "$root/scripts/host-layer.sh" | awk '{print $1}')"
+  fi
   [[ -n "$pkg_chart" && -n "$pkg_app" ]] \
     || { pkg_error="manifest lacks chart_version / app_version"; return 1; }
 
@@ -642,7 +682,7 @@ do_scan_usb() { # do_scan_usb MOUNT
 
   if pkg_verify "$root"; then
     usb_channel="$pkg_channel"; usb_chart="$pkg_chart"; usb_app="$pkg_app"
-    usb_vllm="$pkg_vllm";       usb_notes="$pkg_notes"
+    usb_vllm="$pkg_vllm";       usb_notes="$pkg_notes"; usb_host_sha="$pkg_host_sha"
     if pkg_stage "$root"; then
       usb_verified_at="$(now_utc)"
       write_offline_source ready ""
@@ -655,7 +695,7 @@ do_scan_usb() { # do_scan_usb MOUNT
     fi
   else
     # Keep the versions we could not trust out of state.json.
-    usb_channel=""; usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_verified_at=""
+    usb_channel=""; usb_chart=""; usb_app=""; usb_vllm=""; usb_notes=""; usb_verified_at=""; usb_host_sha=""
     write_offline_source rejected "$pkg_error"
     warn "Package REJECTED: $pkg_error"
     logger -t suite366-update "offline package rejected: $usb_label ($pkg_error)" 2>/dev/null || true
@@ -707,32 +747,216 @@ EOF
 }
 
 # --- apply ---------------------------------------------------------------------
-# Legacy values.yaml (rendered before the appliance-update bridge existed)
-# lacks the hostPath mount — inject it via an overlay so the fleet converges
-# on its next apply. Fresh installs carry the block in values.yaml directly.
+# --- values.yaml: every app <-> host bridge, IN PLACE ------------------------------
+# The app hides a feature whose hostPath bridge is missing (update, backup, the
+# model page, remote access). install.sh renders all five from the template;
+# a box installed earlier keeps the values.yaml of its day, and `helm upgrade`
+# from a NEWER chart does not add what values.yaml does not say. Seen on a
+# client Spark at app 1.11.7 with no model page: the bridge only install.sh knew.
+#
+# In place, not as a `-f` overlay: switch-model.sh (and any operator) runs
+# `helm upgrade -f values.yaml` on its own, and an overlay it does not know
+# about would silently fall off the release at that moment. One file, every
+# writer sees the same thing. The legacy overlay of the update bridge is folded
+# in and removed. Idempotent: returns 0 when something was added, 1 when not.
+#
+# `config.VLLM_MODEL_TRANSCRIPTION` rides along: the app reads it from the
+# ConfigMap, and it must exist — empty for a profile without transcription —
+# before switch-model.sh can keep it in step. Its value follows the profile
+# the box runs (llm/profiles.sh), which is why the host layer is laid down
+# BEFORE this runs.
+detect_stt_model() { # -> the transcription model the box's profile serves, or empty
+  local envf="$DATA_DIR/llm/.env" profiles="$DATA_DIR/llm/profiles.sh" prof model
+  [[ -f "$envf" && -f "$profiles" ]] || return 0
+  prof="$(sed -n 's/^LLM_PROFILE=//p' "$envf" | head -1)"
+  model="$(sed -n 's/^LLM_MODEL=//p' "$envf" | head -1)"
+  ( set +u
+    # shellcheck disable=SC1090
+    source "$profiles" 2>/dev/null || exit 0
+    if [[ -z "$prof" ]]; then
+      for p in ${LLM_PROFILES:-}; do
+        if llm_profile_apply "$p" base tag 2>/dev/null && [[ "${LLM_P_MODEL:-}" == "$model" ]]; then prof="$p"; break; fi
+      done
+    fi
+    [[ -n "$prof" ]] || exit 0
+    llm_profile_apply "$prof" base tag 2>/dev/null && printf '%s' "${LLM_P_STT_MODEL:-}" ) || true
+}
+
 extra_vals=()
 ensure_appliance_values() {
-  local vals="$DATA_DIR/values.yaml"
-  grep -q 'name: appliance-update' "$vals" && return 0
-  local ov="$DATA_DIR/values-appliance-update.yaml"
-  ( umask 077
-    cat > "$ov" <<EOF
-# Generated by update.sh — app <-> host update bridge (see suite366-deploy).
-extraEnv:
-  - name: APPLIANCE_UPDATE_DIR
-    value: /appliance-update
-extraVolumeMounts:
-  - name: appliance-update
-    mountPath: /appliance-update
-extraVolumes:
-  - name: appliance-update
-    hostPath:
-      path: $UPDATES_DIR
-      type: DirectoryOrCreate
-EOF
-  )
-  extra_vals=(-f "$ov")
-  info "appliance-update bridge overlay added ($ov)."
+  local vals="$DATA_DIR/values.yaml" out stt d
+  if ! have python3; then
+    warn "python3 missing — values.yaml bridges NOT converged (the model page stays hidden)."
+    return 1
+  fi
+  stt="$(detect_stt_model)"
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" python3 - "$vals" <<'PY'
+import os, re, sys
+path = sys.argv[1]
+data_dir = os.environ["DATA_DIR"]
+stt = os.environ.get("STT_MODEL", "")
+text = open(path, encoding="utf-8").read()
+lines = text.split("\n")
+if lines and lines[-1] == "":
+    lines.pop()
+# name, env var, mount path, host dir -- the five bridges values.yaml renders.
+BRIDGES = [
+    ("appliance-update", "APPLIANCE_UPDATE_DIR", "/appliance-update", "updates"),
+    ("support-access",   "SUPPORT_ACCESS_DIR",   "/support-access",   "support"),
+    ("appliance-backup", "APPLIANCE_BACKUP_DIR", "/appliance-backup", "backup"),
+    ("appliance-llm",    "APPLIANCE_LLM_DIR",    "/appliance-llm",    "llm-state"),
+    ("appliance-remote", "APPLIANCE_REMOTE_DIR", "/appliance-remote", "remote"),
+]
+def item(kind, b):
+    name, env, mount, sub = b
+    if kind == "extraEnv":
+        return ["  - name: " + env, "    value: " + mount]
+    if kind == "extraVolumeMounts":
+        return ["  - name: " + name, "    mountPath: " + mount]
+    return ["  - name: " + name, "    hostPath:", "      path: " + data_dir + "/" + sub, "      type: DirectoryOrCreate"]
+def marker(kind, b):
+    return "name: " + (b[1] if kind == "extraEnv" else b[0])
+def region(key):
+    """(index of the top-level key line, end index exclusive), or (None, None)."""
+    for i, l in enumerate(lines):
+        if re.match(r"^" + re.escape(key) + r":\s*(\[\]\s*)?(#.*)?$", l):
+            j = i + 1
+            while j < len(lines) and (lines[j] == "" or lines[j].startswith(" ") or lines[j].startswith("#")):
+                j += 1
+            return i, j
+    return None, None
+added = 0
+for kind in ("extraEnv", "extraVolumeMounts", "extraVolumes"):
+    i, j = region(kind)
+    if i is None:
+        lines.append("")
+        lines.append(kind + ":")
+        for b in BRIDGES:
+            lines.extend(item(kind, b)); added += 1
+        continue
+    if re.match(r"^" + re.escape(kind) + r":\s*\[\]", lines[i]):
+        lines[i] = kind + ":"
+    body = "\n".join(lines[i:j])
+    ins = []
+    for b in BRIDGES:
+        if marker(kind, b) not in body:
+            ins.extend(item(kind, b)); added += 1
+    lines[i + 1:i + 1] = ins
+ci, cj = region("config")
+if ci is not None:
+    if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):
+        at = ci + 1
+        for k in range(ci + 1, cj):
+            if re.match(r"^\s+VLLM_MODEL_EMBEDDING:", lines[k]):
+                at = k + 1
+        lines[at:at] = ['  VLLM_MODEL_TRANSCRIPTION: "' + stt + '"']
+        added += 1
+new = "\n".join(lines) + "\n"
+if new != text:
+    open(path, "w", encoding="utf-8").write(new)
+    print("changed: %d entr%s added" % (added, "y" if added == 1 else "ies"))
+else:
+    print("unchanged")
+PY
+)" || { warn "could not converge values.yaml: $out"; return 1; }
+  # The host dirs behind the bridges, owned like install.sh makes them (the pod
+  # is uid/gid 1001 and k8s does not fsGroup-chown a hostPath).
+  for d in updates support backup remote llm-state; do
+    mkdir -p "$DATA_DIR/$d"
+    chown "root:$APP_GID" "$DATA_DIR/$d" 2>/dev/null || true   # not root under the self-test
+    chmod 0770 "$DATA_DIR/$d" 2>/dev/null || true
+  done
+  if [[ -f "$DATA_DIR/values-appliance-update.yaml" ]]; then
+    rm -f "$DATA_DIR/values-appliance-update.yaml"
+    info "legacy values-appliance-update.yaml overlay removed (folded into values.yaml)."
+  fi
+  case "$out" in
+    changed*) info "values.yaml: $out (app <-> host bridges)"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- the host layer: fetch, verify, lay down, converge --------------------------
+# Same trust ladder as backup.sh, for the same reason: switch-model.sh runs as
+# root and rewrites the vLLM stack. Key present + signed manifest + matching
+# hash -> lay down; key present, anything else -> REFUSE; no key -> TLS-only.
+# Staging (files on disk) and applying (containers, units) are separate so
+# that the compose in place is the NEW one before any container is recreated:
+# on a legacy compose a base-image move would drag the LLM along with it.
+host_layer_new_sha=""
+stage_host_layer_online() {
+  local strict=0
+  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  if [[ "$strict" == 1 ]]; then
+    if [[ "${online_signed:-0}" != "1" ]]; then
+      warn "not laying down the host layer: the channel manifest was not signature-verified."; return 1
+    fi
+    if [[ -z "${online_host_sha:-}" ]]; then
+      warn "not laying down the host layer: the signed manifest carries no host_layer_sha256."
+      warn "  Publish it with tools/sign-channel.sh, or this box keeps the host side it was installed with."
+      return 1
+    fi
+  fi
+  local tmp; tmp="$(mktemp)"
+  if ! curl -fsSL -m 60 "$HOST_LAYER_URL" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+    warn "could not fetch host-layer.sh from $HOST_LAYER_URL (non-blocking)."; rm -f "$tmp"; return 1
+  fi
+  local got; got="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$strict" == 1 && "$got" != "$online_host_sha" ]]; then
+    warn "REFUSING host-layer.sh from $HOST_LAYER_URL — hash does not match the signed manifest."
+    warn "  expected $online_host_sha"
+    warn "  got      $got"
+    rm -f "$tmp"; return 1
+  fi
+  local origin="$HOST_LAYER_URL"
+  [[ "$strict" == 1 ]] && origin="$origin (signature-verified)"
+  stage_host_layer_file "$tmp" "$got" "$origin"
+  local rc=$?; rm -f "$tmp"; return $rc
+}
+stage_host_layer_from_package() {
+  local src="$OFFLINE_PKG/scripts/host-layer.sh"
+  [[ -s "$src" ]] || { warn "the staged package ships no host-layer.sh — host side left as is."; return 1; }
+  stage_host_layer_file "$src" "$(sha256sum "$src" | awk '{print $1}')" "the signed package"
+}
+stage_host_layer_file() { # stage_host_layer_file FILE SHA ORIGIN
+  if ! bash -n "$1" 2>/dev/null; then warn "host-layer.sh does not parse — not laid down."; return 1; fi
+  log "Laying down the host layer from $3"
+  if ! bash "$1" extract "$DATA_DIR"; then
+    warn "host-layer.sh could not unpack into $DATA_DIR — host side left as is."; return 1
+  fi
+  host_layer_new_sha="$2"
+  info "switch-model.sh + llm/ updated (bundle ${2:0:12})."
+}
+# Recreates what the new compose or the new base image changed, in ONE pass,
+# through the operator script that owns the stack. The stamp is written only
+# when convergence succeeded, so a failed run is retried by the next apply.
+apply_host_layer() { # apply_host_layer STAGED(0|1) VLLM_MOVED(0|1)
+  local sw="$DATA_DIR/switch-model.sh"
+  if [[ -x "$sw" && -f "$DATA_DIR/llm/profiles.sh" ]]; then
+    log "Converging the vLLM host side (switch-model.sh converge)"
+    if DATA_DIR="$DATA_DIR" "$sw" converge; then
+      if [[ "$1" == 1 && -n "$host_layer_new_sha" ]]; then
+        printf '%s\n' "$host_layer_new_sha" > "$HOST_LAYER_STAMP"; chmod 0644 "$HOST_LAYER_STAMP"
+        cur_host="$host_layer_new_sha"; host_diff=0
+        info "host layer stamped ${host_layer_new_sha:0:12}."
+      fi
+    else
+      warn "host-side convergence reported errors — the stamp is NOT written; the next apply retries."
+      warn "  Details: sudo $sw converge"
+    fi
+  elif [[ "$2" == 1 ]]; then
+    # No host layer on this box (a fetch that was refused): the pre-bundle
+    # behaviour, a plain recreate on the new image. Offline: the image is
+    # already loaded, so `pull` would only fail.
+    local vllm_ok=0
+    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+      ( cd "$DATA_DIR/llm" && docker compose up -d ) && vllm_ok=1
+    else
+      ( cd "$DATA_DIR/llm" && docker compose pull && docker compose up -d ) && vllm_ok=1
+    fi
+    if [[ "$vllm_ok" == 1 ]]; then info "vLLM containers recreated."
+    else warn "vLLM image update failed — check: docker logs suite366-vllm-llm"; fi
+  fi
 }
 
 apply_exit_trap() {
@@ -754,7 +978,7 @@ do_apply() {
   fi
 
   if up_to_date; then
-    log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}) — nothing to apply."
+    log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}, host layer ${cur_host:0:12}) — nothing to apply."
     rm -f "$MARKER"
     write_state_json 0
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
@@ -775,23 +999,26 @@ do_apply() {
     import_package_images
   fi
 
+  # The host layer FIRST, files only: the compose and switch-model.sh in place
+  # must be the new ones before .env moves or any container is recreated.
+  local host_staged=0 vllm_moved=0
+  if [[ "$host_diff" == 1 ]]; then
+    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+      stage_host_layer_from_package && host_staged=1
+    else
+      stage_host_layer_online && host_staged=1
+    fi
+  fi
+
+  # The vLLM base image: .env only. VLLM_IMAGE is what the embed and the
+  # transcription run and what the profiles derive the generative image from —
+  # a pinned profile (gemma on cu130-nightly) does NOT follow it. The recreate
+  # happens once, in apply_host_layer below, after the app is upgraded.
   if [[ "$vllm_diff" == 1 ]]; then
     log "vLLM image: $cur_vllm -> $want_vllm"
     [[ -f "$DATA_DIR/llm/.env" ]] || die "$DATA_DIR/llm/.env missing — cannot retarget vLLM image."
     sed -i "s|^VLLM_IMAGE=.*|VLLM_IMAGE=$want_vllm|" "$DATA_DIR/llm/.env"
-    # Offline: the image is already loaded, so `pull` would only fail. Online:
-    # pull first so a bad tag surfaces before the containers are torn down.
-    local vllm_ok=0
-    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
-      ( cd "$DATA_DIR/llm" && docker compose up -d ) && vllm_ok=1
-    else
-      ( cd "$DATA_DIR/llm" && docker compose pull && docker compose up -d ) && vllm_ok=1
-    fi
-    if [[ "$vllm_ok" == 1 ]]; then
-      info "vLLM containers recreated."
-    else
-      warn "vLLM image update failed — check: docker logs suite366-vllm-llm"
-    fi
+    vllm_moved=1
   fi
 
   if [[ "$app_diff" == 1 ]]; then
@@ -808,9 +1035,14 @@ do_apply() {
     sed -i "s|\(suite-366-workbench-runner:\)[^\"[:space:]]*|\1$want_app|" "$vals"
   fi
 
-  if [[ "$chart_diff" == 1 || "$app_diff" == 1 ]]; then
-    ensure_appliance_values
-    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $want_chart, app ${cur_app:-?} -> ${want_app:-unchanged}"
+  # Every app <-> host bridge, in place — a box updated from an older values.yaml
+  # gets the model page, the backup page and remote access wired like a fresh
+  # install. A change here is a reason to roll the release on its own.
+  local values_changed=0 target_chart="${want_chart:-$cur_chart}"
+  if ensure_appliance_values; then values_changed=1; fi
+  [[ "$chart_diff" == 1 ]] || target_chart="${cur_chart:-$want_chart}"
+  if [[ "$chart_diff" == 1 || "$app_diff" == 1 || "$values_changed" == 1 ]]; then
+    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml bridges')"
     # Offline: the chart comes from the signed package as a local .tgz, so no
     # `--version` (the archive IS the version) and no OCI pull.
     local chart_args=()
@@ -820,7 +1052,7 @@ do_apply() {
       chart_args=( "${pkg_charts[0]}" )
       info "chart from package: $(basename "${pkg_charts[0]}")"
     else
-      chart_args=( "$CHART_REF" --version "$want_chart" )
+      chart_args=( "$CHART_REF" --version "$target_chart" )
     fi
     helm upgrade "$RELEASE" "${chart_args[@]}" \
       -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
@@ -831,6 +1063,11 @@ do_apply() {
   log "Health check"
   kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
     || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
+
+  # The vLLM stack, one pass: the new host layer and/or the new base image.
+  if [[ "$host_staged" == 1 || "$vllm_moved" == 1 ]]; then
+    apply_host_layer "$host_staged" "$vllm_moved"
+  fi
 
   # The helm upgrade above re-pushed the Secret from values.yaml, so the app may
   # have restarted onto a key the database row does not carry. DEEP=1: a POST is
@@ -851,6 +1088,8 @@ do_apply() {
   cur_chart="$want_chart"
   [[ "$app_diff"  == 1 ]] && cur_app="$want_app"
   [[ "$vllm_diff" == 1 ]] && cur_vllm="$want_vllm"
+  # host_diff stays 1 when the layer could not be laid down or converged: the
+  # state the app reads keeps offering it, and the next apply retries.
   chart_diff=0; vllm_diff=0; app_diff=0; summary_line=""
 
   # Fleet convergence: make sure the app-trigger units exist / are current, and

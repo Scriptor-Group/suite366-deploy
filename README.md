@@ -570,10 +570,12 @@ uninstall.sh                          clean uninstaller — reverses install.sh 
 channel.json                          fleet release manifest (chart_version / app_version / vllm_image / updater_sha256) polled by update.sh
 channel.json.sig                      Ed25519 signature over channel.json — required by any appliance holding the public key
 values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. tokens substituted at run-time)
-switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run]) — .env, chart values and the database
+switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run] | converge) — .env, chart values and the database
+host-layer.sh                         GENERATED (tools/bundle-host-layer.sh): switch-model.sh + llm/ in one file, pinned in channel.json as host_layer_sha256, laid down by install.sh and update.sh
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
 llm/profiles.sh                       the three models and their measured budgets, and the transcription model each allows; the ONE table install.sh and switch-model.sh share
 llm/stt/Dockerfile                    the audio extras the arm64 vLLM image ships without; built on the box as suite366/vllm-stt
+tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
 llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
 llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box)
@@ -717,6 +719,20 @@ so an LLM call never proved anything about it. A box that merely boots proves
 nothing about the step above.
 
 ### Updates
+
+**What an update carries.** The app image and the chart, the vLLM base image,
+`update.sh` and `backup.sh` themselves — and, since the host layer became one
+artefact, everything the vLLM stack needs on the **host**: `switch-model.sh`, the
+model profiles, the compose, the nginx proxy config, the container entrypoint and
+the two image build contexts (`host-layer.sh`, pinned as `host_layer_sha256`).
+A box whose bundle differs from the channel's sees "host layer" in the update it
+is offered; applying it lays the bundle down, adds every app ↔ host bridge its
+`values.yaml` lacks (model page, backups, remote access), rolls the release, and
+runs `switch-model.sh converge`: fills `llm/.env` from the profile the box already
+runs (a pre-profile box is recognised by its model id — Gemma stays on its pinned
+`cu130-nightly` while the base image moves), recreates only the containers whose
+definition changed, reloads the proxy, rewrites the systemd units, publishes
+`state.json`. Nobody re-runs `install.sh` for a host-side feature any more.
 
 The installer arms a **daily systemd timer** (`suite366-update.timer`) that
 polls a **channel manifest** ([`channel.json`](channel.json) in this repo) and

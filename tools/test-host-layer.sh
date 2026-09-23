@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Self-test of the host layer — no hardware, no Docker, no root.
+#
+# What it guards:
+#   • host-layer.sh is what tools/bundle-host-layer.sh produces from this tree
+#     (a stale committed copy would be signed and shipped), and unpacks to the
+#     very files it was built from, with the installer's modes;
+#   • `switch-model.sh converge` turns a July 2026 box (LLM_MODEL, no profile,
+#     no cache dir, no transcription keys, base image already moved to v0.29.0
+#     by the channel) into a profile-driven one WITHOUT moving its model: Gemma
+#     keeps its pinned nightly, tuned budgets are kept, missing keys get the
+#     installer's defaults, the transcription container is taken down, the
+#     proxy is reloaded, the units are rewritten;
+#   • update.sh's in-place values.yaml patch adds every missing app <-> host
+#     bridge, is idempotent, and leaves a current file untouched;
+#   • a missing stamp shows up as an update — only on a box with a vLLM stack.
+# =============================================================================
+set -uo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PASS=0; FAIL=0
+ok()      { printf '  \033[32mok\033[0m   %s\n' "$1"; PASS=$((PASS+1)); }
+ko()      { printf '  \033[31mKO\033[0m   %s\n' "$1"; FAIL=$((FAIL+1)); }
+check()   { if [[ "$2" == "$3" ]]; then ok "$1"; else ko "$1 (attendu '$3', obtenu '$2')"; fi; }
+contains(){ case "$2" in *"$3"*) ok "$1" ;; *) ko "$1 (absent : $3)" ;; esac; }
+absent()  { case "$2" in *"$3"*) ko "$1 (présent alors qu'il ne devrait pas : $3)" ;; *) ok "$1" ;; esac; }
+head_()   { printf '\n== %s ==\n' "$1"; }
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+# --- 1. le bundle ---------------------------------------------------------------
+head_ "host-layer.sh"
+if "$REPO_ROOT/tools/bundle-host-layer.sh" --stdout | cmp -s - "$REPO_ROOT/host-layer.sh"; then
+  ok "host-layer.sh est à jour (régénération identique octet pour octet)"
+else
+  ko "host-layer.sh est PÉRIMÉ — lance tools/bundle-host-layer.sh et committe le résultat"
+fi
+X="$WORK/extract"; bash "$REPO_ROOT/host-layer.sh" extract "$X" >/dev/null 2>&1 || ko "extract a échoué"
+n=0; bad=0
+while IFS= read -r f; do
+  n=$((n+1)); cmp -s "$REPO_ROOT/$f" "$X/$f" || { bad=$((bad+1)); ko "contenu différent : $f"; }
+done < <(bash "$REPO_ROOT/host-layer.sh" list)
+[[ "$bad" == 0 ]] && ok "les $n fichiers extraits sont identiques aux sources"
+check "switch-model.sh est root-only (750)" "$(stat -c %a "$X/switch-model.sh")" "750"
+check "serve-llm.sh est exécutable (755)"   "$(stat -c %a "$X/llm/serve-llm.sh")" "755"
+check "profiles.sh est une donnée (644)"     "$(stat -c %a "$X/llm/profiles.sh")" "644"
+contains "le bundle embarque le contexte Flash-Next" "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/flash-next/Dockerfile"
+contains "le bundle embarque le contexte STT"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/stt/Dockerfile"
+absent   "le bundle ne transporte pas de doc"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "README"
+
+# --- 2. converge sur une box de juillet ----------------------------------------------
+head_ "switch-model.sh converge (box de juillet 2026)"
+STUB="$WORK/stub"; mkdir -p "$STUB"
+cat > "$STUB/docker" <<'STUBEOF'
+#!/bin/bash
+echo "docker $*" >> "$DOCKER_LOG"
+case "$1 $2" in
+  "inspect -f")
+    # health / state / image for any container; healthy so the waits return at once
+    case "$3" in
+      *Health*) echo healthy ;;
+      *Status*) echo running ;;
+      *) echo "img" ;;
+    esac ;;
+  "image inspect") exit 0 ;;      # every image is present: no build, no pull
+  "compose "*) exit 0 ;;
+  "exec "*) exit 0 ;;
+  *) exit 0 ;;
+esac
+STUBEOF
+printf '#!/bin/bash\necho "systemctl $*" >> "$DOCKER_LOG"; exit 0\n' > "$STUB/systemctl"
+printf '#!/bin/bash\nexit 0\n' > "$STUB/sysctl"
+chmod +x "$STUB"/*
+mkbox() { # mkbox DIR MODEL [EXTRA_ENV_LINES]
+  local box="$1"; mkdir -p "$box/llm"
+  bash "$REPO_ROOT/host-layer.sh" extract "$box" >/dev/null
+  cat > "$box/llm/.env" <<ENV
+VLLM_IMAGE=vllm/vllm-openai:v0.29.0
+PROXY_IMAGE=nginx:1.31-alpine
+HF_TOKEN=
+VLLM_API_KEY=sk-test
+MODELS_DIR=$box/models
+BIND_IP=10.99.0.1
+LLM_MODEL=$2
+EMBED_MODEL=Qwen/Qwen3-VL-Embedding-8B
+LLM_PORT=8001
+EMBED_PORT=8002
+PROXY_PORT=8000
+LLM_GPU_MEM_UTIL=0.55
+EMBED_GPU_MEM_UTIL=0.30
+LLM_MAX_NUM_SEQS=2
+LLM_MAX_MODEL_LEN=262144
+EMBED_MAX_MODEL_LEN=8192
+${3:-}
+ENV
+  mkdir -p "$box/models/hub"
+}
+conv() { # conv BOX -> output
+  DOCKER_LOG="$1/docker.log" PATH="$STUB:$PATH" DATA_DIR="$1" SYSTEMD_DIR="$1/systemd" \
+  VLLM_SYSCTL_FILE="$1/sysctl.conf" LLM_STATE_DIR="$1/llm-state" SWITCH_MODEL_SELFTEST=1 \
+    bash "$1/switch-model.sh" converge 2>&1
+}
+envv() { sed -n "s/^$2=//p" "$1/llm/.env" | head -1; }
+
+BOX="$WORK/gemma-box"; mkbox "$BOX" nvidia/Gemma-4-26B-A4B-NVFP4; mkdir -p "$BOX/systemd"
+out="$(conv "$BOX")"; rc=$?
+check "converge sort en 0"                          "$rc" "0"
+contains "reconnaît le profil d'après le modèle"    "$out" "profile for nvidia/Gemma-4-26B-A4B-NVFP4: gemma"
+check ".env : LLM_PROFILE posé"                     "$(envv "$BOX" LLM_PROFILE)" "gemma"
+# Le piège que ce test existe pour attraper : le canal a déplacé VLLM_IMAGE sur
+# v0.29.0 et l'ancien compose y aurait entraîné Gemma. Le profil le garde épinglé.
+check ".env : Gemma reste sur sa nightly épinglée"  "$(envv "$BOX" VLLM_LLM_IMAGE)" "vllm/vllm-openai:cu130-nightly"
+check ".env : la base reste celle du canal"         "$(envv "$BOX" VLLM_IMAGE)" "vllm/vllm-openai:v0.29.0"
+check ".env : budget réglé conservé"                "$(envv "$BOX" LLM_GPU_MEM_UTIL)" "0.55"
+check ".env : budget embed conservé"                "$(envv "$BOX" EMBED_GPU_MEM_UTIL)" "0.30"
+check ".env : CACHE_DIR par défaut"                 "$(envv "$BOX" CACHE_DIR)" "$BOX/cache"
+check ".env : pas de tête MTP pour Gemma"           "$(envv "$BOX" LLM_MTP_TOKENS)" ""
+check ".env : pas de transcription pour Gemma"      "$(envv "$BOX" STT_MODEL)" ""
+check ".env : profil compose stt désactivé"         "$(envv "$BOX" COMPOSE_PROFILES)" ""
+check ".env : STT_PORT par défaut"                  "$(envv "$BOX" STT_PORT)" "8003"
+if [[ -d "$BOX/cache/vllm" && -d "$BOX/cache/flashinfer" && -d "$BOX/cache/triton" ]]; then ok "caches JIT créés"; else ko "caches JIT créés"; fi
+D="$(cat "$BOX/docker.log")"
+contains "conteneur STT retiré (le profil n'en a pas)"  "$D" "docker compose --profile stt rm -sf vllm-stt"
+contains "compose up -d (recrée ce qui a changé)"       "$D" "docker compose up -d"
+absent   "pas de --force-recreate (rien d'inutile)"     "$D" "force-recreate"
+contains "proxy rechargé"                               "$D" "docker exec suite366-vllm-proxy nginx -s reload"
+contains "daemon-reload après les unités"               "$D" "systemctl daemon-reload"
+U="$(cat "$BOX/systemd/suite366-vllm.service" 2>/dev/null)"
+contains "unité vLLM réécrite avec le rafraîchissement CDI" "$U" "ExecStartPre=-/usr/bin/nvidia-ctk cdi generate"
+contains "unité vLLM : WorkingDirectory de la box"          "$U" "WorkingDirectory=$BOX/llm"
+if [[ -f "$BOX/systemd/suite366-llm-switch.path" ]]; then ok "unité .path du déclencheur écrite"; else ko "unité .path du déclencheur écrite"; fi
+ST="$BOX/llm-state/state.json"
+if python3 -m json.tool "$ST" >/dev/null 2>&1; then ok "state.json publié et valide"; else ko "state.json publié et valide"; fi
+check "state : profil actif gemma" "$(python3 -c "import json;print(json.load(open('$ST'))['active'])")" "gemma"
+check "state : bascule au repos"   "$(python3 -c "import json;print(json.load(open('$ST'))['switch']['status'])")" "idle"
+# Idempotent : une seconde passe n'écrit rien dans .env.
+env1="$(cat "$BOX/llm/.env")"; out2="$(conv "$BOX")"
+check "seconde passe : .env inchangé"  "$(cat "$BOX/llm/.env")" "$env1"
+contains "seconde passe : 0 clé écrite" "$out2" ".env: 0 key(s) written"
+
+BOX2="$WORK/qwen-box"; mkbox "$BOX2" nvidia/Qwen3.8-27B-NVFP4; mkdir -p "$BOX2/systemd"
+out="$(conv "$BOX2")"
+check "qwen27b : profil reconnu"            "$(envv "$BOX2" LLM_PROFILE)" "qwen27b"
+check "qwen27b : image = la base"           "$(envv "$BOX2" VLLM_LLM_IMAGE)" "vllm/vllm-openai:v0.29.0"
+check "qwen27b : transcription activée"     "$(envv "$BOX2" STT_MODEL)" "Qwen/Qwen3-ASR-1.7B"
+check "qwen27b : profil compose stt"        "$(envv "$BOX2" COMPOSE_PROFILES)" "stt"
+check "qwen27b : tête MTP à 3"              "$(envv "$BOX2" LLM_MTP_TOKENS)" "3"
+absent "qwen27b : le conteneur STT n'est pas retiré" "$(cat "$BOX2/docker.log")" "rm -sf vllm-stt"
+
+BOX3="$WORK/custom-box"; mkbox "$BOX3" someone/Custom-Model; mkdir -p "$BOX3/systemd"
+out="$(conv "$BOX3")"; rc=$?
+check "modèle inconnu : sort en 0 sans casser"   "$rc" "0"
+contains "modèle inconnu : le dit et n'invente rien" "$out" "no profile serves 'someone/Custom-Model'"
+check "modèle inconnu : .env sans LLM_PROFILE"   "$(envv "$BOX3" LLM_PROFILE)" ""
+absent "modèle inconnu : aucun compose up"       "$(cat "$BOX3/docker.log" 2>/dev/null)" "compose up"
+if [[ -f "$BOX3/systemd/suite366-vllm.service" ]]; then ok "modèle inconnu : l'unité est quand même réécrite"; else ko "modèle inconnu : l'unité est quand même réécrite"; fi
+
+# --- 3. values.yaml : les ponts, en place ---------------------------------------------
+head_ "update.sh ensure_appliance_values"
+vals_run() { # vals_run BOX -> rc ; output in $VOUT
+  VOUT="$(bash -c '
+    set -uo pipefail
+    info() { printf "    %s\n" "$*"; }; warn() { printf "!!  %s\n" "$*"; }
+    have() { command -v "$1" >/dev/null 2>&1; }
+    DATA_DIR="$1"; APP_GID=1001
+    for f in detect_stt_model ensure_appliance_values; do eval "$(sed -n "/^$f() {/,/^}/p" "$2")"; done
+    ensure_appliance_values
+  ' _ "$1" "$REPO_ROOT/update.sh" 2>&1)"
+}
+JULY="$WORK/july"; mkdir -p "$JULY/llm"
+cat > "$JULY/values.yaml" <<'Y'
+image:
+  tag: "1.8.22"
+config:
+  NODE_ENV: "production"
+  VLLM_BASE_URL: "http://10.99.0.1:8000/v1"
+  VLLM_MODEL_HIGH: "nvidia/Gemma-4-26B-A4B-NVFP4"
+  VLLM_MODEL_EMBEDDING: "Qwen/Qwen3-VL-Embedding-8B"
+  VLLM_MAX_CONTEXT_WINDOW: "200000"
+
+sandbox:
+  enabled: true
+Y
+cp "$BOX/llm/.env" "$JULY/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$JULY/llm/profiles.sh"
+vals_run "$JULY"; rc=$?
+check "juillet : signale un changement (rc 0)" "$rc" "0"
+V="$(cat "$JULY/values.yaml")"
+for b in APPLIANCE_UPDATE_DIR SUPPORT_ACCESS_DIR APPLIANCE_BACKUP_DIR APPLIANCE_LLM_DIR APPLIANCE_REMOTE_DIR; do
+  contains "juillet : env $b" "$V" "name: $b"
+done
+for m in appliance-update support-access appliance-backup appliance-llm appliance-remote; do
+  contains "juillet : montage + volume $m" "$V" "- name: $m"
+done
+contains "juillet : hostPath sous DATA_DIR"           "$V" "path: $JULY/llm-state"
+contains "juillet : VLLM_MODEL_TRANSCRIPTION vide (Gemma)" "$V" 'VLLM_MODEL_TRANSCRIPTION: ""'
+# Insérée dans le bloc config, juste après l'embedding, pas en fin de fichier.
+check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: ""'
+for d in updates support backup remote llm-state; do [[ -d "$JULY/$d" ]] || ko "répertoire de pont $d créé"; done; ok "répertoires de pont créés"
+if python3 -c "import yaml" 2>/dev/null; then
+  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts dans chaque liste"; else ko "juillet : YAML valide, 5 ponts dans chaque liste"; fi
+else
+  ok "juillet : (PyYAML absent — validation structurelle sautée)"
+fi
+v1="$(cat "$JULY/values.yaml")"; vals_run "$JULY"; rc=$?
+check "juillet : seconde passe sans changement (rc 1)" "$rc" "1"
+check "juillet : seconde passe, fichier identique"     "$(cat "$JULY/values.yaml")" "$v1"
+
+SEP="$WORK/sep"; mkdir -p "$SEP/llm"; cp "$BOX2/llm/.env" "$SEP/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$SEP/llm/profiles.sh"
+cat > "$SEP/values.yaml" <<'Y'
+config:
+  VLLM_MODEL_EMBEDDING: "Qwen/Qwen3-VL-Embedding-8B"
+extraEnv:
+  - name: APPLIANCE_UPDATE_DIR
+    value: /appliance-update
+extraVolumeMounts:
+  - name: appliance-update
+    mountPath: /appliance-update
+extraVolumes:
+  - name: appliance-update
+    hostPath:
+      path: /opt/suite366/updates
+      type: DirectoryOrCreate
+Y
+touch "$SEP/values-appliance-update.yaml"
+vals_run "$SEP"
+V="$(cat "$SEP/values.yaml")"
+check "pont update déjà là : non dupliqué" "$(grep -c 'name: APPLIANCE_UPDATE_DIR' "$SEP/values.yaml")" "1"
+contains "les quatre autres ajoutés"        "$V" "name: APPLIANCE_LLM_DIR"
+contains "qwen27b : VLLM_MODEL_TRANSCRIPTION suit le profil" "$V" 'VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
+if [[ ! -f "$SEP/values-appliance-update.yaml" ]]; then ok "overlay legacy supprimé (replié dans values.yaml)"; else ko "overlay legacy supprimé"; fi
+contains "…et dit qu'il l'a fait" "$VOUT" "overlay removed"
+
+CUR="$WORK/current"; mkdir -p "$CUR/llm"; cp "$BOX2/llm/.env" "$CUR/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$CUR/llm/profiles.sh"
+sed "s#@DATA_DIR@#$CUR#g" "$REPO_ROOT/tools/testdata/values-plain.rendered.yaml" > "$CUR/values.yaml"
+c0="$(cat "$CUR/values.yaml")"; vals_run "$CUR"; rc=$?
+check "un values.yaml courant : rien à faire (rc 1)" "$rc" "1"
+check "un values.yaml courant : intact"              "$(cat "$CUR/values.yaml")" "$c0"
+
+# --- 4. la décision « mise à jour disponible » -------------------------------------------
+head_ "update.sh compute_diffs (couche hôte)"
+diffs() { # diffs HOST_APPLICABLE CUR_HOST WANT_HOST
+  bash -c '
+    set -uo pipefail
+    info() { :; }; warn() { :; }
+    UPDATE_SOURCE=online; channel=stable
+    cur_chart=0.10.0; want_chart=0.10.0; cur_app=1.11.7; want_app=1.11.7; cur_vllm=img; want_vllm=img
+    host_applicable="$1"; cur_host="$2"; want_host="$3"
+    for f in ver_gt compute_diffs up_to_date; do eval "$(sed -n "/^$f() {/,/^}/p" "$4")"; done
+    compute_diffs >/dev/null 2>&1
+    if up_to_date; then u=up-to-date; else u=update; fi
+    printf "%s %s %s\n" "$host_diff" "$u" "${summary_line:-<none>}"
+  ' _ "$1" "$2" "$3" "$REPO_ROOT/update.sh" 2>&1
+}
+out="$(diffs 1 "" abc123def456)";  check "box sans stamp : la couche hôte est une mise à jour" "${out%% *}" "1"
+contains "…et le résumé le dit"     "$out" "host layer (model switch, transcription) -> abc123def456"
+out="$(diffs 1 abc123def456 abc123def456)"; check "stamp = canal : rien" "${out%% *}" "0"
+contains "…et la box est à jour"    "$out" "up-to-date"
+out="$(diffs 1 old000000000 abc123def456)"; check "stamp différent : mise à jour" "${out%% *}" "1"
+out="$(diffs 0 "" abc123def456)";  check "box SKIP_VLLM : jamais concernée" "${out%% *}" "0"
+out="$(diffs 1 "" "")";            check "canal sans host_layer_sha256 : rien à proposer" "${out%% *}" "0"
+
+printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]

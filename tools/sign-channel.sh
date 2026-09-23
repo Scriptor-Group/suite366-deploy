@@ -14,7 +14,9 @@
 #      agent every night with the destination's credentials. Rather than a
 #      detached signature each, the manifest carries `updater_sha256` and
 #      `backup_sha256` — covered by the manifest's own signature — so verifying
-#      the manifest transitively verifies both scripts.
+#      the manifest transitively verifies both scripts. `host_layer_sha256` pins
+#      host-layer.sh the same way: it unpacks switch-model.sh, which runs as root
+#      and rewrites the vLLM stack.
 #
 #      backup.sh is pinned for a second reason beyond trust: update.sh rolls
 #      itself forward on every apply, so without a hash to fetch against, a box
@@ -40,6 +42,7 @@ KEY="${PACKAGE_PRIVATE_KEY:-}"
 CHANNEL="$REPO_ROOT/channel.json"
 UPDATER="$REPO_ROOT/update.sh"
 BACKUP="$REPO_ROOT/backup.sh"
+HOST_LAYER="$REPO_ROOT/host-layer.sh"
 
 c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
 log()  { printf "${c_g}==>${c_0} ${c_b}%s${c_0}\n" "$*"; }
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --channel) CHANNEL="$2"; shift 2 ;;
     --updater) UPDATER="$2"; shift 2 ;;
     --backup)  BACKUP="$2";  shift 2 ;;
+    --host-layer) HOST_LAYER="$2"; shift 2 ;;
     -h|--help) sed -n '2,36p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -64,6 +68,7 @@ command -v openssl >/dev/null || die "openssl required."
 [[ -s "$CHANNEL" ]] || die "channel manifest not found: $CHANNEL"
 [[ -s "$UPDATER" ]] || die "updater not found: $UPDATER"
 [[ -s "$BACKUP" ]]  || die "backup agent not found: $BACKUP"
+[[ -s "$HOST_LAYER" ]] || die "host layer bundle not found: $HOST_LAYER (tools/bundle-host-layer.sh)"
 
 # --- 1. Pin the scripts the appliance fetches and runs as root ----------------
 # Both are pinned the same way, and a missing field is fatal rather than skipped:
@@ -96,6 +101,7 @@ pin_script() { # pin_script FIELD FILE
 log "Pinning the scripts an appliance fetches"
 pin_script updater_sha256 "$UPDATER"
 pin_script backup_sha256  "$BACKUP"
+pin_script host_layer_sha256 "$HOST_LAYER"
 
 # The restic pins ride along, read from lib/config.sh so there is exactly one
 # place in the repo that decides which restic an appliance runs. Signing them
