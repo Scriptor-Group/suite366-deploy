@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Tests for the CDI spec refresh: lib/preflight.sh's refresh_cdi_spec() and the
-# ExecStartPre baked into suite366-vllm.service by lib/vllm.sh.
+# ExecStartPre baked into suite366-vllm.service by switch-model.sh
+# (install-vllm-unit — the one template, written at install by lib/vllm.sh and
+# on a running box by update.sh through `switch-model.sh converge`).
 #
 # This exists because of a box that came back from a reboot with every LLM call
 # failing and nothing in any log naming the cause. /etc/cdi/nvidia.yaml pins the
@@ -99,10 +101,18 @@ grep -q "may not resolve after reboot" <<<"$out" \
 echo "== the unit refreshes the spec before the containers are created =="
 # Devices are injected at container CREATION, so a refresh that runs after
 # `docker compose up` would be a no-op for the containers that matter. Pull the
-# unit heredoc straight out of lib/vllm.sh.
-unit="$(sed -n '/cat > \/etc\/systemd\/system\/suite366-vllm.service <<EOF/,/^EOF$/p' \
-        "$REPO/lib/vllm.sh")"
+# unit heredoc straight out of switch-model.sh (install_vllm_unit), the one
+# template every writer uses.
+unit="$(sed -n '/cat > "\$SYSTEMD_DIR\/suite366-vllm.service" <<EOF/,/^EOF$/p' \
+        "$REPO/switch-model.sh")"
 [[ -n "$unit" ]] || { ko "the suite366-vllm.service heredoc is still where the test looks"; unit=""; }
+# lib/vllm.sh must not keep a second copy: two templates drift, and the one the
+# updater rewrites would silently differ from the one the installer wrote.
+grep -q 'suite366-vllm.service <<EOF' "$REPO/lib/vllm.sh" \
+  && ko "lib/vllm.sh still carries its own copy of the unit (one template only)" \
+  || ok "lib/vllm.sh writes the unit through switch-model.sh install-vllm-unit"
+grep -q 'switch-model.sh" install-vllm-unit' "$REPO/lib/vllm.sh" \
+  && ok "  and calls it" || ko "  and calls it"
 
 grep -q '^ExecStartPre=.*nvidia-ctk cdi generate' <<<"$unit" \
   && ok "the unit carries a CDI refresh as ExecStartPre" \
@@ -114,7 +124,13 @@ grep -q '^ExecStartPre=-' <<<"$unit" \
   && ok "the refresh is best-effort, it cannot block the stack" \
   || ko "the refresh is best-effort, it cannot block the stack" "$unit"
 
-grep -q 'ExecStartPre=.*--output=\$CDI_SPEC' <<<"$unit" \
+# The unit writes $cdi_spec, which install_vllm_unit sets from the same
+# CDI_SPEC the preflight refresh reads — lib/vllm.sh passes it through, and a
+# box converged by update.sh gets the installer's default.
+grep -q 'ExecStartPre=.*--output=\$cdi_spec' <<<"$unit" \
+  && grep -q 'cdi_spec="\${CDI_SPEC:-/etc/cdi/nvidia.yaml}"' "$REPO/switch-model.sh" \
+  && grep -q 'CDI_SPEC="\${CDI_SPEC:-/etc/cdi/nvidia.yaml}"' "$REPO/lib/config.sh" \
+  && grep -q 'CDI_SPEC="\$CDI_SPEC" "\$DATA_DIR/switch-model.sh" install-vllm-unit' "$REPO/lib/vllm.sh" \
   && ok "the unit and the preflight refresh target the same file" \
   || ko "the unit and the preflight refresh target the same file" "$unit"
 
