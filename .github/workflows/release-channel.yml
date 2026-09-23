@@ -407,6 +407,19 @@ jobs:
           # step to a warning and a dry run is how the workflow gets tested.
           # The run ID cannot drift that way, and it also covers the sibling
           # `package` job — so match on details_url, which carries it.
+          #
+          # A PREVIOUS release run on this same commit leaves its own check run
+          # behind too, and a failed one (a roll fired before CI finished, say)
+          # made every later roll on the commit fail on "check 'channel'
+          # concluded failure": a deadlock only a new commit could break. Those
+          # are this workflow's jobs, not CI, so they are skipped by name as
+          # well — and the names are checked against the file, so a rename
+          # fails here instead of silently counting the old job as a check.
+          own_jobs='channel package'
+          for j in $own_jobs; do
+            grep -qE "^  $j:\$" "$GITHUB_WORKSPACE/.github/workflows/release-channel.yml" \
+              || { echo "::error::job '$j' not found in release-channel.yml — update own_jobs after a rename."; exit 1; }
+          done
           runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
                     --jq '.check_runs[] | [.name, .status, (.conclusion // "-"), (.details_url // "-")] | @tsv' || true)"
           rc=0
@@ -417,6 +430,10 @@ jobs:
               printf '  skip    %s (this release run)\n' "$name"
               continue
             fi
+            case " $own_jobs " in *" $name "*)
+              printf '  skip    %s (a previous release run on this commit: %s %s)\n' "$name" "$status" "$concl"
+              continue ;;
+            esac
             seen=1
             case "$status:$concl" in
               completed:success|completed:neutral|completed:skipped) printf '  ok      %s\n' "$name" ;;
