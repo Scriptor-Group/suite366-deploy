@@ -482,7 +482,8 @@ compute_diffs() {
   info "vLLM   running : ${cur_vllm:-unknown}    target : ${want_vllm:-unchanged}"
   if [[ "${host_applicable:-0}" == 1 ]]; then
     local _ch="${cur_host:-}" _wh="${want_host:-}"
-    info "host   layer   : ${_ch:0:12}${_ch:-none (pre-bundle box)}    target : ${_wh:0:12}${_wh:-unpinned}"
+    _ch="${_ch:0:12}"; _wh="${_wh:0:12}"
+    info "host   layer   : ${_ch:-none (pre-bundle box)}    target : ${_wh:-unpinned}"
   fi
 
   # STRICTLY NEWER, not merely different. The channel is rolled deliberately and
