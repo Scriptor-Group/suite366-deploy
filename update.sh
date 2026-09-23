@@ -993,6 +993,25 @@ apply_host_layer() { # apply_host_layer STAGED(0|1) VLLM_MOVED(0|1)
   fi
 }
 
+# One helm roll, from whichever source is in play. Offline: the chart comes
+# from the signed package as a local .tgz, so no `--version` (the archive IS
+# the version) and no OCI pull.
+roll_release() { # roll_release CHART_VERSION
+  local vals="$DATA_DIR/values.yaml" chart_args=()
+  if [[ "$UPDATE_SOURCE" == "usb" ]]; then
+    local pkg_charts=( "$OFFLINE_PKG"/chart/*.tgz )
+    [[ -f "${pkg_charts[0]:-}" ]] || die "staged package has no chart archive."
+    chart_args=( "${pkg_charts[0]}" )
+    info "chart from package: $(basename "${pkg_charts[0]}")"
+  else
+    chart_args=( "$CHART_REF" --version "$1" )
+  fi
+  helm upgrade "$RELEASE" "${chart_args[@]}" \
+    -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
+    --wait --timeout 15m \
+    || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
+}
+
 apply_exit_trap() {
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -1014,6 +1033,17 @@ do_apply() {
   if up_to_date; then
     log "Up to date (chart ${cur_chart:-?}, app ${cur_app:-?}, host layer ${cur_host:0:12}) — nothing to apply."
     rm -f "$MARKER"
+    # values.yaml can lag the template while every version matches: a box
+    # installed before a block existed (the bridges, the workbench) stays
+    # without it until something else moves. Converge it here too, and roll the
+    # release when it changed — this is what a manual `apply` on an up-to-date
+    # box is for.
+    if [[ -n "${cur_chart:-}" ]] && ensure_appliance_values; then
+      log "helm upgrade $RELEASE: chart $cur_chart (values.yaml converged)"
+      roll_release "$cur_chart"
+      kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
+        || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
+    fi
     write_state_json 0
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
     install_units
@@ -1076,22 +1106,8 @@ do_apply() {
   if ensure_appliance_values; then values_changed=1; fi
   [[ "$chart_diff" == 1 ]] || target_chart="${cur_chart:-$want_chart}"
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 || "$values_changed" == 1 ]]; then
-    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml bridges')"
-    # Offline: the chart comes from the signed package as a local .tgz, so no
-    # `--version` (the archive IS the version) and no OCI pull.
-    local chart_args=()
-    if [[ "$UPDATE_SOURCE" == "usb" ]]; then
-      local pkg_charts=( "$OFFLINE_PKG"/chart/*.tgz )
-      [[ -f "${pkg_charts[0]:-}" ]] || die "staged package has no chart archive."
-      chart_args=( "${pkg_charts[0]}" )
-      info "chart from package: $(basename "${pkg_charts[0]}")"
-    else
-      chart_args=( "$CHART_REF" --version "$target_chart" )
-    fi
-    helm upgrade "$RELEASE" "${chart_args[@]}" \
-      -n "$NAMESPACE" -f "$vals" "${extra_vals[@]}" \
-      --wait --timeout 15m \
-      || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
+    log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml converged')"
+    roll_release "$target_chart"
   fi
 
   log "Health check"

@@ -3,7 +3,7 @@
   "chart_version": "0.10.0",
   "app_version": "1.11.8",
   "vllm_image": "vllm/vllm-openai:v0.29.0",
-  "updater_sha256": "80f9b06c1026535e0da0e246c0d6f9689c7ce98090b9ff2d7a7deaf24be44764",
+  "updater_sha256": "c2ad9814df1baade68e90f3f85baed00a7c2d9625727afc80256c19567172c3e",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
   "host_layer_sha256": "a3080d81ea3d48739ddf091aa740ee6034f0721751d18af1e855f19d7302f6f6",
   "restic_version": "0.19.1",
