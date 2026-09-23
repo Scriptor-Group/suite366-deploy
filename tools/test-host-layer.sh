@@ -161,7 +161,7 @@ vals_run() { # vals_run BOX -> rc ; output in $VOUT
     set -uo pipefail
     info() { printf "    %s\n" "$*"; }; warn() { printf "!!  %s\n" "$*"; }
     have() { command -v "$1" >/dev/null 2>&1; }
-    DATA_DIR="$1"; APP_GID=1001
+    DATA_DIR="$1"; APP_GID=1001; cur_app=1.11.8; want_app=""
     for f in detect_stt_model ensure_appliance_values; do eval "$(sed -n "/^$f() {/,/^}/p" "$2")"; done
     ensure_appliance_values
   ' _ "$1" "$REPO_ROOT/update.sh" 2>&1)"
@@ -179,6 +179,15 @@ config:
 
 sandbox:
   enabled: true
+  namespace: sandbox
+  createNamespace: false
+  api:
+    image: ghcr.io/scriptor-group/suite-366-sandbox-api:1.8.22
+    pullPolicy: IfNotPresent
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.8.22
+
+ingress:
+  enabled: true
 Y
 cp "$BOX/llm/.env" "$JULY/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$JULY/llm/profiles.sh"
 vals_run "$JULY"; rc=$?
@@ -195,8 +204,15 @@ contains "juillet : VLLM_MODEL_TRANSCRIPTION vide (Gemma)" "$V" 'VLLM_MODEL_TRAN
 # Insérée dans le bloc config, juste après l'embedding, pas en fin de fichier.
 check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: ""'
 for d in updates support backup remote llm-state; do [[ -d "$JULY/$d" ]] || ko "répertoire de pont $d créé"; done; ok "répertoires de pont créés"
+# Le workbench : le bloc entier, épinglé sur la version d'app installée, sous sandbox.
+contains "juillet : bloc workbench ajouté"           "$V" "  workbench:"
+contains "juillet : workbench activé"                "$V" "    enabled: true"
+contains "juillet : runner épinglé sur l'app"        "$V" "suite-366-workbench-runner:1.11.8"
+contains "juillet : quota du gabarit"                "$V" 'requestsStorage: "300Gi"'
+check "juillet : le bloc suit runnerImage, sous sandbox" "$(grep -A1 'suite-366-sandbox-runner' "$JULY/values.yaml" | tail -1)" "  workbench:"
+absent "juillet : l'ingress qui suit n'a pas bougé de place" "$(sed -n '/^ingress:/,$p' "$JULY/values.yaml")" "workbench"
 if python3 -c "import yaml" 2>/dev/null; then
-  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts dans chaque liste"; else ko "juillet : YAML valide, 5 ponts dans chaque liste"; fi
+  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5; assert d['sandbox']['workbench']['enabled'] is True and d['sandbox']['workbench']['resourceQuota']['pods']=='10' and d['sandbox']['enabled'] is True" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox"; else ko "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox"; fi
 else
   ok "juillet : (PyYAML absent — validation structurelle sautée)"
 fi
@@ -228,6 +244,23 @@ contains "les quatre autres ajoutés"        "$V" "name: APPLIANCE_LLM_DIR"
 contains "qwen27b : VLLM_MODEL_TRANSCRIPTION suit le profil" "$V" 'VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
 if [[ ! -f "$SEP/values-appliance-update.yaml" ]]; then ok "overlay legacy supprimé (replié dans values.yaml)"; else ko "overlay legacy supprimé"; fi
 contains "…et dit qu'il l'a fait" "$VOUT" "overlay removed"
+
+# Un admin qui a ÉTEINT le workbench le garde éteint : présent = pas touché.
+OFF="$WORK/off"; mkdir -p "$OFF/llm"; cp "$BOX/llm/.env" "$OFF/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$OFF/llm/profiles.sh"
+cat > "$OFF/values.yaml" <<'Y'
+config:
+  VLLM_MODEL_EMBEDDING: "e"
+sandbox:
+  enabled: true
+  runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.7
+  workbench:
+    enabled: false
+    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.7
+Y
+vals_run "$OFF"
+check "workbench éteint par l'admin : un seul bloc"  "$(grep -c '^  workbench:' "$OFF/values.yaml")" "1"
+contains "workbench éteint par l'admin : reste éteint" "$(cat "$OFF/values.yaml")" "    enabled: false"
+absent   "workbench éteint par l'admin : pas de quota injecté" "$(cat "$OFF/values.yaml")" "resourceQuota"
 
 CUR="$WORK/current"; mkdir -p "$CUR/llm"; cp "$BOX2/llm/.env" "$CUR/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$CUR/llm/profiles.sh"
 sed "s#@DATA_DIR@#$CUR#g" "$REPO_ROOT/tools/testdata/values-plain.rendered.yaml" > "$CUR/values.yaml"

@@ -766,6 +766,13 @@ EOF
 # before switch-model.sh can keep it in step. Its value follows the profile
 # the box runs (llm/profiles.sh), which is why the host layer is laid down
 # BEFORE this runs.
+#
+# So does `sandbox.workbench`: the per-user workbench landed in the template on
+# 2026-08-05 and the chart defaults it OFF, so every box installed before that
+# date runs 1.11.x with `workbenchEnabled: false` and no way to turn it on from
+# an update — the pin rewrite above only touches lines that exist. The block is
+# added whole when absent, pinned on the app version this apply installs, and
+# never edited when present: an admin who turned it off keeps it off.
 detect_stt_model() { # -> the transcription model the box's profile serves, or empty
   local envf="$DATA_DIR/llm/.env" profiles="$DATA_DIR/llm/profiles.sh" prof model
   [[ -f "$envf" && -f "$profiles" ]] || return 0
@@ -791,11 +798,12 @@ ensure_appliance_values() {
     return 1
   fi
   stt="$(detect_stt_model)"
-  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" python3 - "$vals" <<'PY'
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" python3 - "$vals" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 data_dir = os.environ["DATA_DIR"]
 stt = os.environ.get("STT_MODEL", "")
+app_version = os.environ.get("APP_VERSION", "")
 text = open(path, encoding="utf-8").read()
 lines = text.split("\n")
 if lines and lines[-1] == "":
@@ -843,6 +851,31 @@ for kind in ("extraEnv", "extraVolumeMounts", "extraVolumes"):
         if marker(kind, b) not in body:
             ins.extend(item(kind, b)); added += 1
     lines[i + 1:i + 1] = ins
+# sandbox.workbench: the whole block, as the template renders it, when the
+# sandbox block has none. Placed right after `runnerImage:` (or after the key
+# line) so it reads like a fresh render; two-space children of `sandbox:`.
+si, sj = region("sandbox")
+if si is not None and app_version and not any(re.match(r"^  workbench:", l) for l in lines[si:sj]):
+    at = si + 1
+    for k in range(si + 1, sj):
+        if re.match(r"^  runnerImage:", lines[k]):
+            at = k + 1
+    lines[at:at] = [
+        "  workbench:",
+        "    enabled: true",
+        "    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:" + app_version,
+        "    pullPolicy: IfNotPresent",
+        "    storageClass: local-path",
+        "    resourceQuota:",
+        '      pods: "10"',
+        '      requestsCpu: "4"',
+        '      requestsMemory: "4Gi"',
+        '      limitsCpu: "20"',
+        '      limitsMemory: "40Gi"',
+        '      persistentVolumeClaims: "30"',
+        '      requestsStorage: "300Gi"',
+    ]
+    added += 1
 ci, cj = region("config")
 if ci is not None:
     if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):
