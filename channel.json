@@ -1,7 +1,7 @@
 {
   "channel": "stable",
   "chart_version": "0.10.0",
-  "app_version": "1.11.8",
+  "app_version": "1.11.9",
   "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "295603829bdc7780b1d85d9bdef988fcfde18975320db1270cc2a652487e30f0",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
@@ -9,5 +9,5 @@
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Same app 1.11.8 and chart 0.10.0. update.sh now also converges values.yaml on an up-to-date box and rolls the release when it added something, and it adds the sandbox.workbench block whole on a box installed before the workbench existed (2026-08-05): enabled, runner pinned on the app version, pullPolicy IfNotPresent, the template quota. A block already present is never edited. On such a box run the apply twice from the box: the first installs this updater, the second converges the file."
+  "notes": "app 1.11.8 -> 1.11.9, same application code: a version bump so that every appliance receives the new update.sh at the end of this apply. That updater then offers, on the next check, what it can converge on its own: the host layer (model switch, transcription) and a values.yaml behind the template \u2014 the app <-> host bridges and the sandbox.workbench block, added whole on a box installed before the workbench existed, runner pinned on the app version, never edited when present. Gemma stays on its pinned cu130-nightly while the base image is v0.29.0."
 }
