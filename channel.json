@@ -1,7 +1,7 @@
 {
   "channel": "stable",
-  "chart_version": "0.10.1",
-  "app_version": "1.11.9",
+  "chart_version": "0.10.2",
+  "app_version": "1.11.10",
   "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "59abc793d1b9d2dea507814e4259f717ed1849dedce8a22b38245834d4a694f5",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
@@ -9,5 +9,5 @@
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "chart 0.10.0 -> 0.10.1, app 1.11.9 and vLLM image unchanged. The chart renders the sandbox-api integers through int64: Helm 3.21.1 wrote 1800000 as 1.8e+06 and sandbox-api read it as 1 ms, so every sandbox session and workbench was stopped a minute after creation on such a box. values.yaml already carries the two idle limits as quoted strings; the chart now renders them in full whatever their form."
+  "notes": "app 1.11.9 -> 1.11.10, chart 0.10.1 -> 0.10.2, vLLM image v0.29.0 unchanged. App: sandbox-api reads its numeric environment with Number, so a value a chart renders as 7.2e+06 is 7200000 and not 7. Chart: checksum annotations on the sandbox-api pod, so a ConfigMap or Secret change restarts it. Deploy: the updater now refreshes itself at the START of a check or an apply and re-executes, so what a check offers is what the apply does \u2014 one click, never two; the host layer, a values.yaml behind the template (bridges, workbench block, quoted idle limits) and the vLLM stack all converge through the same update. Gemma stays on its pinned cu130-nightly while the base image is v0.29.0."
 }
