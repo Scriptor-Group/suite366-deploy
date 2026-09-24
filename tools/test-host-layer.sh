@@ -351,5 +351,41 @@ NSBOX="$WORK/ns"; mkdir -p "$NSBOX"; printf 'other:\n  namespace: wrong\nsandbox
 ns="$(DATA_DIR="$NSBOX" bash -c 'eval "$(sed -n "/^restart_sandbox_api() {/,/^}/p" "$1")"; awk "/^sandbox:/{f=1;next} f&&/^[a-z]/{f=0} f&&/^  namespace:/{print \$2; exit}" "$DATA_DIR/values.yaml"' _ "$REPO_ROOT/update.sh")"
 check    "lit le namespace sous sandbox: (pas le premier venu)" "$ns" "sbx"
 
+# --- 6. l'updater se rafraîchit EN PREMIER ----------------------------------------
+head_ "update.sh self_update_first"
+contains "check : rafraîchissement avant survey"  "$(awk '/^  check\)/,/;;/' "$REPO_ROOT/update.sh" | tr -s ' \n' ' ')" "fetch_manifest_online || true load_offline_source self_update_first survey"
+contains "apply : rafraîchissement avant survey"  "$(awk '/^  apply\)/,/;;/' "$REPO_ROOT/update.sh" | tr -s ' \n' ' ')" "fetch_manifest_online || true load_offline_source self_update_first survey"
+RX="$WORK/reexec"; mkdir -p "$RX"; printf '#!/bin/bash\necho OLD\n' > "$RX/update.sh"; chmod +x "$RX/update.sh"
+out="$(bash -c '
+  set -uo pipefail
+  info() { :; }
+  DATA_DIR="$1"; SELF_UPDATE=1; online_reachable=1; ORIG_ARGS=(check --flag)
+  self_update() { printf "#!/bin/bash\necho NEW-UPDATER args=[\$*] reexec=\${SUITE366_UPDATER_REEXEC:-0}\n" > "$DATA_DIR/update.sh"; chmod +x "$DATA_DIR/update.sh"; }
+  eval "$(sed -n "/^self_update_first() {/,/^}/p" "$2")"
+  self_update_first
+  echo "NOT-REEXECED"
+' _ "$RX" "$REPO_ROOT/update.sh" 2>&1)"
+contains "un updater plus récent est relancé avec les mêmes arguments" "$out" "NEW-UPDATER args=[check --flag] reexec=1"
+absent   "…et l'ancien ne continue pas"                               "$out" "NOT-REEXECED"
+out="$(bash -c '
+  set -uo pipefail
+  info() { :; }
+  DATA_DIR="$1"; SELF_UPDATE=1; online_reachable=1; ORIG_ARGS=(check)
+  self_update() { :; }
+  eval "$(sed -n "/^self_update_first() {/,/^}/p" "$2")"
+  self_update_first; echo "CONTINUES"
+' _ "$RX" "$REPO_ROOT/update.sh" 2>&1)"
+contains "updater déjà à jour : on continue sans relance" "$out" "CONTINUES"
+out="$(SUITE366_UPDATER_REEXEC=1 bash -c '
+  set -uo pipefail
+  info() { :; }
+  DATA_DIR="$1"; SELF_UPDATE=1; online_reachable=1; ORIG_ARGS=(check)
+  self_update() { printf "#!/bin/bash\necho LOOP\n" > "$DATA_DIR/update.sh"; }
+  eval "$(sed -n "/^self_update_first() {/,/^}/p" "$2")"
+  self_update_first; echo "GUARDED"
+' _ "$RX" "$REPO_ROOT/update.sh" 2>&1)"
+contains "le marqueur d'environnement coupe toute boucle" "$out" "GUARDED"
+absent   "…pas de seconde relance"                        "$out" "LOOP"
+
 printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
