@@ -9,5 +9,5 @@
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Same app 1.11.9 and chart 0.10.0. update.sh restarts sandbox-api after a values.yaml convergence rolled the release: it reads its configuration at start and the chart has no checksum on its pod, so the workbench turned on in the ConfigMap stayed invisible to it until a restart."
+  "notes": "Same app 1.11.9 and chart 0.10.0. The two idle limits of the sandbox and the workbench are now carried as quoted strings in values.yaml and added on update where absent: Helm 3.21.1 rendered a plain 1800000 as 1.8e+06 and sandbox-api read it as 1 ms, so every sandbox session and workbench was stopped a minute after creation on such a box."
 }
