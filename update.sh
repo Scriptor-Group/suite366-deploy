@@ -880,6 +880,8 @@ if si is not None and app_version and not any(re.match(r"^  workbench:", l) for 
         "    runnerImage: ghcr.io/scriptor-group/suite-366-workbench-runner:" + app_version,
         "    pullPolicy: IfNotPresent",
         "    storageClass: local-path",
+        "    limits:",
+        '      idleStopMs: "7200000"',
         "    resourceQuota:",
         '      pods: "10"',
         '      requestsCpu: "4"',
@@ -890,6 +892,38 @@ if si is not None and app_version and not any(re.match(r"^  workbench:", l) for 
         '      requestsStorage: "300Gi"',
     ]
     added += 1
+# The two idle limits, QUOTED: Helm 3.21.1 renders a plain 1800000 as "1.8e+06"
+# and sandbox-api's parseInt makes 1 ms of it -- every session and workbench
+# then dies at the reaper's first pass. A string renders verbatim on every
+# Helm. Added under sandbox.limits and sandbox.workbench.limits when absent,
+# never edited when present (an operator may have tuned them).
+def sub_block(start, end, indent):
+    # Lines after `start` that belong to the mapping opened there (deeper than `indent`).
+    j = start + 1
+    while j < end and (lines[j] == "" or lines[j].startswith(" " * (indent + 1)) or lines[j].lstrip().startswith("#")):
+        j += 1
+    return j
+def ensure_quoted_limit(parent_start, parent_end, indent, key, value):
+    # Within a mapping (children at `indent`), make sure `limits:` holds key: "value". 1 when added.
+    global lines
+    pad = " " * indent
+    for k in range(parent_start + 1, parent_end):
+        if re.match(r"^" + pad + r"limits:\s*$", lines[k]):
+            lend = sub_block(k, parent_end, indent)
+            if any(re.match(r"^" + pad + r"  " + re.escape(key) + r":", l) for l in lines[k:lend]):
+                return 0
+            lines[k + 1:k + 1] = [pad + "  " + key + ': "' + value + '"']
+            return 1
+    lines[parent_start + 1:parent_start + 1] = [pad + "limits:", pad + "  " + key + ': "' + value + '"']
+    return 1
+si, sj = region("sandbox")
+if si is not None:
+    added += ensure_quoted_limit(si, sj, 2, "idleTimeoutMs", "1800000")
+    si, sj = region("sandbox")
+    for k in range(si + 1, sj):
+        if re.match(r"^  workbench:\s*$", lines[k]):
+            added += ensure_quoted_limit(k, sub_block(k, sj, 2), 4, "idleStopMs", "7200000")
+            break
 ci, cj = region("config")
 if ci is not None:
     if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):

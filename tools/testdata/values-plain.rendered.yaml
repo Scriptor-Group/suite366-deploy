@@ -316,6 +316,15 @@ sandbox:
   runnerImage: ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.9
   # Tune sessions/limits if the GB10 unified memory budget is tight — defaults
   # aim at 20 pods × 512 MB.
+  #
+  # idleTimeoutMs is QUOTED on purpose. Helm 3.21.1 renders a plain 1800000 as
+  # "1.8e+06" (a float64 through %v), 3.21.3 does not, and sandbox-api parses
+  # its environment with parseInt — which makes 1 ms out of "1.8e+06". Seen on
+  # a client Spark: every sandbox session and every workbench stopped at the
+  # reaper's first pass, 60 s after creation ("Stopping idle workbench, idleMs
+  # 28769"). A string renders verbatim on every Helm.
+  limits:
+    idleTimeoutMs: "1800000"
 
   # Workbench — per-user persistent dev sandbox (terminal + opencode + Firefox
   # desktop, cf. suite-366/documentation/34-workbench.md). One pod + one PVC
@@ -334,6 +343,9 @@ sandbox:
     # IfNotPresent : redémarrage offline (l'image est pré-pullée par install.sh)
     pullPolicy: IfNotPresent
     storageClass: local-path
+    # Quoted for the same reason as sandbox.limits.idleTimeoutMs above.
+    limits:
+      idleStopMs: "7200000"
     resourceQuota:
       # Un seul GB10 : borné plus bas que les défauts du chart.
       pods: "10"

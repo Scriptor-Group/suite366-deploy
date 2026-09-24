@@ -214,10 +214,14 @@ contains "juillet : bloc workbench ajouté"           "$V" "  workbench:"
 contains "juillet : workbench activé"                "$V" "    enabled: true"
 contains "juillet : runner épinglé sur l'app"        "$V" "suite-366-workbench-runner:1.11.8"
 contains "juillet : quota du gabarit"                "$V" 'requestsStorage: "300Gi"'
+# Les deux délais d'inactivité, CITÉS : Helm 3.21.1 rend 1800000 en "1.8e+06" et parseInt en fait 1 ms.
+contains "juillet : sandbox.limits.idleTimeoutMs cité"      "$V" '    idleTimeoutMs: "1800000"'
+contains "juillet : workbench.limits.idleStopMs cité"       "$V" '      idleStopMs: "7200000"'
+check    "juillet : un seul bloc limits sous sandbox"       "$(grep -c '^  limits:' "$JULY/values.yaml")" "1"
 check "juillet : le bloc suit runnerImage, sous sandbox" "$(grep -A1 'suite-366-sandbox-runner' "$JULY/values.yaml" | tail -1)" "  workbench:"
 absent "juillet : l'ingress qui suit n'a pas bougé de place" "$(sed -n '/^ingress:/,$p' "$JULY/values.yaml")" "workbench"
 if python3 -c "import yaml" 2>/dev/null; then
-  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5; assert d['sandbox']['workbench']['enabled'] is True and d['sandbox']['workbench']['resourceQuota']['pods']=='10' and d['sandbox']['enabled'] is True" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox"; else ko "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox"; fi
+  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5; assert d['sandbox']['workbench']['enabled'] is True and d['sandbox']['workbench']['resourceQuota']['pods']=='10' and d['sandbox']['enabled'] is True; assert d['sandbox']['limits']['idleTimeoutMs']=='1800000' and d['sandbox']['workbench']['limits']['idleStopMs']=='7200000'" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes"; else ko "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes"; fi
 else
   ok "juillet : (PyYAML absent — validation structurelle sautée)"
 fi
@@ -266,6 +270,26 @@ vals_run "$OFF"
 check "workbench éteint par l'admin : un seul bloc"  "$(grep -c '^  workbench:' "$OFF/values.yaml")" "1"
 contains "workbench éteint par l'admin : reste éteint" "$(cat "$OFF/values.yaml")" "    enabled: false"
 absent   "workbench éteint par l'admin : pas de quota injecté" "$(cat "$OFF/values.yaml")" "resourceQuota"
+
+# Un admin qui a déjà réglé les délais garde ses valeurs, même non citées.
+TUNED="$WORK/tuned"; mkdir -p "$TUNED/llm"; cp "$BOX/llm/.env" "$TUNED/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$TUNED/llm/profiles.sh"
+cat > "$TUNED/values.yaml" <<'Y'
+config:
+  VLLM_MODEL_EMBEDDING: "e"
+  VLLM_MODEL_TRANSCRIPTION: ""
+sandbox:
+  enabled: true
+  limits:
+    idleTimeoutMs: 900000
+  workbench:
+    enabled: true
+    limits:
+      idleStopMs: 3600000
+Y
+vals_run "$TUNED"
+check "délais réglés : idleTimeoutMs conservé" "$(grep -c 'idleTimeoutMs: 900000' "$TUNED/values.yaml")" "1"
+check "délais réglés : idleStopMs conservé"    "$(grep -c 'idleStopMs: 3600000' "$TUNED/values.yaml")" "1"
+check "délais réglés : pas de doublon"          "$(grep -c 'idleStopMs' "$TUNED/values.yaml")" "1"
 
 CUR="$WORK/current"; mkdir -p "$CUR/llm"; cp "$BOX2/llm/.env" "$CUR/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$CUR/llm/profiles.sh"
 sed "s#@DATA_DIR@#$CUR#g" "$REPO_ROOT/tools/testdata/values-plain.rendered.yaml" > "$CUR/values.yaml"
