@@ -196,6 +196,7 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   "checked_at": "$(now_utc)",
   "update_available": $avail,
   "summary": "$(json_esc "${summary_line:-}")",
+  "values_behind": $( [[ "${values_diff:-0}" == 1 ]] && printf true || printf false ),
   "notes": "$(json_esc "${notes:-}")",
   "source": "$(json_esc "${UPDATE_SOURCE:-none}")",
   "current": {
@@ -470,7 +471,7 @@ resolve_target() {
 }
 
 compute_diffs() {
-  chart_diff=0; vllm_diff=0; app_diff=0; host_diff=0; summary_line=""
+  chart_diff=0; vllm_diff=0; app_diff=0; host_diff=0; values_diff=0; summary_line=""
   if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
     warn "No usable update source (network unreachable, no verified offline package)."
     return 0
@@ -506,6 +507,12 @@ compute_diffs() {
   # the only signal, and a channel that pins one this box does not carry — or a
   # box that carries none — is an update. Only where the vLLM stack runs.
   if [[ "${host_applicable:-0}" == 1 && -n "${want_host:-}" && "${cur_host:-}" != "${want_host:-}" ]]; then host_diff=1; fi
+  # values.yaml lagging the template (a bridge, the workbench block) is an
+  # update too: it is what `apply` converges, and without this line an
+  # up-to-date box could only get it from a root shell. Guarded so the diffs
+  # self-test, which extracts this function alone, is unaffected.
+  if declare -F ensure_appliance_values >/dev/null && ensure_appliance_values --check; then values_diff=1; fi
+  if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench) — converged on apply"; fi
 
   # A channel BEHIND the box is not an update, but it is worth saying out loud:
   # it usually means the channel has not been rolled since this box was built,
@@ -527,6 +534,7 @@ compute_diffs() {
   [[ "$app_diff"   == 1 ]] && parts+=("app ${cur_app:-?} -> $want_app")
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
   [[ "$host_diff"  == 1 ]] && parts+=("host layer (model switch, transcription) -> ${want_host:0:12}")
+  [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench)")
   [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
 }
@@ -540,7 +548,7 @@ survey() {
   compute_diffs
 }
 
-up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 && "${host_diff:-0}" == 0 ]]; }
+up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 && "${host_diff:-0}" == 0 && "${values_diff:-0}" == 0 ]]; }
 
 # --- Offline package: verification + staging -----------------------------------
 # Layout produced by tools/build-offline-package.sh:
@@ -791,19 +799,25 @@ detect_stt_model() { # -> the transcription model the box's profile serves, or e
 }
 
 extra_vals=()
-ensure_appliance_values() {
-  local vals="$DATA_DIR/values.yaml" out stt d
+# `--check`: report what WOULD be added and write nothing — what `check` uses
+# to offer the convergence as an update, so an up-to-date box gets the Apply
+# button in the UI instead of a root shell.
+ensure_appliance_values() { # ensure_appliance_values [--check] -> 0 changed/would change, 1 nothing
+  local vals="$DATA_DIR/values.yaml" out stt d check=0
+  [[ "${1:-}" == "--check" ]] && check=1
+  [[ -f "$vals" ]] || return 1
   if ! have python3; then
-    warn "python3 missing — values.yaml bridges NOT converged (the model page stays hidden)."
+    [[ "$check" == 1 ]] || warn "python3 missing — values.yaml bridges NOT converged (the model page stays hidden)."
     return 1
   fi
   stt="$(detect_stt_model)"
-  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" python3 - "$vals" <<'PY'
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" CHECK_ONLY="$check" python3 - "$vals" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 data_dir = os.environ["DATA_DIR"]
 stt = os.environ.get("STT_MODEL", "")
 app_version = os.environ.get("APP_VERSION", "")
+check_only = os.environ.get("CHECK_ONLY", "0") == "1"
 text = open(path, encoding="utf-8").read()
 lines = text.split("\n")
 if lines and lines[-1] == "":
@@ -887,12 +901,16 @@ if ci is not None:
         added += 1
 new = "\n".join(lines) + "\n"
 if new != text:
-    open(path, "w", encoding="utf-8").write(new)
+    if not check_only:
+        open(path, "w", encoding="utf-8").write(new)
     print("changed: %d entr%s added" % (added, "y" if added == 1 else "ies"))
 else:
     print("unchanged")
 PY
-)" || { warn "could not converge values.yaml: $out"; return 1; }
+)" || { [[ "$check" == 1 ]] || warn "could not converge values.yaml: $out"; return 1; }
+  if [[ "$check" == 1 ]]; then
+    case "$out" in changed*) return 0 ;; *) return 1 ;; esac
+  fi
   # The host dirs behind the bridges, owned like install.sh makes them (the pod
   # is uid/gid 1001 and k8s does not fsGroup-chown a hostPath).
   for d in updates support backup remote llm-state; do
@@ -1140,7 +1158,7 @@ do_apply() {
   [[ "$vllm_diff" == 1 ]] && cur_vllm="$want_vllm"
   # host_diff stays 1 when the layer could not be laid down or converged: the
   # state the app reads keeps offering it, and the next apply retries.
-  chart_diff=0; vllm_diff=0; app_diff=0; summary_line=""
+  chart_diff=0; vllm_diff=0; app_diff=0; values_diff=0; summary_line=""
 
   # Fleet convergence: make sure the app-trigger units exist / are current, and
   # refresh this script for the next run. Ordered BEFORE write_state_json so the
