@@ -68,6 +68,9 @@
 set -euo pipefail
 
 MODE="${1:-check}"
+# Kept for the re-exec in self_update_first: the refreshed updater is started
+# with the very same arguments.
+ORIG_ARGS=("$@")
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"
 # Pull in the install-time config if present (manual runs); the systemd units
@@ -1282,6 +1285,36 @@ self_update_from_package() {
   fi
 }
 
+# --- the updater refreshes itself FIRST ----------------------------------------
+# For a long time update.sh replaced itself at the END of an apply. So the code
+# that ran an apply was always the previous updater, and whatever the new one
+# knew to converge (the host layer, values.yaml, the workbench block) surfaced
+# one check later: every host-side feature took two applies, the first of
+# them offering nothing in the UI. Seen three times in one day on the fleet.
+#
+# Now `check` and `apply` begin by refreshing the script — same trust ladder
+# as ever: with the key installed, a signed manifest and a matching hash, or
+# nothing — and, when a newer one was installed, re-execute it with the same
+# arguments. The new updater sees itself equal to the channel and does not
+# re-exec again; the environment marker is a second guard against a loop.
+# Offline, the staged package's own update.sh plays the same role.
+self_update_first() {
+  [[ "${SUITE366_UPDATER_REEXEC:-0}" == 1 ]] && return 0
+  [[ "$SELF_UPDATE" == "1" ]] || return 0
+  local me="$DATA_DIR/update.sh" before after
+  [[ -f "$me" ]] || return 0
+  before="$(sha256sum "$me" | awk '{print $1}')"
+  if [[ "${online_reachable:-0}" == 1 ]]; then
+    self_update
+  elif [[ "${usb_status:-none}" == "ready" ]]; then
+    self_update_from_package
+  fi
+  after="$(sha256sum "$me" | awk '{print $1}')"
+  [[ "$after" != "$before" ]] || return 0
+  info "update.sh refreshed — continuing with the new one."
+  SUITE366_UPDATER_REEXEC=1 exec "$me" "${ORIG_ARGS[@]}"
+}
+
 # --- install-units -------------------------------------------------------------
 # systemd .path units watching the trigger files the app drops in
 # $UPDATES_DIR. Written inline (not fetched) so $DATA_DIR paths are baked in,
@@ -1908,6 +1941,9 @@ require_cluster_tools() {
 case "$MODE" in
   check)
     require_cluster_tools
+    fetch_manifest_online || true
+    load_offline_source
+    self_update_first
     survey
     notify
     # Convergence belongs here, not only in `apply`. `apply` runs when there is
@@ -1924,6 +1960,9 @@ case "$MODE" in
     ;;
   apply)
     require_cluster_tools
+    fetch_manifest_online || true
+    load_offline_source
+    self_update_first
     survey
     do_apply
     ;;
