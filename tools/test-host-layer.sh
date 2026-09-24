@@ -163,8 +163,8 @@ vals_run() { # vals_run BOX -> rc ; output in $VOUT
     have() { command -v "$1" >/dev/null 2>&1; }
     DATA_DIR="$1"; APP_GID=1001; cur_app=1.11.8; want_app=""
     for f in detect_stt_model ensure_appliance_values; do eval "$(sed -n "/^$f() {/,/^}/p" "$2")"; done
-    ensure_appliance_values
-  ' _ "$1" "$REPO_ROOT/update.sh" 2>&1)"
+    ensure_appliance_values ${3:-}
+  ' _ "$1" "$REPO_ROOT/update.sh" "${2:-}" 2>&1)"
 }
 JULY="$WORK/july"; mkdir -p "$JULY/llm"
 cat > "$JULY/values.yaml" <<'Y'
@@ -190,6 +190,11 @@ ingress:
   enabled: true
 Y
 cp "$BOX/llm/.env" "$JULY/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$JULY/llm/profiles.sh"
+# --check d'abord : dit qu'il y a à faire, n'écrit RIEN — c'est ce que `check` publie comme mise à jour.
+j0="$(cat "$JULY/values.yaml")"; vals_run "$JULY" --check; rc=$?
+check "juillet --check : annonce un changement (rc 0)" "$rc" "0"
+check "juillet --check : n'écrit rien"                 "$(cat "$JULY/values.yaml")" "$j0"
+if [[ -d "$JULY/llm-state" ]]; then ko "juillet --check : ne crée pas les répertoires"; else ok "juillet --check : ne crée pas les répertoires"; fi
 vals_run "$JULY"; rc=$?
 check "juillet : signale un changement (rc 0)" "$rc" "0"
 V="$(cat "$JULY/values.yaml")"
@@ -266,6 +271,7 @@ CUR="$WORK/current"; mkdir -p "$CUR/llm"; cp "$BOX2/llm/.env" "$CUR/llm/.env"; c
 sed "s#@DATA_DIR@#$CUR#g" "$REPO_ROOT/tools/testdata/values-plain.rendered.yaml" > "$CUR/values.yaml"
 c0="$(cat "$CUR/values.yaml")"; vals_run "$CUR"; rc=$?
 check "un values.yaml courant : rien à faire (rc 1)" "$rc" "1"
+vals_run "$CUR" --check; check "un values.yaml courant --check : rien à annoncer (rc 1)" "$?" "1"
 check "un values.yaml courant : intact"              "$(cat "$CUR/values.yaml")" "$c0"
 
 # --- 4. la décision « mise à jour disponible » -------------------------------------------
@@ -290,6 +296,26 @@ contains "…et la box est à jour"    "$out" "up-to-date"
 out="$(diffs 1 old000000000 abc123def456)"; check "stamp différent : mise à jour" "${out%% *}" "1"
 out="$(diffs 0 "" abc123def456)";  check "box SKIP_VLLM : jamais concernée" "${out%% *}" "0"
 out="$(diffs 1 "" "")";            check "canal sans host_layer_sha256 : rien à proposer" "${out%% *}" "0"
+# La dérive de values.yaml est une mise à jour à part entière : bouton Appliquer dans l'UI.
+vdiff() { # vdiff RC — the stubbed `ensure_appliance_values --check` returns RC: 0 = would change, 1 = nothing
+  bash -c '
+    set -uo pipefail
+    info() { :; }; warn() { :; }
+    UPDATE_SOURCE=online; channel=stable
+    cur_chart=0.10.0; want_chart=0.10.0; cur_app=1.11.8; want_app=1.11.8; cur_vllm=img; want_vllm=img
+    host_applicable=1; cur_host=a; want_host=a
+    ensure_appliance_values() { [[ "$1" == "--check" ]] && return '"$1"'; return 1; }
+    for f in ver_gt compute_diffs up_to_date; do eval "$(sed -n "/^$f() {/,/^}/p" "$2")"; done
+    compute_diffs >/dev/null 2>&1
+    if up_to_date; then u=up-to-date; else u=update; fi
+    printf "%s %s %s
+" "$values_diff" "$u" "${summary_line:-<none>}"
+  ' _ "$1" "$REPO_ROOT/update.sh" 2>&1
+}
+out="$(vdiff 1)"; check "values.yaml à jour : pas une mise à jour"  "${out%% *}" "0"
+contains "…et la box est à jour" "$out" "up-to-date"
+out="$(vdiff 0)"; check "values.yaml en retard : mise à jour"      "${out%% *}" "1"
+contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench)"
 
 printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
