@@ -1030,6 +1030,25 @@ roll_release() { # roll_release CHART_VERSION
     || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
 }
 
+# sandbox-api reads its configuration through `envFrom` on configmap-sandbox-api
+# at start, and the chart puts no checksum on its pod template: a converged
+# values.yaml that turned the workbench on rewrites the ConfigMap and nothing
+# restarts the pod. Seen on the client Spark: workbench tab present, "service
+# unreachable", sandbox-api still on its pre-workbench environment. Two seconds
+# to restart; done whenever values.yaml was converged and rolled.
+restart_sandbox_api() {
+  local ns
+  ns="$(awk '/^sandbox:/{f=1;next} f&&/^[a-z]/{f=0} f&&/^  namespace:/{print $2; exit}' "$DATA_DIR/values.yaml" 2>/dev/null | tr -d '"')"
+  [[ -n "$ns" ]] || return 0
+  kc -n "$ns" get deploy sandbox-api >/dev/null 2>&1 || return 0
+  if kc -n "$ns" rollout restart deploy/sandbox-api >/dev/null 2>&1 \
+     && kc -n "$ns" rollout status deploy/sandbox-api --timeout=120s >/dev/null 2>&1; then
+    info "sandbox-api restarted on the converged configuration (workbench)."
+  else
+    warn "sandbox-api did not come back after the restart — check: sudo k3s kubectl -n $ns get pods"
+  fi
+}
+
 apply_exit_trap() {
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -1061,6 +1080,7 @@ do_apply() {
       roll_release "$cur_chart"
       kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
         || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
+      restart_sandbox_api
     fi
     write_state_json 0
     write_apply_json idle "already up to date (chart ${cur_chart:-?}, app ${cur_app:-?})"
@@ -1126,11 +1146,13 @@ do_apply() {
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 || "$values_changed" == 1 ]]; then
     log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml converged')"
     roll_release "$target_chart"
+    # After the health check below; the flag is read there.
   fi
 
   log "Health check"
   kc -n "$NAMESPACE" wait --for=condition=Available deploy --all --timeout=180s \
     || warn "Not all deployments became Available — check: sudo k3s kubectl -n $NAMESPACE get pods"
+  if [[ "$values_changed" == 1 ]]; then restart_sandbox_api; fi
 
   # The vLLM stack, one pass: the new host layer and/or the new base image.
   if [[ "$host_staged" == 1 || "$vllm_moved" == 1 ]]; then
