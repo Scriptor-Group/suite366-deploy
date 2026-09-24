@@ -133,7 +133,7 @@ CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 # 0.10.0 : onlyoffice/livekit ingress `extraHosts` (un 2e nom + son propre
 #          Secret TLS sur le meme Ingress), requis par HOST_MODE=proxy qui
 #          garde les noms du LAN a cote des noms publics.
-CHART_VERSION="${CHART_VERSION:-0.10.0}"
+CHART_VERSION="${CHART_VERSION:-0.10.1}"
 # Channel manifest polled daily by the update timer (see setup_update_timer).
 # Publishing a new chart_version/vllm_image here rolls the fleet forward;
 # appliances NOTIFY only (no auto-apply). Override to pin a box to a private
