@@ -317,5 +317,15 @@ contains "…et la box est à jour" "$out" "up-to-date"
 out="$(vdiff 0)"; check "values.yaml en retard : mise à jour"      "${out%% *}" "1"
 contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench)"
 
+# --- 5. sandbox-api suit la ConfigMap convergée ------------------------------------------
+head_ "update.sh restart_sandbox_api"
+U="$(cat "$REPO_ROOT/update.sh")"
+contains "la fonction existe"                         "$U" "restart_sandbox_api() {"
+check    "appelée après CHAQUE roll de values.yaml"   "$(grep -c '^\s*if \[\[ "\$values_changed" == 1 \]\]; then restart_sandbox_api; fi\|^\s*restart_sandbox_api$' "$REPO_ROOT/update.sh")" "2"
+# Le namespace vient du bloc sandbox de values.yaml, pas d'un autre `namespace:`.
+NSBOX="$WORK/ns"; mkdir -p "$NSBOX"; printf 'other:\n  namespace: wrong\nsandbox:\n  enabled: true\n  namespace: sbx\n' > "$NSBOX/values.yaml"
+ns="$(DATA_DIR="$NSBOX" bash -c 'eval "$(sed -n "/^restart_sandbox_api() {/,/^}/p" "$1")"; awk "/^sandbox:/{f=1;next} f&&/^[a-z]/{f=0} f&&/^  namespace:/{print \$2; exit}" "$DATA_DIR/values.yaml"' _ "$REPO_ROOT/update.sh")"
+check    "lit le namespace sous sandbox: (pas le premier venu)" "$ns" "sbx"
+
 printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
