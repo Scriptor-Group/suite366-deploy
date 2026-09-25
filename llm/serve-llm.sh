@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Entrypoint of the vllm-llm container. ONE script for the three generative
+# Entrypoint of the vllm-llm container. ONE script for the four generative
 # profiles, because the compose must not change when the operator switches
 # model: everything profile-specific lives here and in llm/profiles.sh.
 #
@@ -8,13 +8,14 @@
 #   this file        (container) the vLLM flags and env each model needs
 #
 # Every flag below was measured on the test Spark; the reasoning is in
-# docker-compose.yml and the README. Do not "harmonise" the three lists: they
-# are three validated recipes, not one recipe with variables.
+# docker-compose.yml and the README. Do not "harmonise" the four lists: they
+# are four validated recipes, not one recipe with variables.
 set -euo pipefail
 : "${LLM_PROFILE:?}" "${LLM_MODEL:?}" "${LLM_MAX_MODEL_LEN:?}" "${LLM_MAX_NUM_SEQS:?}" "${LLM_GPU_MEM_UTIL:?}"
 
-# Shared by the three: bind, budgets, and the fact that the app never sends
-# video (not reserving encoder budget for it).
+# Shared by the four: bind, budgets, and the fact that the app never sends
+# video (not reserving encoder budget for it). The video limit is a no-op on a
+# text-only model (orcasaq), vLLM ignores it there.
 common=(
   --host 0.0.0.0 --port 8000
   --served-model-name "$LLM_MODEL"
@@ -38,6 +39,25 @@ case "$LLM_PROFILE" in
       --max-num-batched-tokens 8192 \
       --async-scheduling \
       --load-format fastsafetensors \
+      --reasoning-parser qwen3 \
+      --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+      --default-chat-template-kwargs '{"enable_thinking": false}' \
+      --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${LLM_MTP_TOKENS:-3}}"
+    ;;
+
+  # --- OrcaSAQ-2-27B — Qwen3.8-27B in a 3.2-bit EXL3 trellis ------------------
+  orcasaq)
+    # The same recipe as qwen27b, minus what the format changes. No
+    # --quantization: config.json says `exl3` and the orcasaq2 plugin baked into
+    # the image (llm/exl3/) registers that method when vLLM loads its plugins.
+    # No --load-format fastsafetensors: the plugin captures each shard through
+    # vLLM's default loader, and 12 GB load in 56 s that way — not worth
+    # validating a second loader. Text-only checkpoint: no vision tower to
+    # budget for.
+    exec vllm serve "$LLM_MODEL" "${common[@]}" \
+      --kv-cache-dtype fp8 \
+      --max-num-batched-tokens 8192 \
+      --async-scheduling \
       --reasoning-parser qwen3 \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml \
       --default-chat-template-kwargs '{"enable_thinking": false}' \

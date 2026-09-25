@@ -100,10 +100,10 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
-| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `flash-next` or `gemma` (cf. § Choosing a model) |
+| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
-| `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next is built on it (the `gemma` profile pins its own) |
+| `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next and OrcaSAQ are built on it (the `gemma` profile pins its own) |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
 | `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
 | `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
@@ -312,29 +312,52 @@ plumbing, not the AI path.
 
 ## Choosing a model
 
-The appliance serves ONE generative model at a time, out of three that were each
+The appliance serves ONE generative model at a time, out of four that were each
 measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
 `switch-model.sh` changes it afterwards without a reinstall.
 
-| | `qwen27b` *(default)* | `flash-next` | `gemma` |
-|---|---|---|---|
-| Model | Qwen3.8-27B-NVFP4 | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
-| Shape | dense 27B hybrid | MoE 176B, 6B active | MoE 26B, 4B active |
-| On disk | 21.9 GB | 123.5 GB | 18 GB |
-| Resident | 20.8 GiB | 77.1 GiB | 18.0 GiB |
-| Context served | 262,144 | 131,072 | 262,144 |
-| Decode, French prose | 19-20 t/s | 26.7 t/s | 28-30 t/s |
-| Decode, code | ~30 t/s | 34.9 t/s | not measured |
-| Prefill 69k tokens | 49 s | 33 s | 65 s at 62k |
-| Swap in use, idle | 0 | 7-10 GiB | 10 GiB |
-| vLLM | official v0.29.0 | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
-| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | none (no room) | none (not measured yet) |
+| | `qwen27b` *(default)* | `orcasaq` | `flash-next` | `gemma` |
+|---|---|---|---|---|
+| Model | Qwen3.8-27B-NVFP4 | OrcaSAQ-2-27B | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
+| Shape | dense 27B hybrid | the same 27B, 3.2-bit trellis | MoE 176B, 6B active | MoE 26B, 4B active |
+| On disk | 21.9 GB | 12.3 GB | 123.5 GB | 18 GB |
+| Resident | 20.8 GiB | 11.5 GiB | 77.1 GiB | 18.0 GiB |
+| Context served | 262,144 | 262,144 | 131,072 | 262,144 |
+| Decode, French prose | 19-20 t/s | 38.1 t/s | 26.7 t/s | 28-30 t/s |
+| Decode, code | ~30 t/s | 45.0 t/s | 34.9 t/s | not measured |
+| Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 69k in 33 s | 62k in 65 s |
+| Swap in use, idle | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
+| vLLM | official v0.29.0 | v0.29.0 + `llm/exl3/` | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
+| Vision | yes | no (text-only checkpoint) | yes | yes |
+| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
 
-**`qwen27b` is the default** because it is the only one that leaves the box real
-headroom: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a full
-262k request) and zero swap at idle. It is also the slowest of the three to
+**`qwen27b` is the default** because it leaves the box real headroom without
+building anything: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a
+full 262k request) and zero swap at idle. It is also the slowest of the four to
 decode, which is physics: 20.8 GiB over the GB10's 273 GB/s is 12 t/s, and the
 in-checkpoint MTP head recovers it to 19-20.
+
+**`orcasaq` is the same Qwen3.8-27B at 3.2 bits per weight.** `orcarouter`
+quantised it with a sensitivity-searched mixed-precision trellis code (the EXL3 /
+QTIP family: 3.21 bits on the decoder, 6-bit `lm_head`, int8 embedding, 4-bit
+MTP head) and reports it within 0.02 % of BF16 perplexity on WikiText-2. vLLM
+cannot read the format by itself, so the profile builds its own image on the box
+(`llm/exl3/`: exllamav3's kernels compiled for sm_121 plus the plugin that
+registers the format, ~4 min) and the checkpoint is text-only — the app's vision
+role points at it too, and images simply are not understood. Measured on the
+test Spark on 2026-09-25: 11.5 GiB resident, loaded in 56 s and serving 110 s
+after the container start with the compile cache warm; at the same 0.45 share as
+`qwen27b` the KV cache seats 771,787 fp8 tokens (2.9x a full 262k request), and
+with the embed and the transcription engine up the box sits at 97/121 GiB, like
+`qwen27b`. Decode is the point: 38 t/s on French prose and 45 on code against
+19-20 and ~30 for the NVFP4 build, because 12 GiB cross the same 273 GB/s twice
+as fast — with the checkpoint's 4-bit MTP head at k=3; without it the trellis
+kernel decodes at 15.7 t/s. Prefill is the price: 1,014 tok/s against ~1,400,
+because above 144 rows every projection is rebuilt to BF16 in a scratch buffer
+before its GEMM, so a 69k-token document takes ~68 s to read instead of 49.
+Tool calling (`qwen3_xml`) and the reasoning parser work as on `qwen27b`. The
+quantiser is not public and the checkpoint was a day old when this was
+measured; its quality claims are the card's, not ours.
 
 **`flash-next` is the strongest and the fastest, and it runs at the wall.** The
 checkpoint is 123.5 GiB for 121.6 GiB of RAM; it only fits because the 47.7 GiB
@@ -356,7 +379,7 @@ model: 4B active parameters against 27B.
 ### Switching
 
 ```bash
-sudo /opt/suite366/switch-model.sh list            # the three, and which is active
+sudo /opt/suite366/switch-model.sh list            # the four, and which is active
 sudo /opt/suite366/switch-model.sh status          # what this box runs right now
 sudo /opt/suite366/switch-model.sh qwen27b --dry-run
 sudo /opt/suite366/switch-model.sh qwen27b
@@ -375,7 +398,7 @@ A profile that leaves the memory for it also serves a **speech-to-text model**,
 in a third vLLM container (`suite366-vllm-stt`) behind the same proxy: the app's
 dictation, voice reports and meeting notes already speak the OpenAI
 `/v1/audio/transcriptions` route and only need a model to be named. Today that
-is `qwen27b` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
+is `qwen27b`, `orcasaq` and `gemma` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
 automatically, 4.75 % WER on FLEURS French against 6.31 for Whisper-large-v3,
 and it takes the vocabulary hint the app sends with every window. Audio longer
 than 30 s is split by vLLM at the quietest point of each window, so a 5 min
@@ -390,9 +413,12 @@ ships without `soundfile` and `PyAV` and decodes no audio at all, so one ~100 MB
 layer adds them — bump `LLM_STT_IMAGE_REV` in `llm/profiles.sh` whenever the
 Dockerfile changes. And the service sits behind a **compose profile**
 (`COMPOSE_PROFILES=stt` in `llm/.env`), so `switch-model.sh` can take it down
-before a bigger generative model starts and bring it back after a smaller one is
-healthy; the nginx route resolves it per request and simply answers 502 while it
-is absent. In the app the model is an `AIModel` row with `supportsTranscription`
+before the new generative model starts — always, even when the target serves
+one too: on unified memory vLLM sizes its KV cache as its share minus whatever
+else is resident when it profiles, and Gemma measured 222k tokens of KV with the
+transcription engine up during its start against ~300k without — and bring it
+back once the new engine is healthy; the nginx route resolves it per request and
+simply answers 502 while it is absent. In the app the model is an `AIModel` row with `supportsTranscription`
 and the organisation's default; a switch to a profile without one disables the
 row and clears the default, so the UI says "no transcription model configured"
 instead of failing on a route nothing serves. `LLM_STT_MODEL=` (empty) at
@@ -404,6 +430,8 @@ and nothing else moved: the box ends the run where it started.
 
 Switching to `flash-next` builds its patched image on the box if it is missing
 (~3 min) and lowers `vm.swappiness` to 10; switching away removes that drop-in.
+Switching to `orcasaq` builds its image the same way (`llm/exl3/`, ~4 min: it
+compiles exllamav3 for the GB10).
 The first start on a model whose checkpoint is not on disk downloads it
 (~133 GB for Flash-Next, 25 min at 85 MB/s).
 
@@ -559,7 +587,7 @@ tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a 
 tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 tools/test-local-certs.sh             self-test: the LAN certs name a real issuer, and a re-run never replaces a working certificate
 tools/test-vllm-db.sh                 self-test: a key change reaches the database row, a stale row fails the install, a loading model does not
-tools/test-llm-profiles.sh            self-test: the three profiles resolve to what was measured, and a switch moves all three copies of the model id
+tools/test-llm-profiles.sh            self-test: the four profiles resolve to what was measured, and a switch moves all three copies of the model id
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
@@ -573,12 +601,13 @@ values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. token
 switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run] | converge) — .env, chart values and the database
 host-layer.sh                         GENERATED (tools/bundle-host-layer.sh): switch-model.sh + llm/ in one file, pinned in channel.json as host_layer_sha256, laid down by install.sh and update.sh
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
-llm/profiles.sh                       the three models and their measured budgets, and the transcription model each allows; the ONE table install.sh and switch-model.sh share
+llm/profiles.sh                       the four models and their measured budgets, and the transcription model each allows; the ONE table install.sh and switch-model.sh share
 llm/stt/Dockerfile                    the audio extras the arm64 vLLM image ships without; built on the box as suite366/vllm-stt
 tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
 llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
 llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box)
+llm/exl3/                             the vLLM image that reads EXL3 trellis checkpoints (OrcaSAQ-2-27B): exllamav3 compiled for the GB10 + the orcasaq2 plugin (built on the box)
 llm/nginx.conf                        URL-path router unifying both vLLM behind a single endpoint
 tls/local-ca-issuer.yaml              local self-signed CA (cert-manager)
 dns/avahi-aliases.service             systemd unit publishing mDNS names
@@ -724,7 +753,7 @@ nothing about the step above.
 `update.sh` and `backup.sh` themselves — and, since the host layer became one
 artefact, everything the vLLM stack needs on the **host**: `switch-model.sh`, the
 model profiles, the compose, the nginx proxy config, the container entrypoint and
-the two image build contexts (`host-layer.sh`, pinned as `host_layer_sha256`).
+the three image build contexts (`host-layer.sh`, pinned as `host_layer_sha256`).
 A box whose bundle differs from the channel's sees "host layer" in the update it
 is offered; applying it lays the bundle down, adds every app ↔ host bridge its
 `values.yaml` lacks (model page, backups, remote access), rolls the release, and

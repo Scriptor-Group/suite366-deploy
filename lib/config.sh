@@ -144,17 +144,18 @@ NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
 
-# --- Generative model: one of three measured profiles ------------------------
-# The appliance can serve three models and switch between them without a
+# --- Generative model: one of four measured profiles -------------------------
+# The appliance can serve four models and switch between them without a
 # reinstall. LLM_PROFILE picks one; llm/profiles.sh holds the whole recipe
 # (model id, image, memory budgets, context window) and llm/serve-llm.sh the
 # vLLM flags. `switch-model.sh` changes it on a running box.
 #
 #   qwen27b     dense 27B NVFP4 — 262k context, ~20 t/s, real headroom
+#   orcasaq     dense 27B EXL3  — 262k context, ~38 t/s, 12 GB of weights, image built on the box
 #   flash-next  MoE 176B-A6B    — 131k context, ~30 t/s, runs at the memory wall
 #   gemma       MoE 26B-A4B     — 262k context, ~29 t/s, what the appliance shipped with
 #
-# Default qwen27b: the only one of the three that leaves the box headroom.
+# Default qwen27b: measured headroom, and no image to build on the box.
 # Flash-Next is faster and stronger but sits at 117/121 GiB with 7-10 GiB of
 # swap in use; Gemma is pinned to a vLLM that stopped moving in April. Both
 # remain one `switch-model.sh` away — see README "Choosing a model".
@@ -250,7 +251,7 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 #
 # The GENERATIVE side is profile-driven (llm/profiles.sh carries each model's
 # measured fraction, context and slot count, with the reasoning next to it).
-# Only the embed is fixed here, because it runs unchanged under all three.
+# Only the embed is fixed here, because it runs unchanged under all four.
 #
 #   EMBED 0.20 + an explicit 4 GiB KV budget in the compose
 #     (--kv-cache-memory-bytes): ~20 GiB. The fraction alone was the wrong tool:
