@@ -5,9 +5,9 @@
   "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "59abc793d1b9d2dea507814e4259f717ed1849dedce8a22b38245834d4a694f5",
   "backup_sha256": "1a17717daa7a338d219bf6078e976341c50eb16161da8ea3a7727cea8890f811",
-  "host_layer_sha256": "b89baf597b9738f10abd8671881de11d3e84154cba3a42fa131d422b68d7c9f4",
+  "host_layer_sha256": "99a90332fb2b0bd33e4077c327f10fa18e98e630fef2143fcba26a561f6a771c",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "host layer: transcription on gemma (share lowered to 0.45), new orcasaq profile (OrcaSAQ-2-27B, 3.2-bit EXL3, image built on the box); app 1.11.10, chart 0.10.2 and vLLM image unchanged"
+  "notes": "host layer: a switch that has to build an image stops the running engines first (a build next to Flash-Next took a Spark down); app 1.11.10, chart 0.10.2 and vLLM image unchanged"
 }
