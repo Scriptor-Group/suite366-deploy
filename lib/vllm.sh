@@ -29,22 +29,29 @@ fetch_host_layer() {
   info "host layer laid down (switch-model.sh + llm/, stamp $(cut -c1-12 "$HOST_LAYER_STAMP"))."
 }
 
-# --- Flash-Next: the patched vLLM image, built on the box ---------------------
-# Qwen3.8-Flash-Next only fits on one Spark with its 47.7 GiB n-gram table served
-# from the NVMe by mmap — a vLLM patch set (llm/flash-next/, vendored from
-# blazux/qwen3.8-Flash-DGX) laid over the official v0.29.0 image. No registry
-# holds that image: it is built here, once per (base image, patch commit) tag.
-build_flash_next_image() { # build_flash_next_image TAG
-  local tag="$1" ctx="$DATA_DIR/llm/flash-next"
+# --- The profiles that build their own vLLM image, on the box -----------------
+# Two of the four do (llm/profiles.sh LLM_P_NEEDS_BUILD + LLM_P_BUILD_DIR):
+# Flash-Next, which only fits on one Spark with its 47.7 GiB n-gram table served
+# from the NVMe by mmap (llm/flash-next/, a vLLM patch set laid over the
+# official image), and OrcaSAQ, whose 3.2-bit trellis format needs exllamav3's
+# kernels compiled for the GB10 plus the plugin that registers it (llm/exl3/).
+# No registry holds either image: each is built here, once per tag, and the tag
+# names its inputs so a new base image or a bumped revision rebuilds.
+# switch-model.sh (ensure_profile_images) does the same on a running box.
+build_profile_image() { # build_profile_image TAG BUILD_DIR
+  local tag="$1" ctx="$DATA_DIR/llm/$2"
   if docker image inspect "$tag" >/dev/null 2>&1; then
     info "vLLM image $tag already built."
     return 0
   fi
-  log "Building $tag ($VLLM_IMAGE + the Flash-Next patch set, ~3 min)"
+  [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile missing — the host layer is incomplete."
+  log "Building $tag ($VLLM_IMAGE + llm/$2/ — its Dockerfile says how long)"
   docker pull -q "$VLLM_IMAGE" >/dev/null
   # stdout (the image id) is noise; stderr is where a failing step explains itself.
-  docker build -q -t "$tag" "$ctx" >/dev/null \
-    || die "docker build of $tag failed — see llm/flash-next/README.md"
+  # BASE_IMAGE is read by llm/exl3/Dockerfile; llm/flash-next/Dockerfile pins
+  # its own FROM and ignores it.
+  docker build -q --build-arg "BASE_IMAGE=$VLLM_IMAGE" -t "$tag" "$ctx" >/dev/null \
+    || die "docker build of $tag failed — see llm/$2/README.md"
 }
 
 # --- Transcription: the audio extras, built over the base image ---------------
@@ -91,12 +98,12 @@ deploy_vllm() {
   mkdir -p "$MODELS_DIR" "$DATA_DIR/llm" "$CACHE_DIR/vllm" "$CACHE_DIR/flashinfer" "$CACHE_DIR/triton"
   # The compose, the nginx config, switch-model.sh (an OPERATOR script, at
   # $DATA_DIR next to update.sh and backup.sh: `sudo /opt/suite366/switch-model.sh`),
-  # the profile table, the entrypoint, Gemma's chat template and the two image
+  # the profile table, the entrypoint, Gemma's chat template and the three image
   # build contexts — one bundle, the same one update.sh lays down later.
   fetch_host_layer
   # `if`, not `[[ ]] &&`: as the last command of a function the && form
   # returns 1 when the test is false and `set -e` kills the install.
-  if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_flash_next_image "$VLLM_LLM_IMAGE"; fi
+  if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_profile_image "$VLLM_LLM_IMAGE" "$LLM_P_BUILD_DIR"; fi
   if [[ -n "$LLM_STT_MODEL" ]]; then build_stt_image "$VLLM_STT_IMAGE"; fi
   apply_vllm_sysctl "$LLM_P_SWAPPINESS"
   # Arms the .path unit that lets an org admin switch model from the app, and

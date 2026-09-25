@@ -10,7 +10,7 @@
 #     no cache dir, no transcription keys, base image already moved to v0.29.0
 #     by the channel) into a profile-driven one WITHOUT moving its model: Gemma
 #     keeps its pinned nightly, tuned budgets are kept, missing keys get the
-#     installer's defaults, the transcription container is taken down, the
+#     installer's defaults, the transcription engine the profile allows comes up, the
 #     proxy is reloaded, the units are rewritten;
 #   • update.sh's in-place values.yaml patch adds every missing app <-> host
 #     bridge, is idempotent, and leaves a current file untouched;
@@ -45,6 +45,9 @@ check "serve-llm.sh est exécutable (755)"   "$(stat -c %a "$X/llm/serve-llm.sh"
 check "profiles.sh est une donnée (644)"     "$(stat -c %a "$X/llm/profiles.sh")" "644"
 contains "le bundle embarque le contexte Flash-Next" "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/flash-next/Dockerfile"
 contains "le bundle embarque le contexte STT"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/stt/Dockerfile"
+contains "le bundle embarque le contexte EXL3"       "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/Dockerfile"
+contains "…avec son correctif arm64"                 "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/arm64-build.sh"
+contains "…et ses stubs"                             "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/aarch64_stubs.cpp"
 absent   "le bundle ne transporte pas de doc"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "README"
 
 # --- 2. converge sur une box de juillet ----------------------------------------------
@@ -110,16 +113,20 @@ check ".env : LLM_PROFILE posé"                     "$(envv "$BOX" LLM_PROFILE)
 # v0.29.0 et l'ancien compose y aurait entraîné Gemma. Le profil le garde épinglé.
 check ".env : Gemma reste sur sa nightly épinglée"  "$(envv "$BOX" VLLM_LLM_IMAGE)" "vllm/vllm-openai:cu130-nightly"
 check ".env : la base reste celle du canal"         "$(envv "$BOX" VLLM_IMAGE)" "vllm/vllm-openai:v0.29.0"
-check ".env : budget réglé conservé"                "$(envv "$BOX" LLM_GPU_MEM_UTIL)" "0.55"
+# Gemma est passé de 0,55 à 0,45 pour loger le moteur de transcription : la
+# part d'une box restée à 0,55 est ABAISSÉE (à 0,55 la transcription redémarrait
+# en boucle). Une part réglée plus bas que le profil est conservée (box LOW).
+check ".env : part abaissée au profil (0.55 -> 0.45)" "$(envv "$BOX" LLM_GPU_MEM_UTIL)" "0.45"
 check ".env : budget embed conservé"                "$(envv "$BOX" EMBED_GPU_MEM_UTIL)" "0.30"
 check ".env : CACHE_DIR par défaut"                 "$(envv "$BOX" CACHE_DIR)" "$BOX/cache"
 check ".env : pas de tête MTP pour Gemma"           "$(envv "$BOX" LLM_MTP_TOKENS)" ""
-check ".env : pas de transcription pour Gemma"      "$(envv "$BOX" STT_MODEL)" ""
-check ".env : profil compose stt désactivé"         "$(envv "$BOX" COMPOSE_PROFILES)" ""
+# Depuis le 25/09/2026 Gemma sert la transcription : une box de juillet la reçoit à la convergence.
+check ".env : transcription pour Gemma"             "$(envv "$BOX" STT_MODEL)" "Qwen/Qwen3-ASR-1.7B"
+check ".env : profil compose stt activé"            "$(envv "$BOX" COMPOSE_PROFILES)" "stt"
 check ".env : STT_PORT par défaut"                  "$(envv "$BOX" STT_PORT)" "8003"
 if [[ -d "$BOX/cache/vllm" && -d "$BOX/cache/flashinfer" && -d "$BOX/cache/triton" ]]; then ok "caches JIT créés"; else ko "caches JIT créés"; fi
 D="$(cat "$BOX/docker.log")"
-contains "conteneur STT retiré (le profil n'en a pas)"  "$D" "docker compose --profile stt rm -sf vllm-stt"
+absent   "conteneur STT conservé (le profil en a un)"   "$D" "rm -sf vllm-stt"
 contains "compose up -d (recrée ce qui a changé)"       "$D" "docker compose up -d"
 absent   "pas de --force-recreate (rien d'inutile)"     "$D" "force-recreate"
 contains "proxy rechargé"                               "$D" "docker exec suite366-vllm-proxy nginx -s reload"
@@ -136,6 +143,10 @@ check "state : bascule au repos"   "$(python3 -c "import json;print(json.load(op
 env1="$(cat "$BOX/llm/.env")"; out2="$(conv "$BOX")"
 check "seconde passe : .env inchangé"  "$(cat "$BOX/llm/.env")" "$env1"
 contains "seconde passe : 0 clé écrite" "$out2" ".env: 0 key(s) written"
+# Une part réglée PLUS BAS que le profil est une décision mémoire : conservée.
+LOW="$WORK/gemma-low"; mkbox "$LOW" nvidia/Gemma-4-26B-A4B-NVFP4; mkdir -p "$LOW/systemd"
+sed -i 's/^LLM_GPU_MEM_UTIL=.*/LLM_GPU_MEM_UTIL=0.40/' "$LOW/llm/.env"; conv "$LOW" >/dev/null
+check ".env : une part réglée plus bas est conservée (0.40)" "$(envv "$LOW" LLM_GPU_MEM_UTIL)" "0.40"
 
 BOX2="$WORK/qwen-box"; mkbox "$BOX2" nvidia/Qwen3.8-27B-NVFP4; mkdir -p "$BOX2/systemd"
 out="$(conv "$BOX2")"
@@ -205,9 +216,9 @@ for m in appliance-update support-access appliance-backup appliance-llm applianc
   contains "juillet : montage + volume $m" "$V" "- name: $m"
 done
 contains "juillet : hostPath sous DATA_DIR"           "$V" "path: $JULY/llm-state"
-contains "juillet : VLLM_MODEL_TRANSCRIPTION vide (Gemma)" "$V" 'VLLM_MODEL_TRANSCRIPTION: ""'
+contains "juillet : VLLM_MODEL_TRANSCRIPTION = celle du profil (Gemma en a une depuis le 25/09)" "$V" 'VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
 # Insérée dans le bloc config, juste après l'embedding, pas en fin de fichier.
-check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: ""'
+check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
 for d in updates support backup remote llm-state; do [[ -d "$JULY/$d" ]] || ko "répertoire de pont $d créé"; done; ok "répertoires de pont créés"
 # Le workbench : le bloc entier, épinglé sur la version d'app installée, sous sandbox.
 contains "juillet : bloc workbench ajouté"           "$V" "  workbench:"

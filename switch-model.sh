@@ -2,7 +2,7 @@
 # =============================================================================
 # Suite 366 — switch the appliance's generative model.
 #
-# The appliance can serve three models (llm/profiles.sh). Switching is not just
+# The appliance can serve four models (llm/profiles.sh). Switching is not just
 # a model id: each needs its own image, its own share of the unified memory
 # pool and its own vLLM flags, and the id itself lives in THREE places that
 # must agree or the app breaks in a way nothing reports:
@@ -51,7 +51,7 @@
 #
 # App <-> host bridge ($DATA_DIR/llm-state, hostPath-mounted into drive-app at
 # /appliance-llm — see values.yaml `extraVolumes`):
-#   state.json        written here     — the three profiles, the active one,
+#   state.json        written here     — the profiles, the active one,
 #                                        the engine's health, the switch status
 #   switch-requested  written by the app — line 1 the profile, line 2 the admin
 # The pod runs as uid/gid 1001 and k8s does NOT apply fsGroup to hostPath
@@ -136,7 +136,7 @@ BASE_IMAGE="$(env_get VLLM_IMAGE)"
 FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${BASE_IMAGE##*:}-${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
 STT_IMAGE="$(llm_stt_image "$BASE_IMAGE")"
 
-# Every model id the three profiles can produce: the scope of the Agent rewrite
+# Every model id the profiles can produce: the scope of the Agent rewrite
 # below. An agent pointed at OpenAI or Anthropic must not be touched.
 all_profile_models() {
   local p
@@ -197,18 +197,23 @@ EOF
 }
 
 # Build what the profile needs and the box lacks. Shared by a switch and by
-# converge; both die on a failed build because nothing below could start.
+# converge; both die on a failed build because nothing below could start. A
+# profile that builds names its context (LLM_P_BUILD_DIR, a directory under
+# llm/ with a Dockerfile); the base image is passed as a build argument for the
+# Dockerfiles that take one (llm/exl3/) and ignored by the one that pins its
+# own FROM (llm/flash-next/, vendored as is).
 ensure_profile_images() {
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
     if docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
       info "image $LLM_P_IMAGE already built."
     else
-      [[ -f "$LLM_DIR/flash-next/Dockerfile" ]] \
-        || die "$LLM_DIR/flash-next/ missing — cannot build $LLM_P_IMAGE. Re-run install.sh."
-      log "Building $LLM_P_IMAGE (~3 min)"
+      local ctx="$LLM_DIR/${LLM_P_BUILD_DIR:?profile builds an image but names no LLM_P_BUILD_DIR}"
+      [[ -f "$ctx/Dockerfile" ]] \
+        || die "$ctx/ missing — cannot build $LLM_P_IMAGE. Re-run install.sh."
+      log "Building $LLM_P_IMAGE from llm/$LLM_P_BUILD_DIR/ (see its Dockerfile for how long)"
       docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
-      docker build -q -t "$LLM_P_IMAGE" "$LLM_DIR/flash-next" >/dev/null \
-        || die "docker build of $LLM_P_IMAGE failed."
+      docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$LLM_P_IMAGE" "$ctx" >/dev/null \
+        || die "docker build of $LLM_P_IMAGE failed — see $ctx/Dockerfile"
     fi
   elif ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
     log "Pulling $LLM_P_IMAGE"
@@ -356,7 +361,15 @@ case "$TARGET" in
     # when missing; keys the old compose never had get their defaults.
     set_env_default LLM_PROFILE       "$prof"
     set_env         VLLM_LLM_IMAGE    "$LLM_P_IMAGE"
-    set_env_default LLM_GPU_MEM_UTIL  "$LLM_P_GPU_MEM_UTIL"
+    # The share: filled in when missing, LOWERED to the profile's when the box's
+    # is higher, never raised. Gemma shipped at 0.55 and moved to 0.45 to seat
+    # the transcription engine (2026-09-25): a box left at 0.55 would restart
+    # that engine in a loop (7.9 GiB free, 12.2 needed). A share an operator
+    # tuned DOWN is a memory decision this script must not undo.
+    cur_util="$(env_get LLM_GPU_MEM_UTIL)"
+    if [[ -z "$cur_util" ]] || awk -v c="$cur_util" -v p="$LLM_P_GPU_MEM_UTIL" 'BEGIN { exit !(c + 0 > p + 0) }'; then
+      set_env LLM_GPU_MEM_UTIL "$LLM_P_GPU_MEM_UTIL"
+    fi
     set_env_default LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
     set_env_default LLM_MAX_NUM_SEQS  "$LLM_P_MAX_NUM_SEQS"
     set_env         LLM_MTP_TOKENS    "$LLM_P_MTP_TOKENS"
@@ -608,13 +621,13 @@ if [[ "$DRY_RUN" == 1 ]]; then
   info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
   echo; info "SQL:"; build_sql | sed 's/^/      /'
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
-    echo; info "image build: $LLM_P_IMAGE (from $BASE_IMAGE + llm/flash-next/)"
+    echo; info "image build: $LLM_P_IMAGE (from $BASE_IMAGE + llm/$LLM_P_BUILD_DIR/, unless already built)"
   fi
   if [[ -n "$LLM_P_STT_MODEL" ]]; then
     echo; info "image build: $STT_IMAGE (from $BASE_IMAGE + llm/stt/, unless already built)"
-    info "transcription container: suite366-vllm-stt up after the engine is healthy"
+    info "transcription container: taken down first, then suite366-vllm-stt up after the engine is healthy"
   else
-    echo; info "transcription container: suite366-vllm-stt taken down before the engine starts"
+    echo; info "transcription container: suite366-vllm-stt taken down before the engine starts, and stays down"
   fi
   exit 0
 fi
@@ -665,12 +678,16 @@ rollback() {
 }
 
 # --- 3. bring the new engine up, and wait for it ------------------------------
-# A transcription engine the TARGET does not have goes down FIRST: it holds
-# ~9 GiB the bigger generative model may need to clear vLLM's start-up check.
-if [[ -z "$LLM_P_STT_MODEL" ]]; then
-  ( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
-  docker rm -f suite366-vllm-stt >/dev/null 2>&1 || true
-fi
+# The transcription engine goes down FIRST, whatever the target. Two reasons,
+# both measured. It holds ~10 GiB a bigger generative model may need to clear
+# vLLM's start-up check. And on unified memory vLLM sizes the KV cache as its
+# share MINUS everything else resident when it profiles — Gemma at 0.45 got
+# 222k tokens of KV with the transcription engine up during its start and
+# ~300k without (2026-09-25). Taking it down here and bringing it back in 3b
+# gives every switch the same baseline (the embed only), so a profile's KV
+# does not depend on which profile ran before.
+( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
+docker rm -f suite366-vllm-stt >/dev/null 2>&1 || true
 # From here the app's UI can follow along in state.json.
 publish_state running "$TARGET" "starting the $TARGET engine"
 log "Recreating suite366-vllm-llm on $TARGET"
