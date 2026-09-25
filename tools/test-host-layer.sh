@@ -64,7 +64,11 @@ case "$1 $2" in
       *Status*) echo running ;;
       *) echo "img" ;;
     esac ;;
-  "image inspect") exit 0 ;;      # every image is present: no build, no pull
+  # every image is present (no build, no pull) — except the one a test names
+  # in STUB_MISSING_IMAGE, which the box has to build; STUB_BUILD_FAIL=1 makes
+  # that build fail.
+  "image inspect") case "$3" in *"${STUB_MISSING_IMAGE:-@none@}"*) exit 1 ;; *) exit 0 ;; esac ;;
+  "build "*) [[ "${STUB_BUILD_FAIL:-0}" == 1 ]] && exit 1; exit 0 ;;
   "compose "*) exit 0 ;;
   "exec "*) exit 0 ;;
   *) exit 0 ;;
@@ -156,6 +160,34 @@ check "qwen27b : transcription activée"     "$(envv "$BOX2" STT_MODEL)" "Qwen/Q
 check "qwen27b : profil compose stt"        "$(envv "$BOX2" COMPOSE_PROFILES)" "stt"
 check "qwen27b : tête MTP à 3"              "$(envv "$BOX2" LLM_MTP_TOKENS)" "3"
 absent "qwen27b : le conteneur STT n'est pas retiré" "$(cat "$BOX2/docker.log")" "rm -sf vllm-stt"
+
+# --- 2b. une image à construire : les moteurs en place s'arrêtent AVANT ----------
+# Compiler exllamav3 à côté d'un Flash-Next résident a mis une Spark cliente à
+# genoux (swap plein, charge 74, app injoignable, 25/09/2026). Le moteur en
+# place s'arrête avant le build, revient si le build échoue, et .env n'a pas bougé.
+head_ "switch-model.sh converge : build avec les moteurs arrêtés"
+OB="$WORK/orca-box"; mkbox "$OB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq
+VLLM_LLM_IMAGE=suite366/vllm-exl3:v0.29.0-r0"; mkdir -p "$OB/systemd"
+out="$(STUB_MISSING_IMAGE=vllm-exl3 conv "$OB")"; rc=$?
+check "build : converge sort en 0"                       "$rc" "0"
+D="$(cat "$OB/docker.log")"
+contains "build : les moteurs sont arrêtés d'abord"      "$D" "docker compose --profile stt stop vllm-llm vllm-stt"
+contains "build : l'image est construite depuis llm/exl3" "$D" "docker build -q --build-arg BASE_IMAGE=vllm/vllm-openai:v0.29.0 -t suite366/vllm-exl3:v0.29.0-r1 $OB/llm/exl3"
+check "build : stop AVANT build"                         "$(grep -n "stop vllm-llm\|docker build" "$OB/docker.log" | head -2 | cut -d: -f2- | cut -c1-19 | tr '\n' '|')" "docker compose --pr|docker build -q --b|"
+contains "build : puis compose up -d"                    "$D" "docker compose up -d"
+contains "build : l'opérateur est prévenu que les moteurs s'arrêtent" "$out" "Stopping the running engines for the build"
+check "build : .env pointe sur la nouvelle image"        "$(envv "$OB" VLLM_LLM_IMAGE)" "suite366/vllm-exl3:v0.29.0-r1"
+# Le build échoue : les moteurs reviennent, .env n'a pas bougé, converge sort en erreur.
+FB="$WORK/orca-box-fail"; mkbox "$FB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq
+VLLM_LLM_IMAGE=suite366/vllm-exl3:v0.29.0-r0"; mkdir -p "$FB/systemd"
+out="$(STUB_MISSING_IMAGE=vllm-exl3 STUB_BUILD_FAIL=1 conv "$FB")"; rc=$?
+check "build raté : converge sort en erreur"             "$rc" "1"
+D="$(cat "$FB/docker.log")"
+contains "build raté : les moteurs précédents reviennent" "$D" "docker compose up -d"
+check "build raté : .env n'a pas bougé (ancienne image)" "$(envv "$FB" VLLM_LLM_IMAGE)" "suite366/vllm-exl3:v0.29.0-r0"
+contains "build raté : l'UI voit l'erreur"               "$(cat "$FB/llm-state/state.json")" "could not be built"
+# Sans build à faire, rien ne s'arrête : une box à jour ne coupe pas son moteur pour rien.
+absent "qwen27b : aucun arrêt des moteurs sans build"    "$(cat "$BOX2/docker.log")" "stop vllm-llm"
 
 BOX3="$WORK/custom-box"; mkbox "$BOX3" someone/Custom-Model; mkdir -p "$BOX3/systemd"
 out="$(conv "$BOX3")"; rc=$?
