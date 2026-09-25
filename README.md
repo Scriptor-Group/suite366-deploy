@@ -431,7 +431,11 @@ and nothing else moved: the box ends the run where it started.
 Switching to `flash-next` builds its patched image on the box if it is missing
 (~3 min) and lowers `vm.swappiness` to 10; switching away removes that drop-in.
 Switching to `orcasaq` builds its image the same way (`llm/exl3/`, ~4 min: it
-compiles exllamav3 for the GB10).
+compiles exllamav3 for the GB10). **A build stops the running engines first**
+and the model page says so: compiling next to a resident Flash-Next (117/121 GiB
+before the first `nvcc`) drove a Spark into 16 GiB of swap and a load of 74 and
+took the app down with it. The previous engine is about to be replaced anyway;
+if the build fails it is brought back and nothing else has moved.
 The first start on a model whose checkpoint is not on disk downloads it
 (~133 GB for Flash-Next, 25 min at 85 MB/s).
 

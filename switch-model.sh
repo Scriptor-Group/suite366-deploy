@@ -229,6 +229,32 @@ ensure_profile_images() {
   fi
 }
 
+# Build with the box's memory free to do it. Compiling exllamav3 (llm/exl3/)
+# next to a running Flash-Next — 117/121 GiB before the first nvcc — drove a
+# client Spark into 16 GiB of swap and a load of 74, and took the app down with
+# it (2026-09-25). A build only happens when the target's image is missing, and
+# the target is about to replace the running engine anyway: so the generative
+# and transcription engines are STOPPED first (the embed stays, it is 20 GiB
+# and needed as is), the build runs, and if it fails the previous stack is
+# brought back before the caller dies. The UI is told what is going on: the
+# build is the longest silent stretch of a switch otherwise.
+build_with_engines_down() { # build_with_engines_down LABEL -> 0, or 1 with the previous engines back
+  local label="$1"
+  if [[ "$LLM_P_NEEDS_BUILD" != "1" ]] || docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
+    ensure_profile_images; return 0
+  fi
+  publish_state running "$label" "building the $label image — the current model is paused while it compiles (a few minutes)"
+  log "Stopping the running engines for the build (the box needs its memory to compile)"
+  ( cd "$LLM_DIR" && docker compose --profile stt stop vllm-llm vllm-stt >/dev/null 2>&1 ) || true
+  # A subshell: ensure_profile_images dies on failure, and the previous engine
+  # must come back before anything here exits.
+  if ( ensure_profile_images ); then return 0; fi
+  warn "The build failed — bringing the previous engines back."
+  ( cd "$LLM_DIR" && docker compose up -d >/dev/null 2>&1 ) || true
+  publish_state error "$label" "the $label image could not be built; the previous model is back"
+  return 1
+}
+
 # The transcription keys, ALL of them: a box installed before transcription
 # existed has none, and the compose interpolates every one.
 set_env_stt_keys() {
@@ -356,6 +382,10 @@ case "$TARGET" in
     fi
     llm_profile_apply "$prof" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
     TARGET_LABEL="$prof"
+    # The images first, BEFORE .env moves: a build that fails must leave a box
+    # whose `docker compose up -d` still names an image it has.
+    build_with_engines_down "$prof" \
+      || die "could not build $LLM_P_IMAGE — see the build output above; .env is untouched and the previous engines are back."
     # .env: the profile is authoritative for what it defines (image, MTP head,
     # transcription); budgets an operator may have tuned are only filled in
     # when missing; keys the old compose never had get their defaults.
@@ -380,7 +410,6 @@ case "$TARGET" in
     cache_dir="$(env_get CACHE_DIR)"
     mkdir -p "$cache_dir/vllm" "$cache_dir/flashinfer" "$cache_dir/triton"
     info ".env: $ENV_CHANGES key(s) written"
-    ensure_profile_images
     if [[ -n "$LLM_P_SWAPPINESS" ]]; then
       printf 'vm.swappiness = %s\n' "$LLM_P_SWAPPINESS" > "$VLLM_SYSCTL_FILE"
       sysctl -q -w "vm.swappiness=$LLM_P_SWAPPINESS" >/dev/null 2>&1 || true
@@ -637,7 +666,10 @@ command -v docker >/dev/null || die "docker not found."
 [[ -f "$LLM_DIR/docker-compose.yml" ]] || die "$LLM_DIR/docker-compose.yml missing."
 
 # --- 1. the images this profile needs ----------------------------------------
-ensure_profile_images
+# A build stops the running engines first (see build_with_engines_down): the
+# only thing the previous model can do for the build is to get out of its way.
+build_with_engines_down "$TARGET" \
+  || die "The $TARGET image could not be built; the previous engines were brought back. See the build output above."
 
 # --- 2. .env, with the previous one kept for the rollback ---------------------
 ENV_BACKUP="$(mktemp)"; cp "$ENV_FILE" "$ENV_BACKUP"
