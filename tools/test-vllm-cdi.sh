@@ -134,5 +134,13 @@ grep -q 'ExecStartPre=.*--output=\$cdi_spec' <<<"$unit" \
   && ok "the unit and the preflight refresh target the same file" \
   || ko "the unit and the preflight refresh target the same file" "$unit"
 
+# At boot dockerd restarts last boot's containers before this unit runs, and an
+# unchanged \`up -d\` would keep them — stale spec, engines loaded out of order.
+# The stack must be taken down after the refresh and before the up.
+order="$(grep -nE '^Exec(StartPre|Start)=' <<<"$unit" | cut -d: -f2- | tr '\n' '|')"
+[[ "$order" == *"nvidia-ctk cdi generate"*"|ExecStartPre=-/usr/bin/docker compose down|ExecStart=/usr/bin/docker compose up -d|"* ]] \
+  && ok "the unit recreates the containers at start: refresh, then down, then up" \
+  || ko "the unit recreates the containers at start: refresh, then down, then up" "$order"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
