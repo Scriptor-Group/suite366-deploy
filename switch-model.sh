@@ -185,6 +185,16 @@ WorkingDirectory=$LLM_DIR
 # target is never reached and it never runs at all.
 # Best-effort (leading -): never hold the stack down when the spec is fine.
 ExecStartPre=-/usr/bin/nvidia-ctk cdi generate --output=$cdi_spec
+# The refresh above only reaches containers created AFTER it, and at boot there
+# are none: \`restart: unless-stopped\` makes dockerd restart last boot's
+# containers before this unit runs, and \`up -d\` then finds them unchanged and
+# recreates nothing. So they keep the stale spec, and all three engines load at
+# once instead of LLM first (dockerd ignores depends_on), so vllm-llm exits and
+# \`up\` fails on "dependency failed to start" (seen on every boot of
+# promaxgb10-6452 from 28/09/2026). Taking the stack down first makes a boot
+# behave like a restart: the containers are recreated with the fresh spec and
+# started in compose order. Best-effort: nothing to remove on a first start.
+ExecStartPre=-/usr/bin/docker compose down
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
