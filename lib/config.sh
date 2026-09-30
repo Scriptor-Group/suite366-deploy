@@ -243,6 +243,18 @@ PG_DEPLOY="${PG_DEPLOY:-}"
 # the chart renders the value. Override per-deployment via the env var.
 _DEFAULT_LICENSE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk84/ONPJm9WFpnlQAf7IpRTfdcwwH4Ua3f7NAZtf6/4=\n-----END PUBLIC KEY-----\n'
 LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
+# Instance licence (EdDSA JWT with scope "instance"), issued OFF-BOX by the
+# owner with the app's generator (README "Licensing and several
+# organisations"). OPTIONAL: without it the app hosts ONE organisation. It is
+# a SECRET: the same token licenses any box that trusts the public key above,
+# so it lives under `secrets:` in values.yaml (0600) and is never printed.
+# Kept across re-runs (lib/preflight.sh reads it back); `update.sh license set`
+# installs or rotates it on a running box.
+LICENSE_KEY="${LICENSE_KEY:-}"
+# First app release whose org-creation gate honours the licence: below it a
+# LICENSE_KEY means "unlimited organisations with OPEN sign-up on the LAN", so
+# both entry points refuse a token on an older app. Duplicated in update.sh.
+LICENSE_MIN_APP="${LICENSE_MIN_APP:-1.12.0}"
 
 # --- vLLM tuning for the GB10 UNIFIED memory (one shared pool ~121 GiB) -------
 # Both vLLM instances share this pool (along with the OS, runtime, and KV

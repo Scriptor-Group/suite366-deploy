@@ -39,6 +39,15 @@
 #   install-units (re)install the systemd .path units that let the app UI
 #                 trigger check/apply, and prepare $DATA_DIR/updates. Called by
 #                 install.sh and after every apply (fleet convergence).
+#   license set <token|->  install or rotate the INSTANCE licence (several
+#                 organisations, seats pooled): validates its shape and scope,
+#                 refuses it while the app is older than LICENSE_MIN_APP,
+#                 writes it under `secrets:` in values.yaml and rolls the
+#                 release so the Secret reaches the app. `-` reads the token
+#                 on stdin (keeps it out of argv, ps and shell history). Needs
+#                 the chart reachable (online, or a staged USB package with
+#                 UPDATE_SOURCE=usb).
+#   license show  describe the licence on this box, or say there is none.
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
@@ -885,6 +894,10 @@ if si is not None and app_version and not any(re.match(r"^  workbench:", l) for 
         "    storageClass: local-path",
         "    limits:",
         '      idleStopMs: "7200000"',
+        # Several organisations on one box: without a cap one of them can
+        # take the whole pod quota. Only when the block is created here; a
+        # box that already has it keeps whatever its operator set.
+        '      maxPerOrg: "8"',
         "    resourceQuota:",
         '      pods: "10"',
         '      requestsCpu: "4"',
@@ -927,6 +940,10 @@ if si is not None:
         if re.match(r"^  workbench:\s*$", lines[k]):
             added += ensure_quoted_limit(k, sub_block(k, sj, 2), 4, "idleStopMs", "7200000")
             break
+# Deliberately NOT converged here: `config.APPLIANCE_ADMIN_EMAIL` (it only
+# gates the FIRST organisation of a virgin box — every box that runs this has
+# one already, and adding it would misdescribe the box) and `secrets:` (the
+# instance licence is provisioned by `update.sh license set`, never guessed).
 ci, cj = region("config")
 if ci is not None:
     if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):
@@ -1797,8 +1814,8 @@ SQL
   mapfile -t klist < <(awk '/^k=/ {print substr($0, 3)}' <<<"$raw")
   if (( ${#klist[@]} == 0 )); then
     warn "no vLLM provider row on this box yet — nothing to verify."
-    warn "  The app seeds it ONCE, at the first organization creation. Until"
-    warn "  then there is nothing that can be stale."
+    warn "  The app seeds one per organization, at its creation. Until the"
+    warn "  first exists there is nothing that can be stale."
     VLLM_DB_VERIFIED=norow
     return 0
   fi
@@ -1932,6 +1949,111 @@ reconcile_and_check_vllm_db() { # reconcile_and_check_vllm_db DEEP(0|1)
 # <<< END SHARED vllm-db BLOCK <<<
 
 # --- Mode dispatch ---------------------------------------------------------------
+# --- Instance licence -----------------------------------------------------------
+# Several organisations on one box and the box-wide seat pool are unlocked by an
+# instance licence the app reads from LICENSE_KEY (README "Licensing and several
+# organisations"). The host never verifies it (the app does, Ed25519): it only
+# checks the SHAPE (a JWT) and the SCOPE (instance, not organisation), and
+# refuses any token while the app is older than the release that gates
+# organisation creation on it — on an older app a licence means unlimited
+# organisations with OPEN sign-up on the LAN.
+# LICENSE_MIN_APP and the three decoders are duplicated from lib/config.sh and
+# lib/common.sh: this script cannot source lib/ (it runs alone on the box).
+LICENSE_MIN_APP="${LICENSE_MIN_APP:-1.12.0}"
+license_key_sane() { # license_key_sane TOKEN -> three base64url segments
+  [[ "$1" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]
+}
+jwt_payload() { # jwt_payload TOKEN -> the payload JSON (jose emits it compact)
+  local p; p="$(cut -d. -f2 <<<"$1" | tr '_-' '/+')"
+  while (( ${#p} % 4 )); do p+="="; done
+  printf '%s' "$p" | base64 -d 2>/dev/null
+}
+jwt_field() { # jwt_field TOKEN NAME -> the value (string or number), nested keys included
+  jwt_payload "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1
+}
+license_key_from_values() { # license_key_from_values FILE -> token or nothing
+  sed -n 's/^ *LICENSE_KEY: *"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+license_describe() { # license_describe TOKEN
+  local orgs seats exp
+  orgs="$(jwt_field "$1" maxOrganizations)"; [[ -z "$orgs" || "$orgs" == "-1" ]] && orgs=unlimited
+  seats="$(jwt_field "$1" includedSeats)"; [[ -z "$seats" ]] && seats="$(jwt_field "$1" maxUsers)"
+  [[ -z "$seats" || "$seats" == "-1" ]] && seats=unlimited
+  exp="$(date -u -d "@$(jwt_field "$1" exp)" '+%Y-%m-%d' 2>/dev/null || echo '?')"
+  info "licensee      : $(jwt_field "$1" licensee)  (jti $(jwt_field "$1" jti), type $(jwt_field "$1" type))"
+  info "organisations : $orgs   seats pooled across the box: $seats"
+  info "expires       : $exp"
+}
+# Write (or replace) `secrets.LICENSE_KEY` in values.yaml, in place, touching
+# nothing else — same discipline as ensure_appliance_values. The file keeps its
+# 0600: it now carries a token that licenses any box trusting the public key.
+license_write_values() { # license_write_values FILE TOKEN
+  LICENSE_TOKEN="$2" python3 - "$1" <<'PY'
+import os, re, sys
+path = sys.argv[1]; token = os.environ["LICENSE_TOKEN"]
+lines = open(path, encoding="utf-8").read().split("\n")
+if lines and lines[-1] == "": lines.pop()
+line = '  LICENSE_KEY: "%s"' % token
+for i, l in enumerate(lines):
+    if re.match(r"^ *LICENSE_KEY:", l):
+        lines[i] = line; break
+else:
+    si = next((i for i, l in enumerate(lines) if re.match(r"^secrets:\s*$", l)), None)
+    if si is None:
+        ci = next((i for i, l in enumerate(lines) if re.match(r"^config:\s*$", l)), len(lines))
+        lines[ci:ci] = ["secrets:", line, ""]
+    else:
+        at = si + 1
+        for k in range(si + 1, len(lines)):
+            if lines[k] == "" or not lines[k].startswith(" "): break
+            at = k + 1
+        lines[at:at] = [line]
+open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+  chmod 0600 "$1"
+}
+do_license() { # do_license set TOKEN|- | show
+  local vals="$DATA_DIR/values.yaml" token="${2:-}"
+  [[ -f "$vals" ]] || die "no $vals — is Suite 366 installed?"
+  case "${1:-}" in
+    show)
+      token="$(license_key_from_values "$vals")"
+      [[ -n "$token" ]] || { info "no licence on this box: a single organisation only."; return 0; }
+      license_describe "$token"; return 0 ;;
+    set) ;;
+    *) die "usage: update.sh license set <token|-> | license show" ;;
+  esac
+  [[ -n "$token" ]] || die "usage: update.sh license set <token|->  (- reads the token on stdin)"
+  if [[ "$token" == "-" ]]; then token="$(head -1 | tr -d '[:space:]')"; fi
+  license_key_sane "$token" || die "not a licence token (expected a JWT: three base64url segments)."
+  [[ "$(jwt_field "$token" scope)" == "instance" ]] \
+    || die "not an instance licence (scope \"instance\") — an organisation licence is pasted in the app's Licence page, not here."
+  require_cluster_tools
+  read_current_state
+  if [[ -z "$cur_app" ]] || ver_gt "$LICENSE_MIN_APP" "$cur_app"; then
+    die "app ${cur_app:-unknown} < $LICENSE_MIN_APP — apply the update first (sudo $DATA_DIR/update.sh apply): on an older app this key would mean unlimited organisations with OPEN sign-up."
+  fi
+  [[ -n "$cur_chart" ]] || die "could not read the installed chart version — is the cluster up?"
+  log "Installing the instance licence"
+  license_describe "$token"
+  license_write_values "$vals" "$token"
+  info "values.yaml updated (secrets.LICENSE_KEY)"
+  # The Secret only reaches the app through a helm roll; the app reads
+  # LICENSE_KEY at start, so its pods are restarted on the new Secret.
+  extra_vals=()
+  UPDATE_SOURCE="${UPDATE_SOURCE:-online}"
+  roll_release "$cur_chart"
+  local app_deploy
+  app_deploy="$(kc -n "$NAMESPACE" get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.template.spec.containers[*].image}{"\n"}{end}' 2>/dev/null \
+    | awk '/suite-366:/ {print $1; exit}' || true)"
+  if [[ -n "$app_deploy" ]]; then
+    kc -n "$NAMESPACE" rollout restart "deploy/$app_deploy" >/dev/null 2>&1 || true
+    kc -n "$NAMESPACE" rollout status "deploy/$app_deploy" --timeout=5m >/dev/null 2>&1 || warn "the app is still restarting — check: sudo k3s kubectl -n $NAMESPACE get pods"
+  fi
+  log "Licence installed — the appliance administrators can now create organisations from the app (Appliance → Organisations)."
+}
+
 require_cluster_tools() {
   have helm || die "helm not found."
   have k3s  || die "k3s not found."
@@ -1974,7 +2096,10 @@ case "$MODE" in
   install-units)
     install_units
     ;;
+  license)
+    do_license "${2:-}" "${3:-}"
+    ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show)"
     ;;
 esac

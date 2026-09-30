@@ -223,7 +223,8 @@ ensure_key() { # ensure_key REQUESTED_BY
   chown "root:$APP_GID" "$REVEAL_FILE" 2>/dev/null || true
   chmod 0640 "$REVEAL_FILE"
   log "Repository key generated (requested by ${1:-unknown})"
-  warn "It is shown ONCE, in the app, and stored nowhere else. Without it the"
+  warn "It is shown ONCE, in the app, to the appliance administrators, and stored"
+  warn "  nowhere else (it decrypts EVERY organisation's data). Without it the"
   warn "  backups cannot be read — not by the customer, not by us."
   return 0
 }
@@ -1087,8 +1088,8 @@ SQL
   mapfile -t klist < <(awk '/^k=/ {print substr($0, 3)}' <<<"$raw")
   if (( ${#klist[@]} == 0 )); then
     warn "no vLLM provider row on this box yet — nothing to verify."
-    warn "  The app seeds it ONCE, at the first organization creation. Until"
-    warn "  then there is nothing that can be stale."
+    warn "  The app seeds one per organization, at its creation. Until the"
+    warn "  first exists there is nothing that can be stale."
     VLLM_DB_VERIFIED=norow
     return 0
   fi

@@ -11,9 +11,11 @@
 #   4. the chart's Secret -> the app's env
 #   5. Postgres "AIProvider".config->>'apiKey'
 #
-# The app seeds (5) ONCE, at the first organization creation, out of (4) — see
-# suite-366 serveur/src/lib/ai-providers/vllm-provider.ts:24-54 — with a plain
-# `create` and no upsert, and it never re-reads its environment afterwards. Its
+# The app seeds (5) at EACH organization creation — one row per organization,
+# out of (4) — see suite-366 serveur/src/lib/ai-providers/vllm-provider.ts —
+# with a plain `create` and no upsert, and it never re-reads its environment
+# afterwards (a box hosting several organizations has several rows; the SQL
+# below covers them all, and so does the app's own reconcile at boot). Its
 # resolver then PREFERS that row over the env fallback. So a key that changes
 # anywhere in 1-4 leaves (5) stale and every LLM call in the app returns 401
 # while `docker ps` says Up (healthy), every pod is Running, and the app's own
@@ -236,8 +238,8 @@ SQL
   mapfile -t klist < <(awk '/^k=/ {print substr($0, 3)}' <<<"$raw")
   if (( ${#klist[@]} == 0 )); then
     warn "no vLLM provider row on this box yet — nothing to verify."
-    warn "  The app seeds it ONCE, at the first organization creation. Until"
-    warn "  then there is nothing that can be stale."
+    warn "  The app seeds one per organization, at its creation. Until the"
+    warn "  first exists there is nothing that can be stale."
     VLLM_DB_VERIFIED=norow
     return 0
   fi

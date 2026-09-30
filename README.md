@@ -99,7 +99,8 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_MODE` | `local-ca` | `local-ca` (self-signed, cert-manager) or `provided` (you supply the certificates) |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
-| `ADMIN_EMAIL` | `admin@<DOMAIN>` | admin email |
+| `ADMIN_EMAIL` | `admin@<DOMAIN>` | the appliance administrator: the only account allowed to register the first organisation (cf. § Licensing and several organisations) |
+| `LICENSE_KEY` | empty | optional instance licence (EdDSA JWT, scope `instance`): several organisations, seats pooled. A secret, kept across re-runs |
 | `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
@@ -419,7 +420,7 @@ else is resident when it profiles, and Gemma measured 222k tokens of KV with the
 transcription engine up during its start against ~300k without — and bring it
 back once the new engine is healthy; the nginx route resolves it per request and
 simply answers 502 while it is absent. In the app the model is an `AIModel` row with `supportsTranscription`
-and the organisation's default; a switch to a profile without one disables the
+and each organisation's default; a switch to a profile without one disables the
 row and clears the default, so the UI says "no transcription model configured"
 instead of failing on a route nothing serves. `LLM_STT_MODEL=` (empty) at
 install turns it off for a box that needs the memory elsewhere.
@@ -503,9 +504,11 @@ Embedding and vision skip Anthropic; vision uses `VLLM_MODEL_VISION`
 its vision tower in BF16).
 
 The app seeds the model ids into Postgres when an organisation is created
-(`AIProvider` + `AIModel` rows) and agents store the id again in `Agent.model`.
-Changing `LLM_MODEL` on an installed box therefore also means updating those
-rows — the env vars only drive new organisations and the env fallback.
+(`AIProvider` + `AIModel` rows — one provider row per organisation) and agents
+store the id again in `Agent.model`. Changing `LLM_MODEL` on an installed box
+therefore also means updating those rows, in every organisation — `lib/vllm-db.sh`
+and `switch-model.sh` do, for the rows that are the box's own; the env vars only
+drive new organisations and the env fallback.
 
 ### Why an nginx proxy
 
@@ -548,10 +551,10 @@ an LLM call works:
 | 2 | the containers' environment | docker compose | vLLM — this is the copy that **validates** a request |
 | 3 | `/opt/suite366/values.yaml` | `deploy_suite` | helm |
 | 4 | the chart's Secret -> the app's env | the chart | the app, **at seed time only** |
-| 5 | Postgres `"AIProvider".config->>'apiKey'` | the app, at the first organization creation | **every LLM call** |
+| 5 | Postgres `"AIProvider".config->>'apiKey'` | the app, at each organization's creation (one row per organization) | **every LLM call** |
 
-The app seeds (5) out of (4) once, when the first organization is created, and
-never re-reads its environment; its resolver then prefers that row over the
+The app seeds (5) out of (4) when an organization is created — one row per
+organization — and never re-reads its environment; its resolver then prefers that row over the
 environment fallback. So a key that changes anywhere in 1-4 leaves (5) stale and
 **every LLM call returns 401 while `docker ps` says `Up (healthy)`, every pod is
 `Running`, and the app's own provider health check says HEALTHY** — it writes
@@ -664,8 +667,9 @@ ordering guarantees are covered by `tools/test-backup.sh`; the live cluster
 interactions are **not yet exercised on real hardware**, because doing so means
 destroying a running appliance. Prefer `--target` if you have never run it.
 
-Turn it on **from the admin UI** — *Settings → Organisation → Backups* — which
-is the intended route: it sets the destination, tests it immediately, and shows
+Turn it on **from the admin UI** — *Appliance → Backups*, appliance
+administrators only (box-wide: one repository, one key, every organisation's
+data) — which is the intended route: it sets the destination, tests it immediately, and shows
 the last run, the snapshots and the key fingerprint without anyone opening a
 shell. The page can ask for a destination but can never read the stored
 credentials back: `backup.env` is 0600 and owned by root, so an empty secret
@@ -770,8 +774,8 @@ definition changed, reloads the proxy, rewrites the systemd units, publishes
 The installer arms a **daily systemd timer** (`suite366-update.timer`) that
 polls a **channel manifest** ([`channel.json`](channel.json) in this repo) and
 **notifies** when a newer chart, app release or vLLM image is published. It
-never applies an upgrade on its own — an **org admin applies it from the app
-UI** (Settings → Organization → System update), or over SSH:
+never applies an upgrade on its own — an **appliance administrator applies it
+from the app UI** (Appliance → System update), or over SSH:
 
 ```bash
 sudo /opt/suite366/update.sh check    # what the timer runs: compare + notify
@@ -999,6 +1003,63 @@ sudo systemctl restart suite366-vllm
 The k3s service, mDNS unit, and the chart workload (Postgres/MinIO/etc. PVCs
 on `local-path`) all survive reboots without manual intervention once CDI is
 persistent.
+
+## Licensing and several organisations
+
+A box belongs to **one customer**, who may run **several organisations** on it
+(subsidiaries, departments): each has its own data, members, SSO and settings,
+isolated by the application exactly as on the cloud — one database, one bucket,
+one vLLM, one backup set underneath. What is about the *machine* rather than an
+organisation (system update, model switch, backups and their key, publication,
+support windows, creating organisations) belongs to the customer's **appliance
+administrators**: a per-user role the app grants to whoever registers the first
+organisation, then manages from *Appliance → Administrators*. Free sign-up never
+creates an organisation on a box that already has one.
+
+How many organisations the box may host is decided by an **instance licence**:
+an EdDSA JWT with `scope: "instance"`, issued off-box by the owner with the
+app's generator and installed as `LICENSE_KEY`. Without one the app hosts a
+single organisation. With one, `limits.maxOrganizations` caps them (`--max-orgs`;
+absent = unlimited) and the **seats are pooled across the box**: a user counts
+once, at their highest role, however many organisations they belong to.
+
+Issue a token (owner side — the private key never reaches a box):
+
+```bash
+cd suite-366/serveur
+npx tsx scripts/generate-license.ts --offline --instance \
+  --private-key-file ~/.secrets/license-issuer.pem \
+  --licensee "Acme (spark-abc123)" --type custom --max-orgs 3 --included-seats 40 --days 3650
+```
+
+Install it — at install time (`LICENSE_KEY="$(cat acme.jwt)" sudo -E ./install.sh`,
+kept across re-runs), or on a running box:
+
+```bash
+sudo /opt/suite366/update.sh license set -     # token on stdin: never in argv or history
+sudo /opt/suite366/update.sh license show
+```
+
+Both refuse a token that is not an instance licence, and refuse ANY token while
+the app is older than `LICENSE_MIN_APP` (`lib/config.sh`): on an older app a
+licence means unlimited organisations with open sign-up on the LAN. `license set`
+needs the chart reachable (online, or a staged USB package): it rewrites
+`values.yaml` and rolls the release so the Secret reaches the app. The token is
+a secret — it licenses any box that trusts the public key — and sits in
+`values.yaml` (0600) and in the backup set (encrypted).
+
+Two consequences to say out loud to a customer:
+
+- backup and restore are **whole-box** (one repository, one key, every
+  organisation); there is no per-organisation restore, and the repository key
+  is shown once, to the appliance administrators;
+- the workbench pods are capped per organisation (`sandbox.workbench.limits.maxPerOrg`,
+  8 of the box's 10) so one organisation cannot take every slot.
+
+`ADMIN_EMAIL` (→ `APPLIANCE_ADMIN_EMAIL`) closes the last hole: only that account
+may register the first organisation on a LAN-exposed box. Ship the app release
+that carries the gate before provisioning any token (`update.sh check` shows the
+app version).
 
 ## Security posture
 

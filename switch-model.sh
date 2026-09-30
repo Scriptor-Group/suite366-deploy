@@ -18,7 +18,7 @@
 # LLM_P_STT_MODEL), served by a third container on /v1/audio/*. It follows the
 # same three places: STT_MODEL and COMPOSE_PROFILES in .env, the chart's
 # VLLM_MODEL_TRANSCRIPTION, and an "AIModel" row with supportsTranscription that
-# is the organisation's default. A profile without one takes the container
+# is each organisation's default. A profile without one takes the container
 # down BEFORE the new generative engine starts (it holds memory the bigger
 # model may need) and clears the rows, so the app says "no transcription model"
 # instead of calling a route nothing serves.
@@ -587,23 +587,29 @@ build_sql() {
 \set base_like '$base_like'
 SELECT CASE WHEN to_regclass('"public"."AIModel"') IS NULL THEN 'off' ELSE 'on' END AS have_ai \gset
 \if :have_ai
-WITH m AS (
+WITH ours AS (
+  -- The rows this box owns, in EVERY organisation it hosts: the app's own
+  -- seed, a seed without a base URL, or a row already pointing here. A remote
+  -- vLLM an org admin registered on purpose is not ours, and is never renamed.
+  SELECT id, "organizationId" FROM "public"."AIProvider"
+   WHERE provider = 'VLLM'
+     AND (name = 'vLLM Local' OR config->>'baseUrl' IS NULL OR config->>'baseUrl' LIKE :'base_like')
+), m AS (
   -- The transcription row is modelType LLM too (the app has no STT type; the
   -- flag is what distinguishes it): without the exclusion this rename hits it
   -- on the second run and dies on the (providerId, modelId) unique key.
   UPDATE "public"."AIModel" SET "modelId" = :'model', "displayName" = :'model', "contextWindow" = :ctx
    WHERE "modelType" = 'LLM' AND "supportsTranscription" = false
-     AND "providerId" IN (SELECT id FROM "public"."AIProvider" WHERE provider = 'VLLM')
+     AND "providerId" IN (SELECT id FROM ours)
      AND ("modelId" IS DISTINCT FROM :'model' OR "contextWindow" IS DISTINCT FROM :ctx)
   RETURNING 1
 ), a AS (
+  -- Profile names are box-wide, but an organisation whose only vLLM is a
+  -- remote one it registered itself keeps its agents; NULL = system agents.
   UPDATE "public"."Agent" SET model = :'model'
    WHERE model IN ($models_in) AND model IS DISTINCT FROM :'model'
+     AND ("organizationId" IS NULL OR "organizationId" IN (SELECT "organizationId" FROM ours))
   RETURNING 1
-), ours AS (
-  SELECT id, "organizationId" FROM "public"."AIProvider"
-   WHERE provider = 'VLLM'
-     AND (name = 'vLLM Local' OR config->>'baseUrl' IS NULL OR config->>'baseUrl' LIKE :'base_like')
 ), s_on AS (
   -- The transcription row for this profile, created or re-enabled. Prisma
   -- generates ids client-side, so the insert has to bring its own.
@@ -624,7 +630,7 @@ WITH m AS (
      AND "modelId" IS DISTINCT FROM :'stt'
   RETURNING id
 ), o_set AS (
-  -- The organisation's default, when it is unset or was one of ours. A default
+  -- Each organisation's default, when it is unset or was one of ours. A default
   -- an admin pointed at another provider (BYO Whisper, a system model) is kept.
   UPDATE "public"."Organization" org SET "defaultTranscriptionModelId" = s.id
     FROM s_on s JOIN ours p ON p.id = s."providerId"

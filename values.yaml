@@ -54,6 +54,12 @@ migrations:
 # so chooseDefaultModel() can authenticate against the local nginx proxy.
 secrets:
   VLLM_API_KEY: "@VLLM_API_KEY@"
+  # Instance licence (EdDSA JWT, scope "instance" — README "Licensing and
+  # several organisations"). EMPTY = unlicensed: the app hosts ONE
+  # organisation. A SECRET: the same token licenses any box that trusts
+  # LICENSE_PUBLIC_KEY. Survives re-runs (lib/preflight.sh reads it back);
+  # install or rotate it later with `update.sh license set -`.
+  LICENSE_KEY: "@LICENSE_KEY@"
 
 config:
   NODE_ENV: "production"
@@ -95,7 +101,7 @@ config:
   # memory for it. EMPTY when the active profile has none: the app then says
   # "no transcription model configured" instead of calling a route nothing
   # serves. The app seeds it as an AIModel row with supportsTranscription and
-  # makes it the organisation's default; switch-model.sh keeps the rows in
+  # makes it each organisation's default; switch-model.sh keeps the rows in
   # step with this value on every switch.
   VLLM_MODEL_TRANSCRIPTION: "@STT_MODEL@"
   VLLM_EMBEDDING_DIMENSIONS: "@VLLM_EMBEDDING_DIMENSIONS@"
@@ -110,9 +116,16 @@ config:
   # (Devana) — see suite-366 serveur/LICENSE-GENERATION.md. install.sh
   # substitutes @LICENSE_PUBLIC_KEY@ (default baked in, override via the
   # LICENSE_PUBLIC_KEY env var). The \n escapes become real PEM newlines once
-  # YAML parses this double-quoted scalar. To actually unlock multi-org /
-  # paid limits, also set a signed LICENSE_KEY (issued against your org id).
+  # YAML parses this double-quoted scalar. Several organisations and the
+  # box-wide seat pool come from `secrets.LICENSE_KEY` above — an
+  # INSTANCE-scoped token, not an organisation licence.
   LICENSE_PUBLIC_KEY: "@LICENSE_PUBLIC_KEY@"
+  # Only this account may register the FIRST organisation (the bootstrap of a
+  # LAN-exposed box); it becomes the appliance administrator, and only
+  # appliance administrators create further organisations, from the app.
+  # update.sh does NOT add this to older boxes: their first organisation
+  # already exists.
+  APPLIANCE_ADMIN_EMAIL: "@ADMIN_EMAIL@"
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com
   # SMTP_PORT: "587"
@@ -384,6 +397,11 @@ sandbox:
     # Quoted for the same reason as sandbox.limits.idleTimeoutMs above.
     limits:
       idleStopMs: "7200000"
+      # Plusieurs organisations sur une box : sans borne, une seule peut
+      # prendre les 10 pods du quota ci-dessous. 8 laisse une box mono-org
+      # quasi intacte (elle en perd deux) tout en garantissant qu'une org ne
+      # bloque jamais les autres.
+      maxPerOrg: "8"
     resourceQuota:
       # Un seul GB10 : borné plus bas que les défauts du chart.
       pods: "10"

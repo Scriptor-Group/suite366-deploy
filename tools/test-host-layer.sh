@@ -213,6 +213,9 @@ JULY="$WORK/july"; mkdir -p "$JULY/llm"
 cat > "$JULY/values.yaml" <<'Y'
 image:
   tag: "1.8.22"
+secrets:
+  VLLM_API_KEY: "sk-x"
+  LICENSE_KEY: "eyJa.eyJb.c"
 config:
   NODE_ENV: "production"
   VLLM_BASE_URL: "http://10.99.0.1:8000/v1"
@@ -251,6 +254,13 @@ contains "juillet : hostPath sous DATA_DIR"           "$V" "path: $JULY/llm-stat
 contains "juillet : VLLM_MODEL_TRANSCRIPTION = celle du profil (Gemma en a une depuis le 25/09)" "$V" 'VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
 # Insérée dans le bloc config, juste après l'embedding, pas en fin de fichier.
 check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
+# La licence d'instance et la clé vLLM sont sous secrets: et n'y bougent pas ;
+# APPLIANCE_ADMIN_EMAIL n'est JAMAIS ajouté à une box qui a déjà sa première
+# organisation (il ne gate que l'amorçage d'une box vierge).
+contains "juillet : LICENSE_KEY conservé sous secrets"       "$V" 'LICENSE_KEY: "eyJa.eyJb.c"'
+contains "juillet : VLLM_API_KEY conservé sous secrets"      "$V" 'VLLM_API_KEY: "sk-x"'
+absent   "juillet : APPLIANCE_ADMIN_EMAIL non ajouté (la première organisation existe)" "$V" "APPLIANCE_ADMIN_EMAIL"
+contains "juillet : workbench borné par organisation (gabarit)" "$V" '      maxPerOrg: "8"'
 for d in updates support backup remote llm-state; do [[ -d "$JULY/$d" ]] || ko "répertoire de pont $d créé"; done; ok "répertoires de pont créés"
 # Le workbench : le bloc entier, épinglé sur la version d'app installée, sous sandbox.
 contains "juillet : bloc workbench ajouté"           "$V" "  workbench:"
@@ -264,7 +274,7 @@ check    "juillet : un seul bloc limits sous sandbox"       "$(grep -c '^  limit
 check "juillet : le bloc suit runnerImage, sous sandbox" "$(grep -A1 'suite-366-sandbox-runner' "$JULY/values.yaml" | tail -1)" "  workbench:"
 absent "juillet : l'ingress qui suit n'a pas bougé de place" "$(sed -n '/^ingress:/,$p' "$JULY/values.yaml")" "workbench"
 if python3 -c "import yaml" 2>/dev/null; then
-  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5; assert d['sandbox']['workbench']['enabled'] is True and d['sandbox']['workbench']['resourceQuota']['pods']=='10' and d['sandbox']['enabled'] is True; assert d['sandbox']['limits']['idleTimeoutMs']=='1800000' and d['sandbox']['workbench']['limits']['idleStopMs']=='7200000'" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes"; else ko "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes"; fi
+  if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert len(d['extraEnv'])==5 and len(d['extraVolumes'])==5 and len(d['extraVolumeMounts'])==5; assert d['sandbox']['workbench']['enabled'] is True and d['sandbox']['workbench']['resourceQuota']['pods']=='10' and d['sandbox']['enabled'] is True; assert d['sandbox']['limits']['idleTimeoutMs']=='1800000' and d['sandbox']['workbench']['limits']['idleStopMs']=='7200000' and d['sandbox']['workbench']['limits']['maxPerOrg']=='8'; assert d['secrets']['LICENSE_KEY']=='eyJa.eyJb.c'" "$JULY/values.yaml" 2>/dev/null; then ok "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes, licence intacte"; else ko "juillet : YAML valide, 5 ponts par liste, workbench sous sandbox, délais en chaînes, licence intacte"; fi
 else
   ok "juillet : (PyYAML absent — validation structurelle sautée)"
 fi
