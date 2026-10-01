@@ -46,6 +46,9 @@ export VLLM_EMBEDDING_DIMENSIONS=1024 VLLM_MAX_CONTEXT_WINDOW=8192
 export SANDBOX_NAMESPACE=sandbox DATA_DIR=/opt/suite366
 export cert_annotation='suite366.ai/tls-mode: "pushed"' turn_cert_manager=false
 export lpk_esc=PUBKEY
+# Instance licence + appliance administrator: both deliberately non-default
+# too. The token is a forged three-segment shape, never verified here.
+export LICENSE_KEY=eyJhbGciOiJFZERTQSJ9.eyJzY29wZSI6Imluc3RhbmNlIn0.c2ln ADMIN_EMAIL=ops@acme.example
 
 # `fetch` is how install.sh reads a shipped file; in the test it is the repo.
 fetch() { cat "$REPO/$1"; }
@@ -85,6 +88,22 @@ grep -q '#@local$' "$WORK/plain.yaml" && ko "no marker survives" || ok "no marke
 grep -q 'APPLIANCE_ORIGINS' "$WORK/plain.yaml" \
   && ko "APPLIANCE_ORIGINS is absent (the app keeps its single canonical origin)" \
   || ok "APPLIANCE_ORIGINS is absent (the app keeps its single canonical origin)"
+grep -q '^  LICENSE_KEY: "eyJhbGciOiJFZERTQSJ9.eyJzY29wZSI6Imluc3RhbmNlIn0.c2ln"$' "$WORK/plain.yaml" \
+  && ok "the instance licence lands under secrets:" || ko "the instance licence lands under secrets:"
+grep -q '^  APPLIANCE_ADMIN_EMAIL: "ops@acme.example"$' "$WORK/plain.yaml" \
+  && ok "the appliance administrator lands under config:" || ko "the appliance administrator lands under config:"
+if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert d['secrets']['LICENSE_KEY'].startswith('eyJ') and d['secrets']['VLLM_API_KEY']=='sk-test'; assert d['config']['APPLIANCE_ADMIN_EMAIL']=='ops@acme.example'; assert d['sandbox']['workbench']['limits']['maxPerOrg']=='8'" "$WORK/plain.yaml" 2>/dev/null; then
+  ok "YAML: licence and VLLM key both under secrets, admin under config, workbench capped per org (quoted)"
+else
+  ko "YAML: licence and VLLM key both under secrets, admin under config, workbench capped per org (quoted)"
+fi
+# An unlicensed box renders an EMPTY value, not a missing key or a broken file:
+# the app's trim() reads "" as "no licence", and the daily converge never has
+# to add the line later.
+( export LICENSE_KEY=""; render 0 "$WORK/unlicensed.yaml" )
+grep -q '^  LICENSE_KEY: ""$' "$WORK/unlicensed.yaml" \
+  && ok "an unlicensed box renders an empty LICENSE_KEY (valid YAML, nothing to add later)" \
+  || ko "an unlicensed box renders an empty LICENSE_KEY (valid YAML, nothing to add later)"
 # Byte-for-byte against a checked-in golden, captured from the render that
 # predates the dual-name work. Not a diff against HEAD: that stops being a
 # comparison the moment this lands. A legitimate change to values.yaml has to

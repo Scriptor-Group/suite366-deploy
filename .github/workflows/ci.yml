@@ -60,10 +60,16 @@ jobs:
         run: ./tools/test-local-certs.sh
       # Four days in production: 100% of LLM calls returning 401 while
       # `docker ps` said Up (healthy) and every pod was Running, because the
-      # key the app actually uses lives in a jsonb column written once, at
-      # organization creation, and never re-read.
+      # key the app actually uses lives in a jsonb column written at
+      # organization creation (one row per organization) and never re-read.
       - name: vLLM provider key reconcile + verify self-test
         run: ./tools/test-vllm-db.sh
+      # A LICENSE_KEY on an app older than the org-creation gate means unlimited
+      # organisations with open sign-up on the LAN: both entry points (install
+      # re-run, `update.sh license set`) must refuse it, keep it across re-runs,
+      # and never let it reach a shell or helm argv.
+      - name: Instance licence provisioning self-test
+        run: ./tools/test-license.sh
       # A reboot moved /dev/nvidia-uvm from major 497 to 498. The CDI spec still
       # said 497, so every GPU container got a node on the wrong char device:
       # nvidia-smi fine everywhere, torch.cuda.init() dead, vLLM crash-looping

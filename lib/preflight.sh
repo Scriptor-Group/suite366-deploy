@@ -448,11 +448,22 @@ cert_covers_host() { # cert_covers_host CERT HOST
   return 1
 }
 
+# The instance licence already on the box, or nothing. Anchored at the start
+# of the line so it never matches LICENSE_PUBLIC_KEY nor the comments that
+# mention LICENSE_KEY. Extractable by the tests (sed on the function name).
+license_key_from_values() { # license_key_from_values FILE -> token or nothing
+  sed -n 's/^ *LICENSE_KEY: *"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
 # --- Gather parameters -------------------------------------------------------
 gather_inputs() {
   log "Configuration"
   gather_hosts
-  ask ADMIN_EMAIL  "Admin email"  "admin@$DOMAIN"
+  # The ONLY account allowed to register the FIRST organisation of the box
+  # (the app reads it as APPLIANCE_ADMIN_EMAIL); it becomes the appliance
+  # administrator, and only appliance administrators create organisations
+  # after that. Without it, the first person to reach /register on the LAN is.
+  ask ADMIN_EMAIL  "Appliance administrator e-mail (the only account allowed to create the first organisation)"  "admin@$DOMAIN"
   echo
   # Model ids are still written into values.yaml (the app advertises them, even
   # when the local vLLM backend isn't deployed), so we ask for them regardless.
@@ -481,6 +492,24 @@ gather_inputs() {
     VLLM_API_KEY="$(sed -n 's/.*VLLM_API_KEY: *"\(sk-[^"]*\)".*/\1/p' "$DATA_DIR/values.yaml" | head -1)"
   fi
   VLLM_API_KEY="${VLLM_API_KEY:-sk-$(head -c24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c32)}"
+
+  # Same idempotence for the instance licence: an explicit env wins, else the
+  # token already in values.yaml is kept — a re-run must never un-license a box.
+  # Validated for SHAPE and SCOPE only (the app verifies the signature): a token
+  # on an app older than LICENSE_MIN_APP would open sign-up to the whole LAN.
+  if [[ -z "${LICENSE_KEY:-}" && -f "$DATA_DIR/values.yaml" ]]; then
+    LICENSE_KEY="$(license_key_from_values "$DATA_DIR/values.yaml")"
+  fi
+  if [[ -n "$LICENSE_KEY" ]]; then
+    license_key_sane "$LICENSE_KEY" || die "LICENSE_KEY is not a JWT (three base64url segments)."
+    [[ "$(jwt_field "$LICENSE_KEY" scope)" == "instance" ]] \
+      || die "LICENSE_KEY is not an instance licence (scope \"instance\") — an organisation licence is pasted in the app's Licence page, not here."
+    local _tag
+    _tag="$(fetch values.yaml | sed -n 's/^  tag: "\(.*\)"/\1/p' | head -1)"
+    if [[ -n "$_tag" && "$(printf '%s\n%s\n' "$LICENSE_MIN_APP" "$_tag" | sort -V | head -1)" != "$LICENSE_MIN_APP" ]]; then
+      die "LICENSE_KEY needs app >= $LICENSE_MIN_APP (this template pins $_tag): on an older app the key means unlimited organisations with OPEN sign-up."
+    fi
+  fi
   # Bash `set -e` + `[[ test ]] && cmd` as the last statement of a function
   # propagates the exit code of `[[ test ]]`: if false, the function returns 1
   # and the script dies silently. We use `if/fi` (plus a final `:`).

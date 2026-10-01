@@ -56,8 +56,8 @@ deploy_suite() {
     cert_annotation="cert-manager.io/cluster-issuer: \"$CLUSTER_ISSUER\""
     turn_cert_manager=true
   fi
-  # values.yaml carries `secrets.VLLM_API_KEY` in clear and feeds it
-  # to Helm — write it under a restrictive umask so the rendered file lands
+  # values.yaml carries `secrets.VLLM_API_KEY` and `secrets.LICENSE_KEY` in
+  # clear and feeds them to Helm — write it under a restrictive umask so the rendered file lands
   # at 0600 (root-only), and follow with an explicit chmod as belt-and-braces
   # in case umask was inherited from elsewhere.
   ( umask 077
@@ -92,6 +92,8 @@ deploy_suite() {
             -e "s|@VLLM_EMBEDDING_DIMENSIONS@|$VLLM_EMBEDDING_DIMENSIONS|g" \
             -e "s|@VLLM_MAX_CONTEXT_WINDOW@|$VLLM_MAX_CONTEXT_WINDOW|g" \
             -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
+            -e "s|@LICENSE_KEY@|$LICENSE_KEY|g" \
+            -e "s|@ADMIN_EMAIL@|$ADMIN_EMAIL|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
             -e "s|@DATA_DIR@|$DATA_DIR|g" \
         > "$vals" )

@@ -49,8 +49,10 @@ OnlyOffice PVC (cache), workbench PVCs (per-user scratch, can be hundreds of
 GiB), and `models/` (~33 GiB of public weights, re-downloadable).
 
 Consequence to say out loud to a customer: **a restore loses in-flight sessions
-and workbench scratch space.** Documents, users, organisations, chats and
-provider configuration all come back.
+and workbench scratch space.** Documents, users, **every organisation on the
+box**, chats and provider configuration all come back — backup and restore are
+whole-box; there is no per-organisation restore. A box rebuilt with `--target`
+needs its `LICENSE_KEY` again (values.yaml is not restored).
 
 ---
 

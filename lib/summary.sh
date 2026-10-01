@@ -12,7 +12,7 @@ summary() {
   case "${VLLM_DB_VERIFIED:-unknown}" in
     ok)      db_line="verified — vLLM accepted it on /v1/models, chat and embeddings" ;;
     stale)   db_line="!! STALE — every LLM call in the app will return 401 (see the error below)" ;;
-    norow)   db_line="not created yet (no organization) — nothing to verify" ;;
+    norow)   db_line="not created yet (no organisation on the box) — nothing to verify" ;;
     notable) db_line="no AIProvider table yet (the app's migrations have not run)" ;;
     skipped) db_line="not verified (SKIP_VLLM)" ;;
     *)       db_line="NOT verified — vLLM did not answer; the models may still be loading" ;;
@@ -164,6 +164,25 @@ AI
                      sudo $DATA_DIR/backup.sh init && sudo $DATA_DIR/backup.sh run"
   fi
 
+  # The licence decides how many organisations the box may host and pools the
+  # seats across them; its ABSENCE is the common case on a fresh box and is
+  # said plainly rather than left for the first "cannot create organisation".
+  local lic_block first_block
+  if [[ -n "${LICENSE_KEY:-}" ]]; then
+    lic_block=" Licence         : $(jwt_field "$LICENSE_KEY" licensee) — up to $(jwt_field "$LICENSE_KEY" maxOrganizations | sed 's/^-1$/unlimited/;s/^$/unlimited/') organisations,
+                   $(jwt_field "$LICENSE_KEY" includedSeats | sed 's/^-1$/unlimited/;s/^$/?/') seats pooled across the box,
+                   expires $(date -u -d "@$(jwt_field "$LICENSE_KEY" exp)" '+%Y-%m-%d' 2>/dev/null || echo '?') (jti $(jwt_field "$LICENSE_KEY" jti)).
+                   Rotate   : sudo $DATA_DIR/update.sh license set -"
+  else
+    lic_block=" Licence         : NONE — this box hosts a SINGLE organisation.
+                   To license it: sudo $DATA_DIR/update.sh license set -
+                   (token from the owner, README \"Licensing and several organisations\")"
+  fi
+  first_block=" First sign-in   : only $ADMIN_EMAIL may register the first organisation
+                   (APPLIANCE_ADMIN_EMAIL); that account becomes the appliance
+                   administrator. Update, model, backups, publication and support
+                   windows are box-wide and reserved to that role."
+
   cat <<EOF
 
 $(printf "${c_g}========================================================================${c_0}")
@@ -187,6 +206,8 @@ $dns_block
                    LAN IP via Traefik$( [[ -n "$mdns_on" ]] && printf ' + dynamic mDNS' ).
  systemd services: suite366-net, suite366-vllm$( [[ -n "$mdns_on" ]] && printf ', suite366-avahi-aliases' ), k3s
 $backup_block
+$lic_block
+$first_block
  Updates         : checked daily (suite366-update.timer, notify-only).
                    Check now : sudo $DATA_DIR/update.sh check
                    Apply     : sudo $DATA_DIR/update.sh apply

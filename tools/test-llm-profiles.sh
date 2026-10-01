@@ -243,6 +243,13 @@ contains "dry-run : image de base, pas de build" "$d" "VLLM_LLM_IMAGE=$BASE"
 contains "dry-run : contexte annoncé à l'app"   "$d" "VLLM_MAX_CONTEXT_WINDOW -> 200000"
 contains "dry-run : cible la ligne AIModel LLM" "$d" -- '"modelType" = '"'"'LLM'"'"
 contains "dry-run : borne aux agents des 3 modèles connus" "$d" "'nvidia/Gemma-4-26B-A4B-NVFP4'"
+# Plusieurs organisations sur une box : le renommage ne touche que NOS lignes
+# (un vLLM distant qu'un admin d'org a branché garde son modèle), et les agents
+# suivent l'organisation qui possède une de ces lignes.
+contains "dry-run : le renommage LLM est borné à NOS providers"   "$d" '"providerId" IN (SELECT id FROM ours)'
+absent   "dry-run : plus de renommage sur TOUT provider VLLM"      "$d" "WHERE provider = 'VLLM')"
+contains "dry-run : les agents suivent leur organisation"         "$d" '"organizationId" IN (SELECT "organizationId" FROM ours)'
+contains "dry-run : ours est défini avant d'être lu (CTE non récursive)" "$d" "WITH ours AS ("
 # La ligne d'embedding ne doit JAMAIS être réécrite : elle sert un autre modèle.
 absent "dry-run : ne touche pas l'embedding"    "$d" "Qwen3-VL-Embedding"
 absent "dry-run : ne modifie rien"              "$(cat "$BOX/llm/.env")" "qwen27b"

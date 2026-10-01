@@ -47,7 +47,15 @@
 #                              overrides: {APP,OFFICE,LIVEKIT,TURN}_TLS_*_FILE
 #   TLS_CA_FILE                TLS_MODE=provided: the issuing CA, mounted into
 #                              drive-app so it trusts OnlyOffice server-side
-#   ADMIN_EMAIL                default: admin@<DOMAIN>
+#   ADMIN_EMAIL                the appliance administrator (default
+#                              admin@<DOMAIN>): the ONLY account allowed to
+#                              register the first organisation; only appliance
+#                              administrators create organisations after that.
+#   LICENSE_KEY                optional instance licence (EdDSA JWT, scope
+#                              "instance", issued off-box by the owner). Lets
+#                              the box host several organisations, seats
+#                              pooled. A secret, kept across re-runs; later:
+#                              update.sh license set -
 #   LLM_PROFILE                which generative model to serve: qwen27b
 #                              (default), orcasaq, flash-next or gemma. Each
 #                              carries its own image, memory budget and vLLM

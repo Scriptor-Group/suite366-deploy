@@ -7,8 +7,8 @@
 # incident (15/09/2026: four days of 401 on every LLM call while `docker ps`
 # said Up (healthy) and every pod was Running):
 #
-#  • THE SQL. The row the app reads is written once, at organization creation,
-#    and never re-read. The UPDATE that realigns it must be a no-op when
+#  • THE SQL. The row the app reads is written at organization creation (one
+#    row per organization) and never re-read. The UPDATE that realigns it must be a no-op when
 #    already correct (it runs on every daily check), must CREATE an apiKey the
 #    app omitted, must not be sent at all when the table does not exist, and
 #    must never touch a provider row an admin aimed at another vLLM.
