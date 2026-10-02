@@ -46,7 +46,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 | **k3s** single-node | Traefik (ingress) + local-path (storage) + CoreDNS (k3s defaults) |
 | **vLLM ×2** (Docker host) | generative on `:8001`, embeddings on `:8002`, Blackwell GPU |
 | **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart |
-| **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + MinIO + OnlyOffice + LiveKit/TURN, all in-cluster |
+| **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + S3 object store (RustFS; MinIO on boxes installed before Oct 2026) + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
 | **TLS** | self-signed local CA (cert-manager) by default, or **your own certificates** (`TLS_MODE=provided`) |
@@ -697,7 +697,7 @@ applied with `restic forget --prune` at the end of every run.
 | Tag | Content | Why |
 |---|---|---|
 | `postgres` | `pg_dump -Fc` streamed into restic | a *logical* dump, so it restores into a fresh Postgres whose password differs — the normal case after a reinstall |
-| `minio` | the MinIO PVC directory, **`.minio.sys` excluded** | objects are whole files; MinIO's own IAM is not, and restoring one install's `.minio.sys` over another's root credentials locks you out of the data you just restored |
+| `minio` | the object-store PVC directory, **`.minio.sys` / `.rustfs.sys` excluded** | the object directories are self-contained; the system directory is the install's own IAM and disk identity, and restoring one install's over another's root credentials locks you out of the data you just restored |
 | `config` | `/opt/suite366` minus `models/` | `values.yaml`, `llm/.env`, `update.env`, the local CA. The 33+ GiB of model weights re-download |
 | `secrets` | `secret-<app>` and the cert-manager CA secret | see below — this is what decides whether a restore works at all |
 

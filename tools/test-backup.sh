@@ -8,7 +8,7 @@
 # What it actually proves, i.e. the failures worth a test:
 #   • an unconfigured box reports "unconfigured" and exits 0, so a timer on a
 #     box with no destination is not permanently red;
-#   • the MinIO snapshot EXCLUDES .minio.sys — restoring one install's IAM over
+#   • the MinIO snapshot EXCLUDES .minio.sys and .rustfs.sys — restoring one install's IAM over
 #     another's root credentials locks you out of the data you just restored;
 #   • the config snapshot excludes models/, bin/ and the WHOLE backup
 #     directory — naming its sensitive files one by one is how backup.env (S3
@@ -48,9 +48,10 @@ absent()   { if grep -qF -- "$2" <<<"$3"; then ko "$1" "unexpectedly found '$2'"
 # --- stubs --------------------------------------------------------------------
 BIN="$WORK/bin"; mkdir -p "$BIN"
 RLOG="$WORK/restic.log"; : > "$RLOG"
-MINIO_DATA="$WORK/minio"; mkdir -p "$MINIO_DATA/.minio.sys" "$MINIO_DATA/suite-366"
+MINIO_DATA="$WORK/minio"; mkdir -p "$MINIO_DATA/.minio.sys" "$MINIO_DATA/.rustfs.sys" "$MINIO_DATA/suite-366"
 echo object > "$MINIO_DATA/suite-366/file.bin"
 echo iam    > "$MINIO_DATA/.minio.sys/iam.json"
+echo iam    > "$MINIO_DATA/.rustfs.sys/format.json"
 
 # restic: records every invocation, and answers the few queries backup.sh makes.
 # $WORK/no-repo and $WORK/pg-fails switch the two failure modes under test.
@@ -87,9 +88,10 @@ data:
   NEXTAUTH_SECRET: bGVnYWN5LWtleQ==
   POSTGRES_PASSWORD: c2hvdWxkLW5vdC1iZS1yZXN0b3JlZA==
 YAML
-    mkdir -p "\$tgt/minio/suite-366/doc" "\$tgt/minio/.minio.sys"
+    mkdir -p "\$tgt/minio/suite-366/doc" "\$tgt/minio/.minio.sys" "\$tgt/minio/.rustfs.sys"
     echo restored-object > "\$tgt/minio/suite-366/doc/part.1"
     echo snapshot-iam    > "\$tgt/minio/.minio.sys/iam.json"
+    echo snapshot-iam    > "\$tgt/minio/.rustfs.sys/format.json"
     exit 0 ;;
   *)         exit 0 ;;
 esac
@@ -195,6 +197,7 @@ log="$(cat "$RLOG")"
 contains "postgres arrives as a stdin snapshot"   "--stdin-filename postgres.dump" "$log"
 contains "minio directory is backed up"           "backup $MINIO_DATA" "$log"
 contains "minio EXCLUDES .minio.sys"              "--exclude $MINIO_DATA/.minio.sys" "$log"
+contains "minio EXCLUDES .rustfs.sys"             "--exclude $MINIO_DATA/.rustfs.sys" "$log"
 contains "config snapshot excludes models/"       "--exclude $DATA/models" "$log"
 contains "config snapshot excludes the whole backup dir" "--exclude $BACKUP_DIR" "$log"
 # The three that were actually swept in on a real appliance. Asserted by name
@@ -434,6 +437,7 @@ fi
 # .minio.sys holds THIS install's root credentials. Restoring the snapshot's
 # copy over it locks you out of the objects you just restored.
 check "the live .minio.sys is untouched" "$(cat "$MINIO_DATA/.minio.sys/iam.json")" "iam"
+check "the live .rustfs.sys is untouched" "$(cat "$MINIO_DATA/.rustfs.sys/format.json")" "iam"
 [[ -f "$MINIO_DATA/suite-366/doc/part.1" ]] \
   && ok "objects from the snapshot are restored" || ko "objects from the snapshot are restored"
 # The wording it used to assert ("the only check that proves AUTH_SECRET") was

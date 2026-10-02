@@ -203,9 +203,16 @@ postgres:
 
 minio:
   enabled: true
-  image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z   # pinned (chart default is :latest)
+  # RustFS, not MinIO: MinIO closed every registry to anonymous pulls in
+  # September 2026 (Docker Hub, quay.io, ghcr.io). RustFS is a drop-in for the
+  # chart's MinIO slot — same args, MINIO_ROOT_* and /minio/health/* honoured.
+  # Fresh installs only: a box installed earlier keeps the MinIO pin in its own
+  # values.yaml (update.sh never rewrites it) and its image from the containerd cache.
+  image: rustfs/rustfs:1.0.0
   bucketProvisioner:
-    image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z   # chart default is docker.io/minio/mc, gone from Docker Hub
+    # No `mc` in it: chart >= 0.10.3 falls back to curl SigV4. Same image as the
+    # server, so nothing extra to pull or bundle.
+    image: rustfs/rustfs:1.0.0
   persistence:
     enabled: true
     size: 50Gi

@@ -39,7 +39,7 @@ Each nightly run writes up to five snapshots, tagged `suite366`:
 | Tag | Content | Notes |
 |---|---|---|
 | `postgres` | `pg_dump -Fc` of the whole database | logical, so it restores into a fresh Postgres with a different password |
-| `minio` | the MinIO PVC directory | **`.minio.sys` excluded** — see §4 |
+| `minio` | the MinIO PVC directory (MinIO, or RustFS on boxes installed since Oct 2026) | **`.minio.sys` / `.rustfs.sys` excluded** — see §4 |
 | `config` | `/opt/suite366` minus `models/`, `bin/`, the restic cache and `repo.pass` | `values.yaml`, `llm/.env`, `update.env`, the local CA cert |
 | `secrets` | `secret-<app>` as YAML | **this is what carries `AUTH_SECRET`** |
 | `secrets` | `cert-manager/suite366-local-ca` as YAML | the local CA's *private key* |
@@ -131,7 +131,7 @@ What it does, in this order, because every other order breaks something:
    source box had them, because `encryption.ts` still tries those on decrypt —
    **before** any data lands;
 5. `pg_restore --clean --if-exists`;
-6. **objects**, with MinIO stopped and `.minio.sys` left alone;
+6. **objects**, with MinIO stopped and `.minio.sys` / `.rustfs.sys` left alone;
 7. scale back up, wait for Ready.
 
 Not restored on purpose, and why:
@@ -139,7 +139,7 @@ Not restored on purpose, and why:
 | Not restored | Reason |
 |---|---|
 | `POSTGRES_PASSWORD`, `DATABASE_URL` | the fresh install generated its own and the dump is logical — carrying the old ones over breaks a working stack |
-| `MINIO_*` credentials | same, and `.minio.sys` on disk already matches the fresh ones |
+| `MINIO_*` credentials | same, and `.minio.sys` / `.rustfs.sys` on disk already matches the fresh ones |
 | `values.yaml` | a rebuilt box may legitimately have different hostnames (`HOST_MODE`, TLS). Extracted for reference; copy back by hand if you want it |
 | the local CA | restoring it keeps every already-trusted client working, but conflicts with certificates the fresh install has already issued. Deliberate choice — see §6 |
 

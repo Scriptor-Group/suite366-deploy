@@ -20,10 +20,13 @@
 #   postgres  pg_dump -Fc streamed straight into `restic backup --stdin`. A
 #             logical dump, so it restores into a fresh Postgres whose password
 #             differs — which is the normal case after a reinstall.
-#   minio     the PVC directory, with `.minio.sys` EXCLUDED. Objects are whole
-#             files; MinIO's own IAM/config is not, and restoring one install's
-#             .minio.sys over another's root credentials locks you out of the
-#             very data you just restored.
+#   minio     the PVC directory, with `.minio.sys` and `.rustfs.sys` EXCLUDED
+#             (MinIO and RustFS — fresh installs since Oct 2026 — share the
+#             on-disk object layout, not the system directory's name). The
+#             object directories are self-contained; the system directory is
+#             the install's own IAM/config and disk identity, and restoring one
+#             install's over another's locks you out of the very data you just
+#             restored.
 #   config    $DATA_DIR minus models/ (33+ GiB, re-downloadable) — values.yaml,
 #             llm/.env, update.env, the local CA.
 #   secrets   `secret-<app>` and the cert-manager CA secret, as YAML.
@@ -359,9 +362,9 @@ backup_minio() {
   [[ -n "$pvc" ]] || { warn "no *-minio-pvc in ns/$NAMESPACE — skipping object storage."; return 1; }
   path="$(pvc_host_path "$pvc")" || { warn "could not resolve the host path of $pvc — skipping object storage."; return 1; }
   [[ -d "$path" ]] || { warn "$path does not exist on this node — skipping object storage."; return 1; }
-  info "minio: $path (excluding .minio.sys)"
+  info "minio: $path (excluding .minio.sys / .rustfs.sys)"
   res backup "$path" \
-    --exclude "$path/.minio.sys" \
+    --exclude "$path/.minio.sys" --exclude "$path/.rustfs.sys" \
     --tag suite366 --tag minio || return 1
 }
 
@@ -604,7 +607,7 @@ $(printf "${c_b}Extracted. Nothing on this appliance has been modified.${c_0}")
        BEFORE loading any data, or every encrypted column in the database
        becomes unreadable while appearing to restore fine;
     2. pg_restore the dump into the fresh database;
-    3. copy the MinIO objects back with MinIO stopped, leaving .minio.sys alone;
+    3. copy the MinIO objects back with MinIO stopped, leaving .minio.sys / .rustfs.sys alone;
     4. restore values.yaml / llm/.env / the CA secret, then restart the app;
     5. verify POSITIVELY: open a document AND make one LLM call with a stored
        provider key. A box that merely boots proves nothing about step 1.
@@ -628,7 +631,7 @@ EOF
 #      AES key from AUTH_SECRET, and falls back to NEXTAUTH_SECRET /
 #      ENCRYPTION_KEY on decrypt, so all three are carried when present.
 #   5. pg_restore.
-#   6. MinIO objects, with MinIO stopped, .minio.sys left alone — that directory
+#   6. MinIO objects, with MinIO stopped, .minio.sys / .rustfs.sys left alone — that directory
 #      holds the FRESH install's root credentials, and overwriting it locks you
 #      out of the data you just restored.
 #   7. scale back up and prove it works.
@@ -814,18 +817,18 @@ EOF
     if [[ -n "$src" && -d "$src" ]]; then
       [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" scale "deploy/$minio_deploy" --replicas=0 >/dev/null 2>&1
       [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" rollout status "deploy/$minio_deploy" --timeout=120s >/dev/null 2>&1
-      # --exclude .minio.sys: that directory holds THIS install's root
-      # credentials and IAM. Overwriting it locks you out of the very objects
-      # being restored.
+      # --exclude .minio.sys / .rustfs.sys: that directory holds THIS
+      # install's root credentials, IAM and disk identity. Overwriting it locks
+      # you out of the very objects being restored.
       if have rsync; then
-        rsync -a --exclude '.minio.sys' "$src"/ "$minio_path"/ \
+        rsync -a --exclude '.minio.sys' --exclude '.rustfs.sys' "$src"/ "$minio_path"/ \
           || warn "rsync reported errors while restoring objects."
       else
-        ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name '.minio.sys' -exec cp -a {} "$minio_path"/ \; ) \
+        ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name '.minio.sys' ! -name '.rustfs.sys' -exec cp -a {} "$minio_path"/ \; ) \
           || warn "copy reported errors while restoring objects."
       fi
       [[ -n "$minio_deploy" ]] && kc -n "$NAMESPACE" scale "deploy/$minio_deploy" --replicas=1 >/dev/null 2>&1
-      info "objects restored (.minio.sys left untouched)"
+      info "objects restored (.minio.sys / .rustfs.sys left untouched)"
     else
       warn "the snapshot carries no object directory matching $(basename "$minio_path") — objects NOT restored."
     fi
