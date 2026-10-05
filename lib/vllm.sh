@@ -106,11 +106,6 @@ deploy_vllm() {
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_profile_image "$VLLM_LLM_IMAGE" "$LLM_P_BUILD_DIR"; fi
   if [[ -n "$LLM_STT_MODEL" ]]; then build_stt_image "$VLLM_STT_IMAGE"; fi
   apply_vllm_sysctl "$LLM_P_SWAPPINESS"
-  # Arms the .path unit that lets an org admin switch model from the app, and
-  # writes the first state.json the UI reads. Idempotent, re-run on every
-  # install — the fleet converges here, `update.sh` never replays deploy_vllm.
-  "$DATA_DIR/switch-model.sh" install-units \
-    || warn "could not arm the model-switch trigger (the CLI still works)."
   local env_file="$DATA_DIR/llm/.env" env_old=""
   [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"
   local env_new
@@ -146,6 +141,16 @@ COMPOSE_PROFILES=${LLM_STT_MODEL:+stt}
 EOF
 )"
   ( umask 077; printf '%s\n' "$env_new" > "$env_file" )
+
+  # Arms the .path unit that lets an org admin switch model from the app, and
+  # writes the first state.json the UI reads. Idempotent, re-run on every
+  # install — the fleet converges here, `update.sh` never replays deploy_vllm.
+  # AFTER .env: switch-model.sh refuses to start without VLLM_IMAGE in it. Run
+  # before, it failed on every FRESH install ("VLLM_IMAGE missing from …/.env")
+  # — only a warning, so the box shipped with no llm-state bridge and the app's
+  # model page stuck on "the appliance has not published its models yet".
+  "$DATA_DIR/switch-model.sh" install-units \
+    || warn "could not arm the model-switch trigger (the CLI still works)."
 
   # The unit template lives in switch-model.sh (install-vllm-unit): update.sh
   # rewrites it on a running box through the same path, so a box installed
