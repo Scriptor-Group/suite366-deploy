@@ -76,6 +76,10 @@ jobs:
       # 63 times, and nothing in any log naming CDI.
       - name: CDI spec refresh self-test
         run: ./tools/test-vllm-cdi.sh
+      # install-units used to run before deploy_vllm wrote llm/.env: every fresh
+      # install shipped without the model-switch bridge.
+      - name: vLLM install order on a fresh box
+        run: ./tools/test-vllm-install-order.sh
 
   backup-verify:
     runs-on: ubuntu-latest
