@@ -1,7 +1,7 @@
 {
   "channel": "stable",
   "chart_version": "0.10.3",
-  "app_version": "1.12.0",
+  "app_version": "1.12.2",
   "vllm_image": "vllm/vllm-openai:v0.29.0",
   "updater_sha256": "8affa3a1228a5e6ded2ab8f29f5991478253cedef1d03f35a662b28b01cab395",
   "backup_sha256": "c28c0e1264b46d814371b45e1d2a48a8c3ad5e31fa4a16c61e6d2a7bcef6853e",
