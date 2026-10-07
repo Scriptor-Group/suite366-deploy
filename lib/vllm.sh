@@ -29,15 +29,53 @@ fetch_host_layer() {
   info "host layer laid down (switch-model.sh + llm/, stamp $(cut -c1-12 "$HOST_LAYER_STAMP"))."
 }
 
-# --- The profiles that build their own vLLM image, on the box -----------------
-# Two of the four do (llm/profiles.sh LLM_P_NEEDS_BUILD + LLM_P_BUILD_DIR):
-# Flash-Next, which only fits on one Spark with its 47.7 GiB n-gram table served
-# from the NVMe by mmap (llm/flash-next/, a vLLM patch set laid over the
-# official image), and OrcaSAQ, whose 3.2-bit trellis format needs exllamav3's
-# kernels compiled for the GB10 plus the plugin that registers it (llm/exl3/).
-# No registry holds either image: each is built here, once per tag, and the tag
-# names its inputs so a new base image or a bumped revision rebuilds.
-# switch-model.sh (ensure_profile_images) does the same on a running box.
+# --- The engine image: the unified one, pulled or built ---------------------
+# Three of the four profiles, the transcription engine and the embed run ONE
+# image, llm/unified/Dockerfile: the official vLLM image plus exllamav3 and the
+# EXL3 plugin (OrcaSAQ), the audio extras (transcription) and Gemma's chat
+# template. CI publishes it (ghcr.io/scriptor-group/suite-366-vllm) and the
+# channel names it in vllm_image, so the normal case is a pull. The label the
+# Dockerfile sets is how a box tells it from a PLAIN upstream image: handed one
+# (an offline package, an older channel, an operator's VLLM_IMAGE), the box
+# builds the same Dockerfile over it, once per tag — ~5 min on the Spark's 20
+# cores, with the engines down (switch-model.sh build_with_engines_down does
+# that on a running box; at install nothing runs yet).
+# switch-model.sh carries the same two functions: it has no lib/ to source.
+image_is_unified() { # image_is_unified IMAGE -> the image carries the unified label
+  [[ -n "$(docker image inspect -f "{{index .Config.Labels \"$LLM_UNIFIED_LABEL\"}}" "$1" 2>/dev/null)" ]]
+}
+ensure_engine_image() { # -> sets ENGINE_IMAGE; pulls or builds what is missing
+  local ctx="$DATA_DIR/llm" tag
+  if ! docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+    log "Pulling $VLLM_IMAGE"
+    docker pull -q "$VLLM_IMAGE" >/dev/null || die "docker pull $VLLM_IMAGE failed."
+  fi
+  if image_is_unified "$VLLM_IMAGE"; then
+    ENGINE_IMAGE="$VLLM_IMAGE"
+    info "engine image: $ENGINE_IMAGE (unified, revision $(docker image inspect -f "{{index .Config.Labels \"$LLM_UNIFIED_LABEL\"}}" "$VLLM_IMAGE"))."
+    return 0
+  fi
+  tag="$(llm_unified_image "$VLLM_IMAGE")"
+  ENGINE_IMAGE="$tag"
+  if docker image inspect "$tag" >/dev/null 2>&1; then
+    info "engine image: $tag (built here over $VLLM_IMAGE)."
+    return 0
+  fi
+  [[ -f "$ctx/unified/Dockerfile" ]] || die "$ctx/unified/Dockerfile missing — the host layer is incomplete."
+  log "Building $tag over $VLLM_IMAGE (llm/unified/Dockerfile: exllamav3 compiles in ~3 min on the 20 cores, ~5 min in all)"
+  # stdout (the image id) is noise; stderr is where a failing step explains itself.
+  docker build -q -f "$ctx/unified/Dockerfile" --build-arg "BASE_IMAGE=$VLLM_IMAGE" \
+    --build-arg "UNIFIED_REV=$LLM_UNIFIED_IMAGE_REV" -t "$tag" "$ctx" >/dev/null \
+    || die "docker build of $tag failed — see llm/unified/README.md"
+}
+
+# --- Flash-Next's own image, built on the box -------------------------------
+# The only profile with an image of its own (llm/profiles.sh LLM_P_NEEDS_BUILD):
+# it fits on one Spark only with its 47.7 GiB n-gram table served from the NVMe
+# by mmap, a vLLM patch set (llm/flash-next/) laid over the v0.29.0 image it was
+# written for. No registry holds it: built here, once per tag, and the tag
+# names its inputs so a refreshed patch set rebuilds. switch-model.sh
+# (ensure_profile_images) does the same on a running box.
 build_profile_image() { # build_profile_image TAG BUILD_DIR
   local tag="$1" ctx="$DATA_DIR/llm/$2"
   if docker image inspect "$tag" >/dev/null 2>&1; then
@@ -45,30 +83,12 @@ build_profile_image() { # build_profile_image TAG BUILD_DIR
     return 0
   fi
   [[ -f "$ctx/Dockerfile" ]] || die "$ctx/Dockerfile missing — the host layer is incomplete."
-  log "Building $tag ($VLLM_IMAGE + llm/$2/ — its Dockerfile says how long)"
-  docker pull -q "$VLLM_IMAGE" >/dev/null
-  # stdout (the image id) is noise; stderr is where a failing step explains itself.
-  # BASE_IMAGE is read by llm/exl3/Dockerfile; llm/flash-next/Dockerfile pins
-  # its own FROM and ignores it.
-  docker build -q --build-arg "BASE_IMAGE=$VLLM_IMAGE" -t "$tag" "$ctx" >/dev/null \
+  log "Building $tag ($LLM_FLASH_NEXT_BASE_IMAGE + llm/$2/ — its Dockerfile says how long)"
+  docker pull -q "$LLM_FLASH_NEXT_BASE_IMAGE" >/dev/null
+  # llm/flash-next/Dockerfile pins its own FROM (the vendored recipe, as is);
+  # the build argument is passed for a Dockerfile that would take one.
+  docker build -q --build-arg "BASE_IMAGE=$LLM_FLASH_NEXT_BASE_IMAGE" -t "$tag" "$ctx" >/dev/null \
     || die "docker build of $tag failed — see llm/$2/README.md"
-}
-
-# --- Transcription: the audio extras, built over the base image ---------------
-# vllm/vllm-openai (arm64) decodes no audio at all without soundfile and PyAV
-# (llm/stt/Dockerfile has the evidence). One thin layer, built here at install
-# for the profiles that serve a transcription model, and by switch-model.sh
-# when a later switch turns it on.
-build_stt_image() { # build_stt_image TAG
-  local tag="$1" ctx="$DATA_DIR/llm/stt"
-  if docker image inspect "$tag" >/dev/null 2>&1; then
-    info "vLLM transcription image $tag already built."
-    return 0
-  fi
-  log "Building $tag ($VLLM_IMAGE + the audio extras, ~1 min)"
-  docker pull -q "$VLLM_IMAGE" >/dev/null
-  docker build -q --build-arg "BASE_IMAGE=$VLLM_IMAGE" -t "$tag" "$ctx" >/dev/null \
-    || die "docker build of $tag failed — see llm/stt/Dockerfile"
 }
 
 # Only Flash-Next asks for this: with it up the box has no memory headroom
@@ -98,13 +118,19 @@ deploy_vllm() {
   mkdir -p "$MODELS_DIR" "$DATA_DIR/llm" "$CACHE_DIR/vllm" "$CACHE_DIR/flashinfer" "$CACHE_DIR/triton"
   # The compose, the nginx config, switch-model.sh (an OPERATOR script, at
   # $DATA_DIR next to update.sh and backup.sh: `sudo /opt/suite366/switch-model.sh`),
-  # the profile table, the entrypoint, Gemma's chat template and the three image
+  # the profile table, the entrypoint, Gemma's chat template and the two image
   # build contexts — one bundle, the same one update.sh lays down later.
   fetch_host_layer
+  # The engine image, now that docker can answer whether VLLM_IMAGE is the
+  # unified one; then the profile again, with the real answer. An image the
+  # operator named explicitly (VLLM_LLM_IMAGE / VLLM_STT_IMAGE) stays.
+  ensure_engine_image
+  llm_profile_apply "$LLM_PROFILE" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
+  [[ -n "${VLLM_LLM_IMAGE_SET:-}" ]] || VLLM_LLM_IMAGE="$LLM_P_IMAGE"
+  [[ -n "${VLLM_STT_IMAGE_SET:-}" ]] || VLLM_STT_IMAGE="$ENGINE_IMAGE"
   # `if`, not `[[ ]] &&`: as the last command of a function the && form
   # returns 1 when the test is false and `set -e` kills the install.
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_profile_image "$VLLM_LLM_IMAGE" "$LLM_P_BUILD_DIR"; fi
-  if [[ -n "$LLM_STT_MODEL" ]]; then build_stt_image "$VLLM_STT_IMAGE"; fi
   apply_vllm_sysctl "$LLM_P_SWAPPINESS"
   local env_file="$DATA_DIR/llm/.env" env_old=""
   [[ -f "$env_file" ]] && env_old="$(cat "$env_file")"

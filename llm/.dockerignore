@@ -1,0 +1,5 @@
+# docker build context = llm/ (see unified/Dockerfile). Never ship the box secrets
+# or the Flash-Next context (it has its own build) to the daemon.
+.env
+flash-next/
+*.md

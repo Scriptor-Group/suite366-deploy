@@ -44,10 +44,11 @@ check "switch-model.sh est root-only (750)" "$(stat -c %a "$X/switch-model.sh")"
 check "serve-llm.sh est exécutable (755)"   "$(stat -c %a "$X/llm/serve-llm.sh")" "755"
 check "profiles.sh est une donnée (644)"     "$(stat -c %a "$X/llm/profiles.sh")" "644"
 contains "le bundle embarque le contexte Flash-Next" "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/flash-next/Dockerfile"
-contains "le bundle embarque le contexte STT"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/stt/Dockerfile"
-contains "le bundle embarque le contexte EXL3"       "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/Dockerfile"
-contains "…avec son correctif arm64"                 "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/arm64-build.sh"
-contains "…et ses stubs"                             "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/exl3/aarch64_stubs.cpp"
+contains "le bundle embarque le contexte unifié"     "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/unified/Dockerfile"
+contains "…avec son correctif arm64"                 "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/unified/arm64-build.sh"
+contains "…et ses stubs"                             "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/unified/aarch64_stubs.cpp"
+contains "…et le .dockerignore du contexte llm/"     "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/.dockerignore"
+absent   "plus de contexte STT ni EXL3 à part"       "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/stt/"
 absent   "le bundle ne transporte pas de doc"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "README"
 
 # --- 2. converge sur une box de juillet ----------------------------------------------
@@ -66,8 +67,14 @@ case "$1 $2" in
     esac ;;
   # every image is present (no build, no pull) — except the one a test names
   # in STUB_MISSING_IMAGE, which the box has to build; STUB_BUILD_FAIL=1 makes
-  # that build fail.
-  "image inspect") case "$3" in *"${STUB_MISSING_IMAGE:-@none@}"*) exit 1 ;; *) exit 0 ;; esac ;;
+  # that build fail. The label query (`-f '{{index .Config.Labels …}}' IMAGE`)
+  # answers like the real daemon would: the channel's image and a locally
+  # built unified image carry the label, a plain upstream image does not.
+  "image inspect")
+    if [[ "$3" == "-f" && "$4" == *suite366.unified* ]]; then
+      case "$5" in *suite-366-vllm*|*vllm-unified*) echo 1 ;; esac; exit 0
+    fi
+    case "$3" in *"${STUB_MISSING_IMAGE:-@none@}"*) exit 1 ;; *) exit 0 ;; esac ;;
   "build "*) [[ "${STUB_BUILD_FAIL:-0}" == 1 ]] && exit 1; exit 0 ;;
   "compose "*) exit 0 ;;
   "exec "*) exit 0 ;;
@@ -113,10 +120,12 @@ out="$(conv "$BOX")"; rc=$?
 check "converge sort en 0"                          "$rc" "0"
 contains "reconnaît le profil d'après le modèle"    "$out" "profile for nvidia/Gemma-4-26B-A4B-NVFP4: gemma"
 check ".env : LLM_PROFILE posé"                     "$(envv "$BOX" LLM_PROFILE)" "gemma"
-# Le piège que ce test existe pour attraper : le canal a déplacé VLLM_IMAGE sur
-# v0.29.0 et l'ancien compose y aurait entraîné Gemma. Le profil le garde épinglé.
-check ".env : Gemma reste sur sa nightly épinglée"  "$(envv "$BOX" VLLM_LLM_IMAGE)" "vllm/vllm-openai:cu130-nightly"
+# Une box de juillet a une base NUE dans VLLM_IMAGE : l'image moteur est celle
+# que la box construit par-dessus (le stub la dit déjà construite), et VLLM_IMAGE
+# n'est pas touché — c'est le canal qui le déplace, pas la convergence.
+check ".env : Gemma passe sur l'image unifiée construite sur la box" "$(envv "$BOX" VLLM_LLM_IMAGE)" "suite366/vllm-unified:v0.29.0-u1"
 check ".env : la base reste celle du canal"         "$(envv "$BOX" VLLM_IMAGE)" "vllm/vllm-openai:v0.29.0"
+check ".env : la transcription tourne sur l'image moteur" "$(envv "$BOX" VLLM_STT_IMAGE)" "suite366/vllm-unified:v0.29.0-u1"
 # Gemma est passé de 0,55 à 0,45 pour loger le moteur de transcription : la
 # part d'une box restée à 0,55 est ABAISSÉE (à 0,55 la transcription redémarrait
 # en boucle). Une part réglée plus bas que le profil est conservée (box LOW).
@@ -155,7 +164,7 @@ check ".env : une part réglée plus bas est conservée (0.40)" "$(envv "$LOW" L
 BOX2="$WORK/qwen-box"; mkbox "$BOX2" nvidia/Qwen3.8-27B-NVFP4; mkdir -p "$BOX2/systemd"
 out="$(conv "$BOX2")"
 check "qwen27b : profil reconnu"            "$(envv "$BOX2" LLM_PROFILE)" "qwen27b"
-check "qwen27b : image = la base"           "$(envv "$BOX2" VLLM_LLM_IMAGE)" "vllm/vllm-openai:v0.29.0"
+check "qwen27b : image = l'unifiée construite sur la box" "$(envv "$BOX2" VLLM_LLM_IMAGE)" "suite366/vllm-unified:v0.29.0-u1"
 check "qwen27b : transcription activée"     "$(envv "$BOX2" STT_MODEL)" "Qwen/Qwen3-ASR-1.7B"
 check "qwen27b : profil compose stt"        "$(envv "$BOX2" COMPOSE_PROFILES)" "stt"
 check "qwen27b : tête MTP à 3"              "$(envv "$BOX2" LLM_MTP_TOKENS)" "3"
@@ -165,22 +174,24 @@ absent "qwen27b : le conteneur STT n'est pas retiré" "$(cat "$BOX2/docker.log")
 # Compiler exllamav3 à côté d'un Flash-Next résident a mis une Spark cliente à
 # genoux (swap plein, charge 74, app injoignable, 25/09/2026). Le moteur en
 # place s'arrête avant le build, revient si le build échoue, et .env n'a pas bougé.
+# Ici la box a la base nue et pas encore d'image unifiée : la convergence la construit.
 head_ "switch-model.sh converge : build avec les moteurs arrêtés"
 OB="$WORK/orca-box"; mkbox "$OB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq
-VLLM_LLM_IMAGE=suite366/vllm-exl3:v0.29.0-r0"; mkdir -p "$OB/systemd"
-out="$(STUB_MISSING_IMAGE=vllm-exl3 conv "$OB")"; rc=$?
+VLLM_LLM_IMAGE=suite366/vllm-exl3:v0.29.0-r1"; mkdir -p "$OB/systemd"
+out="$(STUB_MISSING_IMAGE=vllm-unified conv "$OB")"; rc=$?
 check "build : converge sort en 0"                       "$rc" "0"
 D="$(cat "$OB/docker.log")"
 contains "build : les moteurs sont arrêtés d'abord"      "$D" "docker compose --profile stt stop vllm-llm vllm-stt"
-contains "build : l'image est construite depuis llm/exl3" "$D" "docker build -q --build-arg BASE_IMAGE=vllm/vllm-openai:v0.29.0 -t suite366/vllm-exl3:v0.29.0-r1 $OB/llm/exl3"
-check "build : stop AVANT build"                         "$(grep -n "stop vllm-llm\|docker build" "$OB/docker.log" | head -2 | cut -d: -f2- | cut -c1-19 | tr '\n' '|')" "docker compose --pr|docker build -q --b|"
+contains "build : l'image unifiée est construite depuis llm/unified, contexte llm/" "$D" "docker build -q -f $OB/llm/unified/Dockerfile --build-arg BASE_IMAGE=vllm/vllm-openai:v0.29.0 --build-arg UNIFIED_REV=1 -t suite366/vllm-unified:v0.29.0-u1 $OB/llm"
+check "build : stop AVANT build"                         "$(grep -n "stop vllm-llm\|docker build" "$OB/docker.log" | head -2 | cut -d: -f2- | cut -c1-19 | tr '\n' '|')" "docker compose --pr|docker build -q -f |"
 contains "build : puis compose up -d"                    "$D" "docker compose up -d"
 contains "build : l'opérateur est prévenu que les moteurs s'arrêtent" "$out" "Stopping the running engines for the build"
-check "build : .env pointe sur la nouvelle image"        "$(envv "$OB" VLLM_LLM_IMAGE)" "suite366/vllm-exl3:v0.29.0-r1"
+check "build : .env pointe sur la nouvelle image"        "$(envv "$OB" VLLM_LLM_IMAGE)" "suite366/vllm-unified:v0.29.0-u1"
+check "build : une seule construction pour le LLM et la transcription" "$(grep -c 'docker build' "$OB/docker.log")" "1"
 # Le build échoue : les moteurs reviennent, .env n'a pas bougé, converge sort en erreur.
 FB="$WORK/orca-box-fail"; mkbox "$FB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq
 VLLM_LLM_IMAGE=suite366/vllm-exl3:v0.29.0-r0"; mkdir -p "$FB/systemd"
-out="$(STUB_MISSING_IMAGE=vllm-exl3 STUB_BUILD_FAIL=1 conv "$FB")"; rc=$?
+out="$(STUB_MISSING_IMAGE=vllm-unified STUB_BUILD_FAIL=1 conv "$FB")"; rc=$?
 check "build raté : converge sort en erreur"             "$rc" "1"
 D="$(cat "$FB/docker.log")"
 contains "build raté : les moteurs précédents reviennent" "$D" "docker compose up -d"
@@ -188,6 +199,19 @@ check "build raté : .env n'a pas bougé (ancienne image)" "$(envv "$FB" VLLM_LL
 contains "build raté : l'UI voit l'erreur"               "$(cat "$FB/llm-state/state.json")" "could not be built"
 # Sans build à faire, rien ne s'arrête : une box à jour ne coupe pas son moteur pour rien.
 absent "qwen27b : aucun arrêt des moteurs sans build"    "$(cat "$BOX2/docker.log")" "stop vllm-llm"
+
+# --- 2c. la box du canal : VLLM_IMAGE EST l'image unifiée, rien à construire ------
+# Le cas normal après le roll : le canal nomme l'image publiée par CI, le label
+# la fait reconnaître, et le moteur, la transcription et l'embed la partagent.
+head_ "switch-model.sh converge : l'image unifiée du canal"
+CB="$WORK/channel-box"; mkbox "$CB" nvidia/Qwen3.8-27B-NVFP4 "LLM_PROFILE=qwen27b"; mkdir -p "$CB/systemd"
+sed -i 's|^VLLM_IMAGE=.*|VLLM_IMAGE=ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1|' "$CB/llm/.env"
+out="$(conv "$CB")"; rc=$?
+check "canal : converge sort en 0"                       "$rc" "0"
+check "canal : l'image moteur est celle du canal"        "$(envv "$CB" VLLM_LLM_IMAGE)" "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1"
+check "canal : la transcription aussi"                   "$(envv "$CB" VLLM_STT_IMAGE)" "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1"
+absent "canal : aucun build"                             "$(cat "$CB/docker.log")" "docker build"
+absent "canal : aucun arrêt des moteurs"                 "$(cat "$CB/docker.log")" "stop vllm-llm"
 
 BOX3="$WORK/custom-box"; mkbox "$BOX3" someone/Custom-Model; mkdir -p "$BOX3/systemd"
 out="$(conv "$BOX3")"; rc=$?

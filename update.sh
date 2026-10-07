@@ -1166,10 +1166,12 @@ do_apply() {
     fi
   fi
 
-  # The vLLM base image: .env only. VLLM_IMAGE is what the embed and the
-  # transcription run and what the profiles derive the generative image from —
-  # a pinned profile (gemma on cu130-nightly) does NOT follow it. The recreate
-  # happens once, in apply_host_layer below, after the app is upgraded.
+  # The vLLM image: .env only. VLLM_IMAGE is the unified image the embed, the
+  # transcription engine and three of the four profiles run (or, for a plain
+  # upstream image, what the box builds the unified one over) — Flash-Next's
+  # own image does NOT follow it. The recreate happens once, in
+  # apply_host_layer below, after the app is upgraded (switch-model.sh converge
+  # pulls or builds what the new value needs, engines down for a build).
   if [[ "$vllm_diff" == 1 ]]; then
     log "vLLM image: $cur_vllm -> $want_vllm"
     [[ -f "$DATA_DIR/llm/.env" ]] || die "$DATA_DIR/llm/.env missing — cannot retarget vLLM image."

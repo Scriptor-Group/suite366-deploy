@@ -151,31 +151,33 @@ RELEASE="${RELEASE:-drive}"
 # vLLM flags. `switch-model.sh` changes it on a running box.
 #
 #   qwen27b     dense 27B NVFP4 — 262k context, ~20 t/s, real headroom
-#   orcasaq     dense 27B EXL3  — 262k context, ~38 t/s, 12 GB of weights, image built on the box
+#   orcasaq     dense 27B EXL3  — 262k context, ~38 t/s, 12 GB of weights
 #   flash-next  MoE 176B-A6B    — 131k context, ~30 t/s, runs at the memory wall
-#   gemma       MoE 26B-A4B     — 262k context, ~29 t/s, what the appliance shipped with
+#   gemma       MoE 26B-A4B     — 262k context, ~30 t/s, what the appliance shipped with
 #
-# Default qwen27b: measured headroom, and no image to build on the box.
-# Flash-Next is faster and stronger but sits at 117/121 GiB with 7-10 GiB of
-# swap in use; Gemma is pinned to a vLLM that stopped moving in April. Both
-# remain one `switch-model.sh` away — see README "Choosing a model".
+# Default qwen27b: measured headroom. Flash-Next is faster and stronger but
+# sits at 117/121 GiB with 7-10 GiB of swap in use. All remain one
+# `switch-model.sh` away — see README "Choosing a model".
 LLM_PROFILE="${LLM_PROFILE:-qwen27b}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # vLLM image: MUST be arm64 + validated for Blackwell GB10/sm_121. Default is
-# the official Docker Hub RELEASE `vllm/vllm-openai:v0.29.0` (CUDA 13.0.2,
-# multi-arch, no `docker login`). A tagged release rather than a nightly: the
-# old `cu130-nightly` tag silently stopped moving on 2026-04-23 (vLLM 0.19,
-# Marlin weight-only FP4), while v0.29.0 selects the native W4A4 CUTLASS
-# NVFP4 kernel on sm_121 and carries the Gated-DeltaNet speculative fixes
-# (vllm#51812, #51674) the Qwen3.8 MTP head needs. This is the EMBED's image
-# and the base of the Flash-Next build; the gemma profile pins its own.
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
-# Flash-Next runs VLLM_IMAGE plus the patch set in llm/flash-next/ (vendored
-# from blazux/qwen3.8-Flash-DGX at the commit below). lib/vllm.sh builds it on
-# the box — no registry holds it — under a tag that names both inputs, so a new
-# base image or a refreshed patch set rebuilds.
-FLASH_NEXT_PATCHES_COMMIT="${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
-FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${VLLM_IMAGE##*:}-$FLASH_NEXT_PATCHES_COMMIT"
+# the UNIFIED image CI publishes from llm/unified/Dockerfile — the official
+# Docker Hub release vllm/vllm-openai:v0.30.0 (CUDA 13.0, multi-arch, no
+# `docker login`) plus the EXL3 kernels, the audio extras and Gemma's template
+# — the image the embed, the transcription engine and three of the four
+# generative profiles run. The box recognises it by its label; given a PLAIN
+# upstream image here instead (an offline package, an older channel), it
+# builds the same Dockerfile itself (lib/vllm.sh ensure_engine_image). A tagged
+# release rather than a nightly: the old `cu130-nightly` tag silently stopped
+# moving on 2026-04-23 (vLLM 0.19). Resolved after the profile table is loaded:
+# the tag is derived from it.
+VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-vllm/vllm-openai:v0.30.0}"
+# Flash-Next runs its OWN base (llm/profiles.sh LLM_FLASH_NEXT_BASE_IMAGE,
+# v0.29.0) plus the patch set in llm/flash-next/ (vendored from
+# blazux/qwen3.8-Flash-DGX at the commit below). lib/vllm.sh builds it on the
+# box — no registry holds it — under a tag that names both inputs, so a
+# refreshed patch set rebuilds.
+FLASH_NEXT_PATCHES_COMMIT="${FLASH_NEXT_PATCHES_COMMIT:-}"
 
 # llm/profiles.sh is DATA, not a lib/ module: switch-model.sh has to read the
 # same table on a running box, where lib/ was never installed. Load it the way
@@ -197,19 +199,27 @@ load_llm_profiles() {
 load_llm_profiles
 llm_profile_known "$LLM_PROFILE" \
   || die "Unknown LLM_PROFILE '$LLM_PROFILE'. Known profiles: $LLM_PROFILES."
+VLLM_IMAGE="${VLLM_IMAGE:-$(llm_unified_registry_image "$VLLM_BASE_IMAGE")}"
+FLASH_NEXT_IMAGE="$(llm_flash_next_image "$FLASH_NEXT_PATCHES_COMMIT")"
+# Provisional: the engine image is VLLM_IMAGE when it is the unified one, the
+# locally built tag otherwise — a question for docker, answered in deploy_vllm
+# (lib/vllm.sh), which re-applies the profile with the real answer.
 llm_profile_apply "$LLM_PROFILE" "$VLLM_IMAGE" "$FLASH_NEXT_IMAGE"
 
 # The profile supplies the defaults; an explicit override still wins, which is
 # how a box runs a model at settings we never measured — on purpose, and at the
-# operator's risk.
+# operator's risk. The *_SET flags remember which image names the operator
+# chose, so deploy_vllm leaves those alone when it resolves the engine image.
 LLM_MODEL="${LLM_MODEL:-$LLM_P_MODEL}"
+VLLM_LLM_IMAGE_SET="${VLLM_LLM_IMAGE:+1}"
 VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-$LLM_P_IMAGE}"
 # Transcription: a third vLLM, for the profiles that leave room for it. The
 # profile decides (llm/profiles.sh LLM_P_STT_MODEL); `LLM_STT_MODEL=` explicitly
 # empty turns it off on a box that needs the memory for something else — `-`
 # not `:-`, so that empty is an answer, as for LLM_MTP_TOKENS below.
 LLM_STT_MODEL="${LLM_STT_MODEL-$LLM_P_STT_MODEL}"
-VLLM_STT_IMAGE="${VLLM_STT_IMAGE:-$(llm_stt_image "$VLLM_IMAGE")}"
+VLLM_STT_IMAGE_SET="${VLLM_STT_IMAGE:+1}"
+VLLM_STT_IMAGE="${VLLM_STT_IMAGE:-$VLLM_IMAGE}"
 # Tiny URL-path proxy unifying the two vLLM instances behind a single
 # OpenAI-compatible endpoint — matches the Suite 366 PR #325 contract
 # (one VLLM_BASE_URL, per-role VLLM_MODEL_*). We use nginx:alpine (~50 MB,

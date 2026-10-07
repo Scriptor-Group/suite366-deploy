@@ -60,10 +60,15 @@ die()  { printf 'xx  %s\n' "$*" >&2; exit 1; }
 . "$REPO/lib/common.sh"
 # shellcheck source=/dev/null
 . "$REPO/lib/vllm.sh"
+# The profile table: deploy_vllm re-applies the profile once the engine image
+# is resolved (the real one asks docker; here it is VLLM_IMAGE itself).
+# shellcheck source=/dev/null
+. "$REPO/llm/profiles.sh"
+FLASH_NEXT_IMAGE="$(llm_flash_next_image)"
 # Everything that would need the host, the network or a GPU.
 fetch_host_layer()    { :; }
+ensure_engine_image() { ENGINE_IMAGE="$VLLM_IMAGE"; }
 build_profile_image() { :; }
-build_stt_image()     { :; }
 apply_vllm_sysctl()   { :; }
 wait_http()           { return 1; }
 warmup_chat()  { :; }; warmup_embed() { :; }; warmup_stt() { :; }

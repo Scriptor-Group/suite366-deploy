@@ -9,10 +9,16 @@
 # helpers, no `set -e` assumptions, pure parameter assignment.
 #
 # A profile is the whole recipe, not just a model id. The four differ in the
-# IMAGE they need, the share of the unified pool they can take, and the context
-# they can actually seat — every number here was measured on the test Spark and
-# the reasoning lives next to it. The vLLM FLAGS live in llm/serve-llm.sh,
-# which runs inside the container; this file is the host-side table.
+# share of the unified pool they can take and the context they can actually
+# seat — every number here was measured on the test Spark and the reasoning
+# lives next to it. The vLLM FLAGS live in llm/serve-llm.sh, which runs inside
+# the container; this file is the host-side table.
+#
+# Images: three of the four profiles, the transcription engine and the embed
+# run ONE image, the unified one (llm/unified/Dockerfile), published by CI and
+# pulled by the box, or built on the box from the same Dockerfile when the box
+# only has a plain upstream image. Flash-Next alone keeps an image of its own
+# (llm/flash-next/, a patch set pinned to vLLM v0.29.0).
 # =============================================================================
 
 # Order matters: it is the order the operator sees in `switch-model.sh --list`.
@@ -40,8 +46,6 @@ llm_profile_known() { # llm_profile_known KEY
 # for now: a profile names it, or leaves LLM_P_STT_MODEL empty and the switch
 # takes the container down.
 LLM_STT_MODEL_DEFAULT="Qwen/Qwen3-ASR-1.7B"
-# Bump when llm/stt/Dockerfile changes: the tag is how a box knows to rebuild.
-LLM_STT_IMAGE_REV="1"
 # Budgets, the same for every profile that serves it. With the KV budget
 # explicit, the fraction only has to clear vLLM's start-up check (free memory
 # >= fraction x total): 0.10 = 12 GiB. KV: ~112 KiB per token on this 28-layer,
@@ -54,21 +58,42 @@ LLM_STT_KV_CACHE_BYTES="2147483648"
 LLM_STT_MAX_MODEL_LEN="8192"
 LLM_STT_MAX_NUM_SEQS="8"
 
-llm_stt_image() { # llm_stt_image BASE_IMAGE -> the tag of the locally built image
-  printf 'suite366/vllm-stt:%s-r%s' "${1##*:}" "$LLM_STT_IMAGE_REV"
+
+# --- The unified image ---------------------------------------------------------
+# llm/unified/Dockerfile = the official image + exllamav3 and the EXL3 plugin
+# (OrcaSAQ), + the audio extras (transcription), + Gemma 4's chat template. CI
+# publishes it as ghcr.io/scriptor-group/suite-366-vllm:<base tag>-u<rev> and
+# the channel names it in vllm_image; a box whose VLLM_IMAGE is a plain upstream
+# image (offline package, older channel) builds the same Dockerfile itself under
+# the tag llm_unified_image gives. The label is how the host side tells the two
+# apart (lib/vllm.sh, switch-model.sh). Bump the revision whenever anything under
+# llm/unified/ changes: it is in both tags, and the tag is what makes a box
+# rebuild and the workflow publish.
+LLM_UNIFIED_IMAGE_REV="1"
+LLM_UNIFIED_LABEL="suite366.unified"
+LLM_UNIFIED_REGISTRY_IMAGE="ghcr.io/scriptor-group/suite-366-vllm"
+llm_unified_image() { # llm_unified_image BASE_IMAGE -> the tag of the locally built image
+  printf 'suite366/vllm-unified:%s-u%s' "${1##*:}" "$LLM_UNIFIED_IMAGE_REV"
+}
+llm_unified_registry_image() { # llm_unified_registry_image BASE_IMAGE -> what CI publishes for that base
+  printf '%s:%s-u%s' "$LLM_UNIFIED_REGISTRY_IMAGE" "${1##*:}" "$LLM_UNIFIED_IMAGE_REV"
 }
 
-# --- EXL3 (exllamav3 trellis) checkpoints ------------------------------------
-# The orcasaq profile serves a 3.2-bit trellis quantisation that vLLM cannot read
-# by itself: llm/exl3/Dockerfile compiles exllamav3's kernels for the GB10 and
-# installs the plugin that registers the format. Same rule as the transcription
-# image: bump the revision when anything under llm/exl3/ changes.
-LLM_EXL3_IMAGE_REV="1"
-llm_exl3_image() { # llm_exl3_image BASE_IMAGE -> the tag of the locally built image
-  printf 'suite366/vllm-exl3:%s-r%s' "${1##*:}" "$LLM_EXL3_IMAGE_REV"
+# --- Flash-Next's own image ------------------------------------------------------
+# A vLLM patch set vendored from blazux/qwen3.8-Flash-DGX (llm/flash-next/),
+# laid over the v0.29.0 image it was written for — NOT over the unified image's
+# base: measured on v0.30.0 (2026-10-06), the model's resident footprint grew by
+# ~3 GiB and the fast loader removed the swap the September boot was counting
+# as free, so at 0.71 next to the embed it no longer starts. It stays on the
+# recipe that was measured; the tag names both inputs so that refreshing either
+# rebuilds.
+LLM_FLASH_NEXT_BASE_IMAGE="vllm/vllm-openai:v0.29.0"
+LLM_FLASH_NEXT_PATCHES_COMMIT="b002c8a"
+llm_flash_next_image() { # llm_flash_next_image [PATCHES_COMMIT] -> the tag of the locally built image
+  printf 'suite366/vllm-flash-next:%s-%s' "${LLM_FLASH_NEXT_BASE_IMAGE##*:}" "${1:-$LLM_FLASH_NEXT_PATCHES_COMMIT}"
 }
 
-# llm_profile_apply KEY BASE_IMAGE FLASH_NEXT_TAG
+# llm_profile_apply KEY ENGINE_IMAGE FLASH_NEXT_TAG
 #
 # Sets, for the caller, a LLM_P_* variable per knob: MODEL, IMAGE,
 # GPU_MEM_UTIL, MAX_MODEL_LEN, MAX_NUM_SEQS, CONTEXT_WINDOW, MTP_TOKENS,
@@ -82,10 +107,11 @@ llm_exl3_image() { # llm_exl3_image BASE_IMAGE -> the tag of the locally built i
 # and let an explicit override win, while switch-model.sh takes LLM_P_* as
 # authoritative — that is the whole point of switching.
 #
-# BASE_IMAGE is the official vLLM image (also what the embed runs);
-# FLASH_NEXT_TAG is the tag lib/config.sh derives for the locally built image.
+# ENGINE_IMAGE is the unified image this box runs (the channel's, or the one
+# it built — the caller resolves that, this table does not touch docker);
+# FLASH_NEXT_TAG is the tag of Flash-Next's own image.
 llm_profile_apply() {
-  local key="$1" base_image="$2" flash_next_tag="${3:-}"
+  local key="$1" engine_image="$2" flash_next_tag="${3:-}"
   case "$key" in
     qwen27b)
       # NVIDIA's ModelOpt build of Qwen3.8-27B: MLP and lm_head in NVFP4,
@@ -94,7 +120,7 @@ llm_profile_apply() {
       # benchmarks, and the checkpoint the vLLM recipe marks verified on
       # dgx_spark_gb10.
       LLM_P_MODEL="nvidia/Qwen3.8-27B-NVFP4"
-      LLM_P_IMAGE="$base_image"
+      LLM_P_IMAGE="$engine_image"
       # 0.45 -> weights 20.8 GiB + KV 818,650 fp8 tokens = 3.1x a full 262k
       # request. A dense hybrid needs a SMALLER share than the Gemma MoE: only
       # 16 of its 64 layers carry a KV cache, the other 48 are linear attention
@@ -120,10 +146,9 @@ llm_profile_apply() {
       # against 5.6468, 93.2 % top-1 agreement). Text-only: the vision tower is
       # not shipped, so the app's vision role falls back to the same model
       # without images. Published 2026-09-24; the quantiser itself is not
-      # public, only the serving code (llm/exl3/). Same context, same parsers,
-      # same MTP head as qwen27b — what changes is the image (built on the box,
-      # llm/exl3/Dockerfile, ~4 min: exllamav3 compiles in 160 s on the 20 cores)
-      # and the memory. Measured 2026-09-25: 11.5 GiB resident against 20.8,
+      # public, only the serving code (exllamav3 + the orcasaq2 plugin, both in
+      # the unified image). Same context, same parsers, same MTP head as
+      # qwen27b — what changes is the memory. Measured 2026-09-25: 11.5 GiB resident against 20.8,
       # loaded in 56 s, serving 110 s after the container start with the
       # compile cache warm. At 0.45 (the same share as qwen27b) the KV cache is
       # 801,326 fp8 tokens = 3.06x a full 262k request, profiled as a switch
@@ -139,14 +164,14 @@ llm_profile_apply() {
       # k=3 as for qwen27b — one user at a time is the case — at 771,787 KV
       # tokens (2.94x a full request) instead of 796,858.
       LLM_P_MODEL="orcarouter/OrcaSAQ-2-27B"
-      LLM_P_IMAGE="$(llm_exl3_image "$base_image")"
+      LLM_P_IMAGE="$engine_image"
       LLM_P_GPU_MEM_UTIL="0.45"
       LLM_P_MAX_MODEL_LEN="262144"
       LLM_P_MAX_NUM_SEQS="2"
       LLM_P_CONTEXT_WINDOW="200000"
       LLM_P_MTP_TOKENS="3"
-      LLM_P_NEEDS_BUILD="1"
-      LLM_P_BUILD_DIR="exl3"
+      LLM_P_NEEDS_BUILD="0"
+      LLM_P_BUILD_DIR=""
       LLM_P_SWAPPINESS=""
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       ;;
@@ -181,12 +206,14 @@ llm_profile_apply() {
       # (28-30 t/s against 19-20) but is a weaker model with a KV cache 4x
       # more expensive.
       LLM_P_MODEL="nvidia/Gemma-4-26B-A4B-NVFP4"
-      # PINNED to the image this model was validated on, deliberately NOT the
-      # v0.29.0 the other two need. That tag stopped moving on 2026-04-23
-      # (vLLM 0.19) and only knows the Marlin weight-only FP4 path on sm_121;
-      # Gemma 4 under v0.29.0 has never been exercised here, so the profile
-      # ships the combination that was measured rather than an untested one.
-      LLM_P_IMAGE="vllm/vllm-openai:cu130-nightly"
+      # On the unified image since 2026-10-06, no longer pinned to the
+      # `cu130-nightly` tag (vLLM 0.19, Marlin weight-only FP4) it shipped on:
+      # measured on v0.30.0, the native FlashInfer MoE FP4 kernels load and give
+      # the same 30 t/s, tools, thinking, JSON and vision pass, and the prefix
+      # cache is back once the hybrid KV cache manager is off (llm/serve-llm.sh
+      # says why). The 0.19 image is gone from the profiles; a box that still
+      # has it keeps it on disk, unused.
+      LLM_P_IMAGE="$engine_image"
       # 0.45, down from the 0.55 it shipped with, to leave the transcription
       # engine its room: at 0.55 the box had 7.9 GiB free once Gemma was up and
       # the transcription engine, which needs 12.2 free to clear vLLM's
@@ -215,8 +242,8 @@ llm_profile_apply() {
 llm_profile_summary() { # llm_profile_summary KEY
   case "$1" in
     qwen27b)    printf 'dense 27B, NVFP4 — 262k context, ~20 t/s, real headroom' ;;
-    orcasaq)    printf 'dense 27B, 3.2-bit EXL3 — 262k context, ~38 t/s, 12 GB of weights, image built on the box' ;;
-    flash-next) printf 'MoE 176B-A6B — 131k context, ~30 t/s, n-gram table on the NVMe, no memory headroom' ;;
-    gemma)      printf 'MoE 26B-A4B — 262k context, ~29 t/s, the model the appliance shipped with (pinned vLLM 0.19)' ;;
+    orcasaq)    printf 'dense 27B, 3.2-bit EXL3 — 262k context, ~38 t/s, 12 GB of weights' ;;
+    flash-next) printf 'MoE 176B-A6B — 131k context, ~30 t/s, n-gram table on the NVMe, no memory headroom, own image (vLLM 0.29)' ;;
+    gemma)      printf 'MoE 26B-A4B — 262k context, ~30 t/s, the model the appliance shipped with' ;;
   esac
 }

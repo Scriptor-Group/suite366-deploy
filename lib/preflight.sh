@@ -110,8 +110,10 @@ check_connectivity() {
   # this reads TLS_MODE from the ENVIRONMENT: preflight runs before the prompts,
   # so an interactively chosen mode cannot relax the check.
   [[ "$TLS_MODE" == "local-ca" ]] && endpoints+=("https://charts.jetstack.io")
-  # NGC only if we actually pull the vLLM image from nvcr.io
+  # NGC only if we actually pull the vLLM image from nvcr.io; GHCR when the
+  # unified image comes from there (the default; anonymous pull, public package).
   [[ "${VLLM_IMAGE:-}" == nvcr.io/* ]] && endpoints+=("https://nvcr.io/v2/")
+  [[ "${VLLM_IMAGE:-}" == ghcr.io/* ]] && endpoints+=("https://ghcr.io/v2/")
   local u code fails=()
   for u in "${endpoints[@]}"; do
     code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$u" 2>/dev/null || true)"
@@ -514,7 +516,7 @@ gather_inputs() {
   # propagates the exit code of `[[ test ]]`: if false, the function returns 1
   # and the script dies silently. We use `if/fi` (plus a final `:`).
   if [[ "$SKIP_VLLM" != "1" && "$VLLM_IMAGE" == "vllm/vllm-openai:latest" ]]; then
-    warn "vllm/vllm-openai:latest is NOT validated arm64/Blackwell. Prefer vllm/vllm-openai:cu130-nightly (default)."
+    warn "vllm/vllm-openai:latest is NOT validated arm64/Blackwell. Prefer the default (the unified image, see README)."
   fi
   :
 }

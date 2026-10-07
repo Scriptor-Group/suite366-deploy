@@ -2,12 +2,12 @@
   "channel": "stable",
   "chart_version": "0.10.3",
   "app_version": "1.12.2",
-  "vllm_image": "vllm/vllm-openai:v0.29.0",
-  "updater_sha256": "8affa3a1228a5e6ded2ab8f29f5991478253cedef1d03f35a662b28b01cab395",
+  "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
+  "updater_sha256": "e0564b8118d9eb302b60c4de3ff152e499b635bb15f3968416a6c570b7bdc449",
   "backup_sha256": "c28c0e1264b46d814371b45e1d2a48a8c3ad5e31fa4a16c61e6d2a7bcef6853e",
-  "host_layer_sha256": "e0651413faf087c97cf4cb27b3ba1cf34c92ae2147c8d5c12c6cc3e1aa84c258",
+  "host_layer_sha256": "f4f96070bbfe32f264b7a269fe797c80c754e9bdc2ad995c6289674cb507cb29",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "chart 0.10.3: fresh installs run RustFS as the object store, MinIO images are no longer pullable (installed boxes keep MinIO, minio pod restarts once); backup: .rustfs.sys excluded like .minio.sys; offline package rebuilt"
+  "notes": "vLLM: ONE unified image (official v0.30.0 + exllamav3/EXL3 + audio extras + Gemma template, published by CI) for qwen27b/orcasaq/gemma, the transcription engine and the embed - nothing to compile on the box any more; Gemma off the 0.19 nightly, prefix cache restored (--disable-hybrid-kv-cache-manager); nginx resolves every backend per request (no more crossed routes after a restart); Flash-Next keeps its own image on v0.29.0"
 }

@@ -3,9 +3,10 @@
 # Suite 366 — switch the appliance's generative model.
 #
 # The appliance can serve four models (llm/profiles.sh). Switching is not just
-# a model id: each needs its own image, its own share of the unified memory
-# pool and its own vLLM flags, and the id itself lives in THREE places that
-# must agree or the app breaks in a way nothing reports:
+# a model id: each needs its share of the unified memory pool and its own vLLM
+# flags (three run the unified image, Flash-Next its own), and the id itself
+# lives in THREE places that must agree or the app breaks in a way nothing
+# reports:
 #
 #   1. $DATA_DIR/llm/.env         what the vLLM container serves
 #   2. $DATA_DIR/values.yaml      -> ConfigMap VLLM_MODEL_* the app reads
@@ -133,15 +134,38 @@ CUR_MODEL="$(env_get LLM_MODEL)"
 STT_PORT_CUR="$(env_get STT_PORT)"
 BASE_IMAGE="$(env_get VLLM_IMAGE)"
 [[ -n "$BASE_IMAGE" ]] || die "VLLM_IMAGE missing from $ENV_FILE — is this an installed appliance?"
-FLASH_NEXT_IMAGE="suite366/vllm-flash-next:${BASE_IMAGE##*:}-${FLASH_NEXT_PATCHES_COMMIT:-b002c8a}"
-STT_IMAGE="$(llm_stt_image "$BASE_IMAGE")"
+FLASH_NEXT_IMAGE="$(llm_flash_next_image "${FLASH_NEXT_PATCHES_COMMIT:-}")"
+
+# The engine image three of the four profiles, the transcription engine and
+# the embed run: VLLM_IMAGE itself when it is the unified image (the channel's,
+# recognised by its label), else the same Dockerfile built here over it, once
+# per tag (ensure_engine_image). lib/vllm.sh carries the same two functions:
+# this script has no lib/ to source.
+image_is_unified() { # image_is_unified IMAGE -> the image carries the unified label
+  [[ -n "$(docker image inspect -f "{{index .Config.Labels \"$LLM_UNIFIED_LABEL\"}}" "$1" 2>/dev/null)" ]]
+}
+# Resolved without pulling: a `list` or `status` must not start a 10 GB pull.
+# An image not on the box yet is taken for the unified one when its name is
+# the registry's (the channel just moved VLLM_IMAGE there; ensure_engine_image
+# pulls it when a switch or converge needs it), and for a plain base otherwise.
+if command -v docker >/dev/null 2>&1 && docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+  if image_is_unified "$BASE_IMAGE"; then ENGINE_IMAGE="$BASE_IMAGE"; else ENGINE_IMAGE="$(llm_unified_image "$BASE_IMAGE")"; fi
+elif [[ "$BASE_IMAGE" == "$LLM_UNIFIED_REGISTRY_IMAGE":* ]]; then
+  ENGINE_IMAGE="$BASE_IMAGE"
+else
+  ENGINE_IMAGE="$(llm_unified_image "$BASE_IMAGE")"
+fi
+STT_IMAGE="$ENGINE_IMAGE"
+engine_image_missing() { # -> the engine image is one to build here, and is not built yet
+  [[ "$ENGINE_IMAGE" != "$BASE_IMAGE" ]] && ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1
+}
 
 # Every model id the profiles can produce: the scope of the Agent rewrite
 # below. An agent pointed at OpenAI or Anthropic must not be touched.
 all_profile_models() {
   local p
   for p in $LLM_PROFILES; do
-    ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE" && printf '%s\n' "$LLM_P_MODEL" )
+    ( llm_profile_apply "$p" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE" && printf '%s\n' "$LLM_P_MODEL" )
   done
 }
 
@@ -150,7 +174,7 @@ all_profile_models() {
 profile_for_model() { # profile_for_model HF_ID
   local p
   for p in $LLM_PROFILES; do
-    if ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE" && [[ "$LLM_P_MODEL" == "$1" ]] ); then
+    if ( llm_profile_apply "$p" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE" && [[ "$LLM_P_MODEL" == "$1" ]] ); then
       printf '%s' "$p"; return 0
     fi
   done
@@ -206,12 +230,39 @@ EOF
   systemctl enable suite366-vllm.service >/dev/null 2>&1 || true
 }
 
+# The engine image, pulled or built: VLLM_IMAGE when it is the unified one, the
+# same Dockerfile built over it otherwise. Idempotent.
+ENGINE_IMAGE_READY=0
+ensure_engine_image() {
+  [[ "$ENGINE_IMAGE_READY" == 1 ]] && return 0
+  if [[ "$ENGINE_IMAGE" == "$BASE_IMAGE" ]]; then
+    if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+      log "Pulling $ENGINE_IMAGE"
+      docker pull -q "$ENGINE_IMAGE" >/dev/null || die "docker pull $ENGINE_IMAGE failed."
+      image_is_unified "$ENGINE_IMAGE" \
+        || die "$ENGINE_IMAGE does not carry the $LLM_UNIFIED_LABEL label — not an image this box can serve the profiles from."
+    fi
+    ENGINE_IMAGE_READY=1; return 0
+  fi
+  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 && { info "engine image $ENGINE_IMAGE already built."; ENGINE_IMAGE_READY=1; return 0; }
+  [[ -f "$LLM_DIR/unified/Dockerfile" ]] \
+    || die "$LLM_DIR/unified/Dockerfile missing — cannot build $ENGINE_IMAGE. Re-run install.sh."
+  if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+    docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
+  fi
+  log "Building $ENGINE_IMAGE over $BASE_IMAGE (llm/unified/Dockerfile, ~5 min: exllamav3 compiles in ~3)"
+  docker build -q -f "$LLM_DIR/unified/Dockerfile" --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+    --build-arg "UNIFIED_REV=$LLM_UNIFIED_IMAGE_REV" -t "$ENGINE_IMAGE" "$LLM_DIR" >/dev/null \
+    || die "docker build of $ENGINE_IMAGE failed — see $LLM_DIR/unified/Dockerfile"
+  ENGINE_IMAGE_READY=1
+}
+
 # Build what the profile needs and the box lacks. Shared by a switch and by
-# converge; both die on a failed build because nothing below could start. A
-# profile that builds names its context (LLM_P_BUILD_DIR, a directory under
-# llm/ with a Dockerfile); the base image is passed as a build argument for the
-# Dockerfiles that take one (llm/exl3/) and ignored by the one that pins its
-# own FROM (llm/flash-next/, vendored as is).
+# converge; both die on a failed build because nothing below could start.
+# Flash-Next is the one profile with an image of its own (LLM_P_NEEDS_BUILD,
+# LLM_P_BUILD_DIR = llm/flash-next/, a vendored Dockerfile that pins its own
+# FROM — the build argument is passed for form); every other profile, and the
+# transcription engine, runs the engine image.
 ensure_profile_images() {
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
     if docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
@@ -221,36 +272,37 @@ ensure_profile_images() {
       [[ -f "$ctx/Dockerfile" ]] \
         || die "$ctx/ missing — cannot build $LLM_P_IMAGE. Re-run install.sh."
       log "Building $LLM_P_IMAGE from llm/$LLM_P_BUILD_DIR/ (see its Dockerfile for how long)"
-      docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
-      docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$LLM_P_IMAGE" "$ctx" >/dev/null \
+      docker pull -q "$LLM_FLASH_NEXT_BASE_IMAGE" >/dev/null || die "docker pull $LLM_FLASH_NEXT_BASE_IMAGE failed."
+      docker build -q --build-arg "BASE_IMAGE=$LLM_FLASH_NEXT_BASE_IMAGE" -t "$LLM_P_IMAGE" "$ctx" >/dev/null \
         || die "docker build of $LLM_P_IMAGE failed — see $ctx/Dockerfile"
     fi
-  elif ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
-    log "Pulling $LLM_P_IMAGE"
-    docker pull -q "$LLM_P_IMAGE" >/dev/null || die "docker pull $LLM_P_IMAGE failed."
+  else
+    ensure_engine_image
   fi
-  if [[ -n "$LLM_P_STT_MODEL" ]] && ! docker image inspect "$STT_IMAGE" >/dev/null 2>&1; then
-    [[ -f "$LLM_DIR/stt/Dockerfile" ]] \
-      || die "$LLM_DIR/stt/Dockerfile missing — cannot build $STT_IMAGE. Re-run install.sh."
-    log "Building $STT_IMAGE (the audio extras over $BASE_IMAGE, ~1 min)"
-    docker pull -q "$BASE_IMAGE" >/dev/null || die "docker pull $BASE_IMAGE failed."
-    docker build -q --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$STT_IMAGE" "$LLM_DIR/stt" >/dev/null \
-      || die "docker build of $STT_IMAGE failed."
-  fi
+  if [[ -n "$LLM_P_STT_MODEL" ]]; then ensure_engine_image; fi
 }
 
-# Build with the box's memory free to do it. Compiling exllamav3 (llm/exl3/)
-# next to a running Flash-Next — 117/121 GiB before the first nvcc — drove a
-# client Spark into 16 GiB of swap and a load of 74, and took the app down with
-# it (2026-09-25). A build only happens when the target's image is missing, and
-# the target is about to replace the running engine anyway: so the generative
-# and transcription engines are STOPPED first (the embed stays, it is 20 GiB
-# and needed as is), the build runs, and if it fails the previous stack is
-# brought back before the caller dies. The UI is told what is going on: the
-# build is the longest silent stretch of a switch otherwise.
+# Build with the box's memory free to do it. Compiling exllamav3 next to a
+# running Flash-Next — 117/121 GiB before the first nvcc — drove a client Spark
+# into 16 GiB of swap and a load of 74, and took the app down with it
+# (2026-09-25). A build only happens when an image the target needs is missing
+# (its own, or the engine image on a box without the channel's), and the target
+# is about to replace the running engine anyway: so the generative and
+# transcription engines are STOPPED first (the embed stays, it is 20 GiB and
+# needed as is), the build runs, and if it fails the previous stack is brought
+# back before the caller dies. The UI is told what is going on: the build is
+# the longest silent stretch of a switch otherwise.
+needs_build() { # -> an image the target profile needs has to be built here
+  if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
+    ! docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1 && return 0
+  elif engine_image_missing; then
+    return 0
+  fi
+  [[ -n "$LLM_P_STT_MODEL" ]] && engine_image_missing
+}
 build_with_engines_down() { # build_with_engines_down LABEL -> 0, or 1 with the previous engines back
   local label="$1"
-  if [[ "$LLM_P_NEEDS_BUILD" != "1" ]] || docker image inspect "$LLM_P_IMAGE" >/dev/null 2>&1; then
+  if ! needs_build; then
     ensure_profile_images; return 0
   fi
   publish_state running "$label" "building the $label image — the current model is paused while it compiles (a few minutes)"
@@ -348,13 +400,15 @@ publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
       "$(json_str "$st")" "$(json_str "$tgt")" "$(json_str "$msg")" "$(json_str "$(date -Is)")"
     printf '  "profiles": ['
     for p in $LLM_PROFILES; do
-      ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
-        local dl=false; if checkpoint_on_disk "$LLM_P_MODEL"; then dl=true; fi
+      ( llm_profile_apply "$p" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
+        local dl=false nb=false; if checkpoint_on_disk "$LLM_P_MODEL"; then dl=true; fi
+        # "needs_build" is what the UI warns about: a switch that compiles first.
+        if needs_build; then nb=true; fi
         printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s, "stt_model": %s}' \
           "$( [[ "$first" == 1 ]] && printf '' || printf ',' )" \
           "$(json_str "$p")" "$(json_str "$LLM_P_MODEL")" "$(json_str "$(llm_profile_summary "$p")")" \
           "$LLM_P_CONTEXT_WINDOW" \
-          "$( [[ "$LLM_P_NEEDS_BUILD" == 1 ]] && printf true || printf false )" "$dl" \
+          "$nb" "$dl" \
           "$(json_str "$LLM_P_STT_MODEL")" )
       first=0
     done
@@ -390,7 +444,7 @@ case "$TARGET" in
       TARGET=install-units; publish_state idle
       exit 0
     fi
-    llm_profile_apply "$prof" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
+    llm_profile_apply "$prof" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
     TARGET_LABEL="$prof"
     # The images first, BEFORE .env moves: a build that fails must leave a box
     # whose `docker compose up -d` still names an image it has.
@@ -521,7 +575,7 @@ EOF
   list)
     printf '%-12s %-34s %s\n' PROFILE MODEL NOTES
     for p in $LLM_PROFILES; do
-      ( llm_profile_apply "$p" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
+      ( llm_profile_apply "$p" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
         mark=' '; if [[ "$p" == "$CUR_PROFILE" ]]; then mark='*'; fi
         printf '%s%-11s %-34s %s%s\n' "$mark" "$p" "$LLM_P_MODEL" "$(llm_profile_summary "$p")" \
           "${LLM_P_STT_MODEL:+ — with transcription ($LLM_P_STT_MODEL)}" )
@@ -548,7 +602,7 @@ EOF
 esac
 
 llm_profile_known "$TARGET" || die "unknown profile '$TARGET'. Known: $LLM_PROFILES (see '$0 list')."
-llm_profile_apply "$TARGET" "$BASE_IMAGE" "$FLASH_NEXT_IMAGE"
+llm_profile_apply "$TARGET" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
 
 [[ "$DRY_RUN" == 1 || $EUID -eq 0 ]] || die "run me as root (docker, k3s and $DATA_DIR are root-only)."
 
@@ -666,10 +720,14 @@ if [[ "$DRY_RUN" == 1 ]]; then
   info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
   echo; info "SQL:"; build_sql | sed 's/^/      /'
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
-    echo; info "image build: $LLM_P_IMAGE (from $BASE_IMAGE + llm/$LLM_P_BUILD_DIR/, unless already built)"
+    echo; info "image build: $LLM_P_IMAGE (from $LLM_FLASH_NEXT_BASE_IMAGE + llm/$LLM_P_BUILD_DIR/, unless already built)"
+  elif [[ "$ENGINE_IMAGE" != "$BASE_IMAGE" ]]; then
+    echo; info "image build: $ENGINE_IMAGE (from $BASE_IMAGE + llm/unified/, unless already built)"
+  else
+    echo; info "engine image: $ENGINE_IMAGE (the channel's unified image, pulled)"
   fi
   if [[ -n "$LLM_P_STT_MODEL" ]]; then
-    echo; info "image build: $STT_IMAGE (from $BASE_IMAGE + llm/stt/, unless already built)"
+    echo; info "transcription engine: $STT_IMAGE (the engine image)"
     info "transcription container: taken down first, then suite366-vllm-stt up after the engine is healthy"
   else
     echo; info "transcription container: suite366-vllm-stt taken down before the engine starts, and stays down"
