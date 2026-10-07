@@ -199,7 +199,7 @@ load_llm_profiles() {
 load_llm_profiles
 llm_profile_known "$LLM_PROFILE" \
   || die "Unknown LLM_PROFILE '$LLM_PROFILE'. Known profiles: $LLM_PROFILES."
-VLLM_IMAGE="${VLLM_IMAGE:-$(llm_unified_registry_image "$VLLM_BASE_IMAGE")}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1}"
 FLASH_NEXT_IMAGE="$(llm_flash_next_image "$FLASH_NEXT_PATCHES_COMMIT")"
 # Provisional: the engine image is VLLM_IMAGE when it is the unified one, the
 # locally built tag otherwise — a question for docker, answered in deploy_vllm
