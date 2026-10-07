@@ -334,9 +334,25 @@ set_env_stt_keys() {
 
 # nginx reads its config once at start; a new nginx.conf laid down under the
 # running proxy is invisible until told. A reload is zero-downtime and a no-op
-# when nothing changed.
+# when nothing changed — PROVIDED the container sees the new file. It does
+# not: nginx.conf is a bind-mounted FILE, and a file bind mount follows the
+# inode it was mounted from, while the host layer lays a new file down (new
+# inode). Seen 2026-10-07 on two boxes after the resolver change: the host had
+# the new config, `nginx -T` inside the container still showed the old
+# upstream blocks, and the reload had re-read the old inode. So compare what
+# the container sees with the host file, and recreate the proxy (a 2 s gap on
+# the route) when they differ; reload only when they match.
 reload_proxy() {
   docker inspect suite366-vllm-proxy >/dev/null 2>&1 || return 0
+  if ! docker exec suite366-vllm-proxy cat /etc/nginx/nginx.conf 2>/dev/null | cmp -s - "$LLM_DIR/nginx.conf"; then
+    info "nginx.conf changed on the host — recreating the proxy (its bind mount still holds the previous file)."
+    if ( cd "$LLM_DIR" && docker compose up -d --force-recreate vllm-proxy >/dev/null 2>&1 ); then
+      info "proxy recreated on the new config."
+    else
+      warn "proxy recreate failed (non-blocking) — restart it by hand: docker restart suite366-vllm-proxy"
+    fi
+    return 0
+  fi
   if docker exec suite366-vllm-proxy nginx -t >/dev/null 2>&1; then
     docker exec suite366-vllm-proxy nginx -s reload >/dev/null 2>&1 \
       && info "proxy config reloaded." || warn "proxy reload failed (non-blocking)."
