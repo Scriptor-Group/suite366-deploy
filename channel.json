@@ -5,7 +5,7 @@
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "e0564b8118d9eb302b60c4de3ff152e499b635bb15f3968416a6c570b7bdc449",
   "backup_sha256": "c28c0e1264b46d814371b45e1d2a48a8c3ad5e31fa4a16c61e6d2a7bcef6853e",
-  "host_layer_sha256": "f4f96070bbfe32f264b7a269fe797c80c754e9bdc2ad995c6289674cb507cb29",
+  "host_layer_sha256": "b44337ad42f343c310264208e5f9edd8ffb7fe255f35f6efb98be57fb1ce0966",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",

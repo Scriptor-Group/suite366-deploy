@@ -77,7 +77,14 @@ case "$1 $2" in
     case "$3" in *"${STUB_MISSING_IMAGE:-@none@}"*) exit 1 ;; *) exit 0 ;; esac ;;
   "build "*) [[ "${STUB_BUILD_FAIL:-0}" == 1 ]] && exit 1; exit 0 ;;
   "compose "*) exit 0 ;;
-  "exec "*) exit 0 ;;
+  # The proxy's view of nginx.conf: the host file (the mount is fresh), or an
+  # older content when a test sets STUB_STALE_PROXY=1 (the bind mount kept the
+  # inode the host layer replaced).
+  "exec "*)
+    if [[ "$2 $3 $4" == "suite366-vllm-proxy cat /etc/nginx/nginx.conf" ]]; then
+      if [[ "${STUB_STALE_PROXY:-0}" == 1 ]]; then echo "upstream vllm_llm { server vllm-llm:8000; }"; else cat "$DATA_DIR/llm/nginx.conf"; fi
+    fi
+    exit 0 ;;
   *) exit 0 ;;
 esac
 STUBEOF
@@ -144,6 +151,15 @@ contains "compose up -d (recrée ce qui a changé)"       "$D" "docker compose u
 absent   "pas de --force-recreate (rien d'inutile)"     "$D" "force-recreate"
 contains "proxy rechargé"                               "$D" "docker exec suite366-vllm-proxy nginx -s reload"
 contains "daemon-reload après les unités"               "$D" "systemctl daemon-reload"
+# Le bind mount d'un FICHIER suit l'inode : la couche hôte pose un nouveau
+# nginx.conf, le conteneur voit encore l'ancien, et un reload relit l'ancien
+# (vu le 07/10/2026 sur deux box). Quand le contenu diffère, le proxy est recréé.
+SP="$WORK/stale-proxy"; mkbox "$SP" nvidia/Qwen3.8-27B-NVFP4 "LLM_PROFILE=qwen27b"; mkdir -p "$SP/systemd"
+out="$(STUB_STALE_PROXY=1 conv "$SP")"
+contains "proxy périmé : recréé plutôt que rechargé"   "$(cat "$SP/docker.log")" "docker compose up -d --force-recreate vllm-proxy"
+absent   "proxy périmé : pas de reload sur l'ancien fichier" "$(cat "$SP/docker.log")" "nginx -s reload"
+contains "proxy périmé : l'opérateur est prévenu"      "$out" "recreating the proxy"
+absent   "proxy à jour : pas de recréation inutile"    "$D" "force-recreate vllm-proxy"
 U="$(cat "$BOX/systemd/suite366-vllm.service" 2>/dev/null)"
 contains "unité vLLM réécrite avec le rafraîchissement CDI" "$U" "ExecStartPre=-/usr/bin/nvidia-ctk cdi generate"
 contains "unité vLLM : WorkingDirectory de la box"          "$U" "WorkingDirectory=$BOX/llm"
