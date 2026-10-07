@@ -1,0 +1,159 @@
+name: Publish vLLM image
+
+# Builds llm/unified/Dockerfile — the ONE vLLM image the appliance's embed,
+# transcription engine and qwen27b/orcasaq/gemma profiles run — and publishes
+# it to ghcr.io/scriptor-group/suite-366-vllm:<base tag>-u<rev>, so a box pulls
+# it instead of compiling exllamav3 on its own 20 cores with its engines down
+# (the September Spark incident: a build next to a running Flash-Next drove a
+# client box into 16 GiB of swap).
+#
+# Runs on every push to main that touches the Dockerfile's inputs, and by
+# hand. The tag is IMMUTABLE: it names the base image and the revision
+# (llm/profiles.sh LLM_UNIFIED_IMAGE_REV), and a tag that already exists is
+# left alone — bump the revision to publish a change, exactly as a box decides
+# to rebuild. The channel is NOT touched here: rolling the fleet onto the new
+# image is the Release workflow's job (`vllm_image=`), after the image exists.
+#
+# Why a hosted arm64 runner works: the exllamav3 extension is compiled by nvcc
+# for sm_121 (TORCH_CUDA_ARCH_LIST), which needs the CUDA toolchain of the base
+# image, not a GPU. ~15 min on the 4 Cobalt cores (160 s on the Spark's 20).
+# The public package is pulled anonymously by the boxes: the first publish
+# creates it PRIVATE (GitHub's default) — flip it to public once in the
+# package settings, like suite-366-sandbox-runner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'llm/unified/**'
+      - 'llm/tool_chat_template_gemma4.jinja'
+      - 'llm/profiles.sh'
+      - '.github/workflows/publish-vllm-image.yml'
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base image (blank = the Dockerfile default, vllm/vllm-openai:v0.30.0)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild and overwrite an existing tag (only for a tag no box has pulled yet)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-vllm-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + push (linux/arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve the tag from llm/profiles.sh
+        id: tag
+        env:
+          IN_BASE: ${{ inputs.base_image }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source llm/profiles.sh
+          base="${IN_BASE:-$(sed -n 's/^ARG BASE_IMAGE=//p' llm/unified/Dockerfile | head -1)}"
+          [[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9._-]+$ ]] || { echo "::error::base image must be repo:tag, got '$base'"; exit 1; }
+          image="$(llm_unified_registry_image "$base")"
+          echo "base=$base"   >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "rev=$LLM_UNIFIED_IMAGE_REV" >> "$GITHUB_OUTPUT"
+          echo "::notice::$image (base $base, revision $LLM_UNIFIED_IMAGE_REV)"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip when the tag already exists
+        id: exists
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            if [[ "$FORCE" == "true" ]]; then
+              echo "::warning::$IMAGE exists — overwriting on request (force)."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::$IMAGE already published — nothing to do (bump LLM_UNIFIED_IMAGE_REV to publish a change)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The base image alone is ~10 GB compressed / ~32 GB on disk, the result
+      # as much again, and a hosted runner starts with ~30 GB free: drop the
+      # toolchains the image does not need before pulling anything.
+      - name: Free disk space
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+                      /usr/local/share/chromium /usr/lib/jvm /opt/microsoft 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Set up buildx
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./llm
+          file: ./llm/unified/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+          build-args: |
+            BASE_IMAGE=${{ steps.tag.outputs.base }}
+            UNIFIED_REV=${{ steps.tag.outputs.rev }}
+            MAX_JOBS=4
+          labels: |
+            org.opencontainers.image.source=https://github.com/Scriptor-Group/suite366-deploy
+            org.opencontainers.image.revision=${{ github.sha }}
+          # No build cache: the heavy layer is a compile whose inputs are pinned
+          # by checksum, and a stale cache would be the only way to publish an
+          # image that does not match the Dockerfile.
+          no-cache: true
+          provenance: false
+
+      - name: Verify what was published
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+          REV: ${{ steps.tag.outputs.rev }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$IMAGE" >/dev/null
+          got="$(docker image inspect -f '{{index .Config.Labels "suite366.unified"}}' "$IMAGE")"
+          [[ "$got" == "$REV" ]] || { echo "::error::label suite366.unified=$got, expected $REV"; exit 1; }
+          docker run --rm --entrypoint python3 "$IMAGE" -c '
+          import importlib.metadata as m, importlib.util as u
+          assert u.find_spec("exllamav3_ext"), "exllamav3 extension missing"
+          assert any(e.name == "orcasaq2" for e in m.entry_points(group="vllm.general_plugins")), "orcasaq2 plugin missing"
+          import soundfile, av, librosa
+          print("vllm", m.version("vllm"), "| exllamav3", m.version("exllamav3"), "| soundfile", soundfile.__version__, "| av", av.__version__)'
+          docker run --rm --entrypoint test "$IMAGE" -f /app/tool_chat_template_gemma4.jinja
+          echo "::notice::published $IMAGE"

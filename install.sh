@@ -70,10 +70,14 @@
 #                              profile allows (Qwen3-ASR-1.7B with qwen27b, none
 #                              with the other two); LLM_STT_MODEL= (empty)
 #                              turns it off.
-#   VLLM_IMAGE                 vLLM image arm64/Blackwell sm_121 (default
-#                              vllm/vllm-openai:v0.29.0, see README): the embed
-#                              runs it and the Flash-Next image is built on it.
-#                              The gemma profile pins its own (vLLM 0.19).
+#   VLLM_IMAGE                 vLLM image arm64/Blackwell sm_121 (default: the
+#                              unified image CI publishes from llm/unified/,
+#                              ghcr.io/scriptor-group/suite-366-vllm, see
+#                              README): the embed, the transcription engine and
+#                              the qwen27b/orcasaq/gemma profiles run it. Given
+#                              a plain upstream image instead, the box builds
+#                              the same Dockerfile over it. Flash-Next has its
+#                              own image, built on the box over vLLM v0.29.0.
 #   PROXY_IMAGE                URL-path proxy image (default nginx:alpine) —
 #                              unifies the 2 vLLM instances behind a single
 #                              OpenAI-compatible endpoint, wired into the

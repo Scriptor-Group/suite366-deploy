@@ -25,7 +25,9 @@
 # Launched by the systemd unit `suite366-vllm.service`.
 services:
   vllm-llm:
-    # Built on the box by lib/vllm.sh: official ${VLLM_IMAGE} + ./flash-next/.
+    # The engine image for qwen27b/orcasaq/gemma (the unified image, see
+    # ./unified/), or Flash-Next's own (built on the box over vLLM v0.29.0 from
+    # ./flash-next/). lib/vllm.sh and switch-model.sh write which.
     image: ${VLLM_LLM_IMAGE}
     container_name: suite366-vllm-llm
     restart: unless-stopped
@@ -155,9 +157,9 @@ services:
   # resolves lazily, so its absence costs nothing and breaks nothing.
   vllm-stt:
     profiles: ["stt"]
-    # Built on the box by lib/vllm.sh: ${VLLM_IMAGE} + ./stt/ (the audio
-    # extras the arm64 image ships without — see llm/stt/Dockerfile).
-    # The `:-` defaults below exist for ONE reason: a box whose .env predates
+    # The engine image (./unified/ carries the audio extras the arm64 upstream
+    # image ships without; see its Dockerfile). The `:-` defaults below exist
+    # for ONE reason: a box whose .env predates
     # transcription. Compose warns on every unset variable at each boot and
     # refuses `--profile stt` outright without an image; the service is off on
     # such a box anyway. llm/profiles.sh is the authority for the values —

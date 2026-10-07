@@ -328,13 +328,13 @@ measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
 | Decode, code | ~30 t/s | 45.0 t/s | 34.9 t/s | not measured |
 | Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 69k in 33 s | 62k in 65 s |
 | Swap in use, idle | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
-| vLLM | official v0.29.0 | v0.29.0 + `llm/exl3/` | v0.29.0 + `llm/flash-next/` | pinned `cu130-nightly` (0.19) |
+| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
 | Vision | yes | no (text-only checkpoint) | yes | yes |
 | Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
 
-**`qwen27b` is the default** because it leaves the box real headroom without
-building anything: 20.8 GiB of weights, a KV cache of 818,650 fp8 tokens (3.1x a
-full 262k request) and zero swap at idle. It is also the slowest of the four to
+**`qwen27b` is the default** because it leaves the box real headroom: 20.8 GiB
+of weights, a KV cache of ~800k fp8 tokens (3x a full 262k request) and zero
+swap at idle. It is also the slowest of the four to
 decode, which is physics: 20.8 GiB over the GB10's 273 GB/s is 12 t/s, and the
 in-checkpoint MTP head recovers it to 19-20.
 
@@ -342,10 +342,10 @@ in-checkpoint MTP head recovers it to 19-20.
 quantised it with a sensitivity-searched mixed-precision trellis code (the EXL3 /
 QTIP family: 3.21 bits on the decoder, 6-bit `lm_head`, int8 embedding, 4-bit
 MTP head) and reports it within 0.02 % of BF16 perplexity on WikiText-2. vLLM
-cannot read the format by itself, so the profile builds its own image on the box
-(`llm/exl3/`: exllamav3's kernels compiled for sm_121 plus the plugin that
-registers the format, ~4 min) and the checkpoint is text-only — the app's vision
-role points at it too, and images simply are not understood. Measured on the
+cannot read the format by itself: the unified image carries exllamav3's kernels
+compiled for sm_121 and the plugin that registers the format (`llm/unified/`).
+The checkpoint is text-only — the app's vision role points at it too, and images
+simply are not understood. Measured on the
 test Spark on 2026-09-25: 11.5 GiB resident, loaded in 56 s and serving 110 s
 after the container start with the compile cache warm; at the same 0.45 share as
 `qwen27b` the KV cache seats 771,787 fp8 tokens (2.9x a full 262k request), and
@@ -370,12 +370,17 @@ generation. It works; it has no margin. On one Spark, next to the 8B embedding
 model, treat it as a demo rather than a service — an embed of 5 GiB or less, or
 a second Spark, is what would make it comfortable.
 
-**`gemma` is what the appliance shipped with**, kept so a box can go back. Note
-its vLLM pin: the `cu130-nightly` tag stopped moving on 2026-04-23 (vLLM 0.19,
-Marlin weight-only FP4) and Gemma 4 has never been exercised under v0.29.0 here,
-so the profile ships the combination that was measured rather than an untested
-one. That is also why it decodes faster than the dense 27B while being a weaker
-model: 4B active parameters against 27B.
+**`gemma` is what the appliance shipped with**, kept so a box can go back. It
+ran for months on the `cu130-nightly` tag (vLLM 0.19, Marlin weight-only FP4,
+stopped moving on 2026-04-23); since 2026-10-06 it runs the unified image like
+the two Qwen profiles, measured on v0.30.0 at the same 30 t/s with the native
+FlashInfer MoE FP4 kernels, tools, thinking, JSON and vision passing. One flag
+is specific to it, `--disable-hybrid-kv-cache-manager`: vLLM 0.30's hybrid KV
+cache manager never gets a prefix-cache hit on Gemma 4's sliding-window layout
+(a second turn on a 36k-token conversation re-prefilled everything, 15 s instead
+of 0.4), and turning it off restores the 0.19 layout, ~313k tokens of KV at 0.45.
+It decodes faster than the dense 27B while being a weaker model: 4B active
+parameters against 27B.
 
 ### Switching
 
@@ -408,11 +413,11 @@ in 43 s, about 10 GiB resident in all (the box goes from 86 to 97 GiB used),
 35 s of read French transcribed in 2.9 s through the proxy — WAV or webm/opus
 alike — and 5 s in 0.5 s.
 
-Two things to know about it. The container runs a **locally built image**
-(`suite366/vllm-stt:<base>-r<rev>`, `llm/stt/Dockerfile`): the arm64 vLLM image
-ships without `soundfile` and `PyAV` and decodes no audio at all, so one ~100 MB
-layer adds them — bump `LLM_STT_IMAGE_REV` in `llm/profiles.sh` whenever the
-Dockerfile changes. And the service sits behind a **compose profile**
+Two things to know about it. The container runs the **unified image** like the
+generative engine: the arm64 vLLM image ships without `soundfile` and `PyAV`
+and decodes no audio at all, and the unified image's ~100 MB audio layer is what
+makes the route work (`llm/unified/Dockerfile`). And the service sits behind a
+**compose profile**
 (`COMPOSE_PROFILES=stt` in `llm/.env`), so `switch-model.sh` can take it down
 before the new generative model starts — always, even when the target serves
 one too: on unified memory vLLM sizes its KV cache as its share minus whatever
@@ -430,13 +435,15 @@ If it does not come up, `.env` is restored, the previous engine is brought back,
 and nothing else moved: the box ends the run where it started.
 
 Switching to `flash-next` builds its patched image on the box if it is missing
-(~3 min) and lowers `vm.swappiness` to 10; switching away removes that drop-in.
-Switching to `orcasaq` builds its image the same way (`llm/exl3/`, ~4 min: it
-compiles exllamav3 for the GB10). **A build stops the running engines first**
-and the model page says so: compiling next to a resident Flash-Next (117/121 GiB
-before the first `nvcc`) drove a Spark into 16 GiB of swap and a load of 74 and
-took the app down with it. The previous engine is about to be replaced anyway;
-if the build fails it is brought back and nothing else has moved.
+(~3 min, over vLLM v0.29.0 — see "The images" below) and lowers `vm.swappiness`
+to 10; switching away removes that drop-in. The three other profiles share the
+unified image: nothing to build when the channel's image is on the box, and one
+build (~5 min, exllamav3) on a box that only has a plain upstream image. **A
+build stops the running engines first** and the model page says so: compiling
+next to a resident Flash-Next (117/121 GiB before the first `nvcc`) drove a
+Spark into 16 GiB of swap and a load of 74 and took the app down with it. The
+previous engine is about to be replaced anyway; if the build fails it is brought
+back and nothing else has moved.
 The first start on a model whose checkpoint is not on disk downloads it
 (~133 GB for Flash-Next, 25 min at 85 MB/s).
 
@@ -459,12 +466,29 @@ the container runtime. Two consequences bit us:
   not fit at all. This applies to all three profiles and is why `EMBED_GPU_MEM_UTIL`
   is 0.20 and not 0.30.
 
-**Kernels.** On sm_121, vLLM v0.29.0 selects the native W4A4 NVFP4 path
-(`FlashInferCutlassNvFp4LinearKernel`), FP8 FlashInfer for the attention
+**Kernels.** On sm_121, vLLM v0.29.0 and later select the native W4A4 NVFP4
+path (`FlashInferCutlassNvFp4LinearKernel`), FP8 FlashInfer for the attention
 projections and the `FLASHINFER` attention backend. The `cu130-nightly` tag the
 appliance used to run is vLLM 0.19, which only knew the Marlin weight-only path:
 it dequantised FP4 to FP16 and never touched the FP4 tensor cores. That is the
-single biggest reason the two Qwen profiles pin a release rather than a nightly.
+single biggest reason the profiles run a release rather than a nightly.
+
+**The images.** Three of the four profiles, the transcription engine and the
+embed run ONE image, the **unified image** (`llm/unified/Dockerfile`): the
+official `vllm/vllm-openai:v0.30.0` plus exllamav3 and the EXL3 plugin, the
+audio extras and Gemma's chat template. CI publishes it on every change to
+`llm/unified/` on `main` (`.github/workflows/publish-vllm-image.yml`) as
+`ghcr.io/scriptor-group/suite-366-vllm:<base tag>-u<rev>`, the channel names it
+in `vllm_image`, and a box pulls it — ~10 GB, nothing to compile. A box handed a
+PLAIN upstream image instead (an offline package built with one, an operator's
+`VLLM_IMAGE`) recognises the missing `suite366.unified` label and builds the
+same Dockerfile over it, once per tag, engines down. Measured side by side with
+the previous four images on 2026-10-05/06: identical answers (OrcaSAQ greedy
+5/5, a 72 s transcription word for word, image embeddings at 0.9989 cosine),
+same decode, prefill 20-35 % faster. Flash-Next is the exception: its patch set
+is written against v0.29.0 and on the v0.30.0 base its resident footprint no
+longer leaves room for the embed beside it, so it keeps its own image, built on
+the box over v0.29.0 (`llm/flash-next/`), unchanged.
 
 **Start-up.** `--load-format fastsafetensors` loads the 27B's weights in 12 s
 instead of 114. It is NOT used for Flash-Next: the mmap patch hooks the default
@@ -608,14 +632,14 @@ values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. token
 switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run] | converge) — .env, chart values and the database
 host-layer.sh                         GENERATED (tools/bundle-host-layer.sh): switch-model.sh + llm/ in one file, pinned in channel.json as host_layer_sha256, laid down by install.sh and update.sh
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
-llm/profiles.sh                       the four models and their measured budgets, and the transcription model each allows; the ONE table install.sh and switch-model.sh share
-llm/stt/Dockerfile                    the audio extras the arm64 vLLM image ships without; built on the box as suite366/vllm-stt
+llm/profiles.sh                       the four models and their measured budgets, the transcription model each allows, and the image tags; the ONE table install.sh and switch-model.sh share
+llm/unified/                          the UNIFIED vLLM image (official v0.30.0 + exllamav3/EXL3 + audio extras + Gemma template): published by CI, pulled by the boxes, built on a box only over a plain upstream image
+.github/workflows/publish-vllm-image.yml  builds llm/unified/ on a hosted arm64 runner and publishes ghcr.io/scriptor-group/suite-366-vllm:<base>-u<rev> (immutable tags)
 tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
 llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
-llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box)
-llm/exl3/                             the vLLM image that reads EXL3 trellis checkpoints (OrcaSAQ-2-27B): exllamav3 compiled for the GB10 + the orcasaq2 plugin (built on the box)
-llm/nginx.conf                        URL-path router unifying both vLLM behind a single endpoint
+llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box over vLLM v0.29.0)
+llm/nginx.conf                        URL-path router unifying the vLLM engines behind a single endpoint (every backend resolved per request)
 tls/local-ca-issuer.yaml              local self-signed CA (cert-manager)
 dns/avahi-aliases.service             systemd unit publishing mDNS names
 ```
@@ -766,10 +790,10 @@ A box whose bundle differs from the channel's sees "host layer" in the update it
 is offered; applying it lays the bundle down, adds every app ↔ host bridge its
 `values.yaml` lacks (model page, backups, remote access), rolls the release, and
 runs `switch-model.sh converge`: fills `llm/.env` from the profile the box already
-runs (a pre-profile box is recognised by its model id — Gemma stays on its pinned
-`cu130-nightly` while the base image moves), recreates only the containers whose
-definition changed, reloads the proxy, rewrites the systemd units, publishes
-`state.json`. Nobody re-runs `install.sh` for a host-side feature any more.
+runs (a pre-profile box is recognised by its model id), pulls the channel's
+unified image or builds one over a plain base, recreates only the containers
+whose definition changed, reloads the proxy, rewrites the systemd units,
+publishes `state.json`. Nobody re-runs `install.sh` for a host-side feature any more.
 
 The installer arms a **daily systemd timer** (`suite366-update.timer`) that
 polls a **channel manifest** ([`channel.json`](channel.json) in this repo) and

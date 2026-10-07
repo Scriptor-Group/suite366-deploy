@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Entrypoint of the vllm-llm container. ONE script for the four generative
 # profiles, because the compose must not change when the operator switches
-# model: everything profile-specific lives here and in llm/profiles.sh.
+# model: everything profile-specific lives here and in llm/profiles.sh. Three
+# profiles run the unified image (llm/unified/), Flash-Next its own.
 #
 # Split of responsibilities:
 #   llm/profiles.sh  (host)      model id, image, memory budgets, context window
@@ -134,20 +135,26 @@ PY
 
   # --- Gemma-4-26B-A4B-NVFP4 — what the appliance shipped with ---------------
   gemma)
-    # Only MARLIN (weight-only) is functional for NVFP4 MoE in the vLLM 0.19
-    # this profile pins; the FLASHINFER_TRTLLM/CUTLASS paths crash at load.
-    # Scoped to this profile on purpose: forcing marlin under v0.29.0 would
-    # cost the other two models their native W4A4 kernel.
-    export VLLM_USE_FLASHINFER_MOE_FP4=0
-    export VLLM_NVFP4_GEMM_BACKEND=marlin
+    # On the unified image (vLLM 0.30) the native FlashInfer MoE FP4 kernels
+    # load and run: the Marlin pin the 0.19 nightly needed (two env knobs and
+    # --moe-backend marlin) is gone, measured at the same 30 t/s either way.
     # --quantization=modelopt is required: auto-detection loads the checkpoint
-    # but skips the MoE marlin optimisations. The chat template is mandatory
-    # for --tool-call-parser=gemma4 (without it vLLM crashes at boot).
+    # but skips the MoE optimisations. The chat template is mandatory for
+    # --tool-call-parser=gemma4 (without it vLLM crashes at boot).
+    #
+    # --disable-hybrid-kv-cache-manager: vLLM 0.30 puts Gemma 4's
+    # sliding-window layers in a KV group of their own, and with that manager
+    # a prefix-cache lookup never converges for this model — the second turn
+    # of a 36k-token conversation re-prefilled everything (15 s) instead of
+    # hitting the cache (0.4 s), text-only or not. Off, the layout is the one
+    # the 0.19 nightly used (every layer full-attention in the cache, ~313k
+    # tokens of KV at 0.45 instead of ~3M) and the hit is back. Measured
+    # 2026-10-06; re-test before removing on a newer base.
     exec vllm serve "$LLM_MODEL" "${common[@]}" \
       --trust-remote-code \
       --dtype auto \
       --quantization modelopt \
-      --moe-backend marlin \
+      --disable-hybrid-kv-cache-manager \
       --kv-cache-dtype fp8 \
       --async-scheduling \
       --chat-template /app/tool_chat_template_gemma4.jinja \
