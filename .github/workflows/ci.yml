@@ -92,3 +92,18 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
       - name: Backup agent self-test
         run: ./tools/test-backup.sh
+
+  sbom:
+    # Annexe I partie II du règlement (UE) 2024/2847 : le fabricant documente
+    # les composants du produit. La nomenclature est régénérée à chaque push et
+    # publiée en artefact, pour qu'elle ne puisse pas diverger du code.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Générer la nomenclature logicielle
+        run: ./tools/sbom.sh sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          retention-days: 90
