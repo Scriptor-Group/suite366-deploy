@@ -1,7 +1,7 @@
 {
   "channel": "stable",
   "chart_version": "0.10.3",
-  "app_version": "1.12.2",
+  "app_version": "1.14.0",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "2733f30c05fffb9ae71da75ee3ca3683cce9926a0e01dd83ea754eef1ba4f1e6",
   "backup_sha256": "ddfc08bc36eea900c71b69da1efbff4e7d87fa65fba19532d1ddd63587e28022",
