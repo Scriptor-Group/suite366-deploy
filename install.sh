@@ -57,14 +57,17 @@
 #                              pooled. A secret, kept across re-runs; later:
 #                              update.sh license set -
 #   LLM_PROFILE                which generative model to serve: qwen27b
-#                              (default), orcasaq, flash-next or gemma. Each
+#                              (default), orcasaq, orcasaq-batch (the same
+#                              model alone on the box: no embed, no
+#                              transcription), flash-next or gemma. Each
 #                              carries its own image, memory budget and vLLM
 #                              flags — see
 #                              llm/profiles.sh and README "Choosing a model".
 #                              Change it later with switch-model.sh, no reinstall.
 #   LLM_MODEL, EMBED_MODEL     HuggingFace models to serve. LLM_MODEL defaults to
 #                              whatever LLM_PROFILE names; EMBED_MODEL defaults to
-#                              Qwen3-VL-Embedding-8B and is the same for all four.
+#                              Qwen3-VL-Embedding-8B and is the same for every
+#                              profile that serves it (orcasaq-batch does not).
 #   LLM_STT_MODEL              transcription model served by a third vLLM on
 #                              /v1/audio/transcriptions. Defaults to what the
 #                              profile allows (Qwen3-ASR-1.7B with qwen27b, none

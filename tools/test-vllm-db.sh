@@ -67,7 +67,15 @@ printf '%s' "$code"
 if [[ "$code" == "000" ]]; then exit 7; fi   # curl's own behaviour on a connect failure
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/bin/sleep"   # the retry loop is under test, its 60s are not
-chmod +x "$WORK/bin/k3s" "$WORK/bin/curl" "$WORK/bin/sleep"
+# The embed container exists unless a test says otherwise ($WORK/no-embed): a
+# profile that runs the generative model alone (orcasaq-batch) has none, and
+# the deep check must skip /v1/embeddings there instead of crying "down".
+cat > "$WORK/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1 $2" == "inspect suite366-vllm-embed" ]]; then [[ -f "$WORK/no-embed" ]] && exit 1; exit 0; fi
+exit 0
+EOF
+chmod +x "$WORK/bin/k3s" "$WORK/bin/curl" "$WORK/bin/sleep" "$WORK/bin/docker"
 
 # --- harness -----------------------------------------------------------------
 # The shipped block is SOURCED, never copied (test-local-certs.sh:76-78), and it
@@ -189,6 +197,14 @@ contains "$out" "did not converge" "…and says so"
 reset; printf 'rows\nk=%s\n' "$KEY" > "$WORK/pg-out"; printf 401 > "$WORK/code-embed"
 out="$(run "verify_vllm_db_key '$URL' 1")"; RC=$?
 contains "$out" "VERDICT=stale" "chat OK + embeddings 401 -> stale (the routes are different containers)"
+# orcasaq-batch runs the generative model alone: no embed container, so the
+# route is not probed at all — a 401 (or a 502) there is nobody's key.
+reset; printf 'rows\nk=%s\n' "$KEY" > "$WORK/pg-out"; printf 401 > "$WORK/code-embed"; touch "$WORK/no-embed"
+out="$(run "verify_vllm_db_key '$URL' 1")"; RC=$?
+contains "$out" "VERDICT=ok" "no embed container (a profile that runs alone) -> /v1/embeddings is skipped, not stale"
+contains "$out" "no embed container" "…and says why"
+check "…and never calls the route" 0 "$(grep -c '/v1/embeddings' "$CLOG")"
+rm -f "$WORK/no-embed"
 reset; printf 'rows\nk=%s\n' "$KEY" > "$WORK/pg-out"; printf 502 > "$WORK/code-embed"
 out="$(run "verify_vllm_db_key '$URL' 1")"; RC=$?
 contains "$out" "VERDICT=ok" "an embed model still loading is not a bad key"

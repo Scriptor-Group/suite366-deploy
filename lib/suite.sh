@@ -86,7 +86,7 @@ deploy_suite() {
             -e "s|@SUITE_IP@|$SUITE_IP|g" \
             -e "s|@PROXY_PORT@|$PROXY_PORT|g" \
             -e "s|@LLM_MODEL@|$LLM_MODEL|g" \
-            -e "s|@EMBED_MODEL@|$EMBED_MODEL|g" \
+            -e "s|@EMBED_MODEL@|$EMBED_MODEL_SERVED|g" \
             -e "s|@STT_MODEL@|$LLM_STT_MODEL|g" \
             -e "s|@VLLM_API_KEY@|$VLLM_API_KEY|g" \
             -e "s|@VLLM_EMBEDDING_DIMENSIONS@|$VLLM_EMBEDDING_DIMENSIONS|g" \

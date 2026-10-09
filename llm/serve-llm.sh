@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Entrypoint of the vllm-llm container. ONE script for the four generative
-# profiles, because the compose must not change when the operator switches
-# model: everything profile-specific lives here and in llm/profiles.sh. Three
-# profiles run the unified image (llm/unified/), Flash-Next its own.
+# Entrypoint of the vllm-llm container. ONE script for the five profiles,
+# because the compose must not change when the operator switches model:
+# everything profile-specific lives here and in llm/profiles.sh. Four profiles
+# run the unified image (llm/unified/), Flash-Next its own.
 #
 # Split of responsibilities:
 #   llm/profiles.sh  (host)      model id, image, memory budgets, context window
@@ -47,7 +47,9 @@ case "$LLM_PROFILE" in
     ;;
 
   # --- OrcaSAQ-2-27B — Qwen3.8-27B in a 3.2-bit EXL3 trellis ------------------
-  orcasaq)
+  # orcasaq-batch is the same recipe: what differs (the share, the slots, the
+  # side engines) comes in through the budgets above and llm/profiles.sh.
+  orcasaq|orcasaq-batch)
     # The same recipe as qwen27b, minus what the format changes. No
     # --quantization: config.json says `exl3` and the orcasaq2 plugin baked into
     # the image (llm/exl3/) registers that method when vLLM loads its plugins.

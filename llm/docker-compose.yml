@@ -1,7 +1,8 @@
-# Two vLLM instances (three with transcription) + a tiny nginx proxy on the DGX
-# Spark's Blackwell GPU (GB10, sm_121). The proxy presents a SINGLE
-# OpenAI-compatible endpoint (port ${PROXY_PORT}) and routes by URL path:
-#   • /v1/embeddings  -> vllm-embed (Qwen3-VL-Embedding-8B)
+# One to three vLLM instances + a tiny nginx proxy on the DGX Spark's
+# Blackwell GPU (GB10, sm_121). The proxy presents a SINGLE OpenAI-compatible
+# endpoint (port ${PROXY_PORT}) and routes by URL path:
+#   • /v1/embeddings  -> vllm-embed (Qwen3-VL-Embedding-8B — a compose profile:
+#                                    every model profile but orcasaq-batch)
 #   • /v1/audio/*     -> vllm-stt   (Qwen3-ASR-1.7B, only for the profiles that
 #                                    leave room for it — a compose profile)
 #   • everything else -> vllm-llm   (the selected LLM profile, chat + vision + tools)
@@ -14,8 +15,8 @@
 # from this same pool -> we explicitly bound each one via
 # --gpu-memory-utilization (sum < 1.0, headroom kept for OS/runtime/KV).
 #
-# THIS FILE IS PROFILE-AGNOSTIC. The generative container serves whichever of
-# the three models `LLM_PROFILE` names, and switching does not touch it:
+# THIS FILE IS PROFILE-AGNOSTIC. The generative container serves whichever
+# model `LLM_PROFILE` names, and switching does not touch it:
 #   llm/profiles.sh  (host)      model id, image, memory budgets, context window
 #   llm/serve-llm.sh (container) the vLLM flags and env each model needs
 #   switch-model.sh  (operator)  rewrites .env, the chart values and the database
@@ -87,6 +88,12 @@ services:
       start_period: 2400s
 
   vllm-embed:
+    # Behind a COMPOSE PROFILE since orcasaq-batch (2026-10-09): that model
+    # profile runs the generative engine alone and takes the embed's 20 GiB
+    # for its KV cache. lib/vllm.sh and switch-model.sh write COMPOSE_PROFILES
+    # (`embed`, `stt`, both or neither) from llm/profiles.sh; the proxy's
+    # dependency on this service is `required: false` for the same reason.
+    profiles: ["embed"]
     image: ${VLLM_IMAGE}
     container_name: suite366-vllm-embed
     restart: unless-stopped
@@ -225,8 +232,12 @@ services:
     depends_on:
       vllm-llm:
         condition: service_healthy
+      # Not required: with the `embed` profile off (orcasaq-batch) the service
+      # does not exist and the proxy must still come up — its /v1/embeddings
+      # route resolves per request and answers 502 while nothing serves it.
       vllm-embed:
         condition: service_healthy
+        required: false
     healthcheck:
       # nginx:alpine ships wget (busybox); /health is served by our own conf.
       # Use 127.0.0.1 (not localhost): busybox wget resolves localhost to ::1

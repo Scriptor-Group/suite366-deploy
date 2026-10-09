@@ -2,11 +2,11 @@
 # =============================================================================
 # Suite 366 — switch the appliance's generative model.
 #
-# The appliance can serve four models (llm/profiles.sh). Switching is not just
-# a model id: each needs its share of the unified memory pool and its own vLLM
-# flags (three run the unified image, Flash-Next its own), and the id itself
-# lives in THREE places that must agree or the app breaks in a way nothing
-# reports:
+# The appliance can serve five profiles (llm/profiles.sh). Switching is not
+# just a model id: each needs its share of the unified memory pool and its own
+# vLLM flags (four run the unified image, Flash-Next its own), and the id
+# itself lives in THREE places that must agree or the app breaks in a way
+# nothing reports:
 #
 #   1. $DATA_DIR/llm/.env         what the vLLM container serves
 #   2. $DATA_DIR/values.yaml      -> ConfigMap VLLM_MODEL_* the app reads
@@ -23,6 +23,13 @@
 # down BEFORE the new generative engine starts (it holds memory the bigger
 # model may need) and clears the rows, so the app says "no transcription model"
 # instead of calling a route nothing serves.
+#
+# The EMBEDDING engine follows the same rule since orcasaq-batch (llm/profiles.sh
+# LLM_P_EMBED): that profile runs the generative model alone and takes the
+# embed's memory, so the embed container goes down BEFORE its engine starts,
+# the chart's VLLM_MODEL_EMBEDDING is emptied and the "AIModel" EMBEDDING rows
+# are disabled (and each organisation's default cleared); a switch back brings
+# all three back.
 #
 # Order is deliberate: the new engine must be HEALTHY before anything else is
 # touched. If it fails to come up, .env is restored, the previous engine is
@@ -329,8 +336,20 @@ set_env_stt_keys() {
   set_env STT_KV_CACHE_BYTES "$LLM_STT_KV_CACHE_BYTES"
   set_env STT_MAX_MODEL_LEN "$LLM_STT_MAX_MODEL_LEN"
   set_env STT_MAX_NUM_SEQS  "$LLM_STT_MAX_NUM_SEQS"
-  set_env COMPOSE_PROFILES  "${LLM_P_STT_MODEL:+stt}"
+  # Which side engines the compose brings up: the embed (every profile but
+  # orcasaq-batch) and the transcription engine (the profiles with room).
+  set_env COMPOSE_PROFILES  "$(llm_compose_profiles "$LLM_P_EMBED" "$LLM_P_STT_MODEL")"
 }
+# What the embed serves, for the chart and the database: EMBED_MODEL from .env
+# when the profile runs it, empty when it does not. A box from before the
+# embed model was written to .env gets the installer's default.
+embed_model_for() { # embed_model_for EMBED_FLAG -> model id or empty
+  local m
+  [[ "$1" == "1" ]] || return 0
+  m="$(env_get EMBED_MODEL)"; printf '%s' "${m:-$LLM_EMBED_MODEL_DEFAULT}"
+}
+# Whether the embed container should exist right now, from .env's COMPOSE_PROFILES.
+embed_on_now() { case ",$(env_get COMPOSE_PROFILES)," in *,embed,*) return 0 ;; *) return 1 ;; esac; }
 
 # nginx reads its config once at start; a new nginx.conf laid down under the
 # running proxy is invisible until told. A reload is zero-downtime and a no-op
@@ -412,6 +431,12 @@ publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
       "$(json_str "$(env_get STT_MODEL)")" \
       "$(json_str "$(docker inspect -f '{{.State.Status}}' suite366-vllm-stt 2>/dev/null || true)")" \
       "$(json_str "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' suite366-vllm-stt 2>/dev/null || true)")"
+    # The embedding engine, the same way: `model` is empty when the active
+    # profile runs the generative model alone (orcasaq-batch).
+    printf '  "embed": {"model": %s, "state": %s, "health": %s},\n' \
+      "$(json_str "$(if embed_on_now; then env_get EMBED_MODEL; fi)")" \
+      "$(json_str "$(docker inspect -f '{{.State.Status}}' suite366-vllm-embed 2>/dev/null || true)")" \
+      "$(json_str "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' suite366-vllm-embed 2>/dev/null || true)")"
     printf '  "switch": {"status": %s, "target": %s, "message": %s, "updated_at": %s},\n' \
       "$(json_str "$st")" "$(json_str "$tgt")" "$(json_str "$msg")" "$(json_str "$(date -Is)")"
     printf '  "profiles": ['
@@ -420,12 +445,14 @@ publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
         local dl=false nb=false; if checkpoint_on_disk "$LLM_P_MODEL"; then dl=true; fi
         # "needs_build" is what the UI warns about: a switch that compiles first.
         if needs_build; then nb=true; fi
-        printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s, "stt_model": %s}' \
+        # "embed": false is what lets the card say the profile runs alone
+        # (no document search) before the admin clicks.
+        printf '%s\n    {"key": %s, "model": %s, "summary": %s, "context_window": %s, "needs_build": %s, "downloaded": %s, "stt_model": %s, "embed": %s}' \
           "$( [[ "$first" == 1 ]] && printf '' || printf ',' )" \
           "$(json_str "$p")" "$(json_str "$LLM_P_MODEL")" "$(json_str "$(llm_profile_summary "$p")")" \
           "$LLM_P_CONTEXT_WINDOW" \
           "$nb" "$dl" \
-          "$(json_str "$LLM_P_STT_MODEL")" )
+          "$(json_str "$LLM_P_STT_MODEL")" "$( [[ "$LLM_P_EMBED" == "1" ]] && printf true || printf false )" )
       first=0
     done
     printf '\n  ]\n}\n'
@@ -483,6 +510,7 @@ case "$TARGET" in
     set_env_default LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
     set_env_default LLM_MAX_NUM_SEQS  "$LLM_P_MAX_NUM_SEQS"
     set_env         LLM_MTP_TOKENS    "$LLM_P_MTP_TOKENS"
+    set_env_default EMBED_MODEL       "$LLM_EMBED_MODEL_DEFAULT"
     set_env_default EMBED_GPU_MEM_UTIL "0.20"
     set_env_default EMBED_MAX_MODEL_LEN "8192"
     set_env_default CACHE_DIR         "$DATA_DIR/cache"
@@ -498,9 +526,12 @@ case "$TARGET" in
     fi
     install_vllm_unit
     # Containers whose definition changed are recreated, the others left alone;
-    # a transcription container the profile has no room for is taken down.
+    # a side engine the profile has no room for is taken down.
     if [[ -z "$LLM_P_STT_MODEL" ]]; then
       ( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
+    fi
+    if [[ "$LLM_P_EMBED" != "1" ]]; then
+      ( cd "$LLM_DIR" && docker compose --profile embed rm -sf vllm-embed >/dev/null 2>&1 ) || true
     fi
     publish_state running "$prof" "applying the host layer ($prof)"
     log "docker compose up -d (recreates only what changed)"
@@ -508,6 +539,9 @@ case "$TARGET" in
     if wait_healthy suite366-vllm-llm 30 "engine"; then info "engine healthy."; else warn "engine not healthy — check: docker logs suite366-vllm-llm"; fi
     if [[ -n "$LLM_P_STT_MODEL" ]]; then
       if wait_healthy suite366-vllm-stt 30 "transcription engine"; then info "transcription engine healthy."; else warn "transcription engine not healthy — check: docker logs suite366-vllm-stt"; fi
+    fi
+    if [[ "$LLM_P_EMBED" == "1" ]]; then
+      if wait_healthy suite366-vllm-embed 20 "embedding engine"; then info "embedding engine healthy."; else warn "embedding engine not healthy — check: docker logs suite366-vllm-embed"; fi
     fi
     reload_proxy
     # The app-trigger unit and state.json, exactly as install-units does.
@@ -538,7 +572,7 @@ EOF
     systemctl enable --now suite366-llm-switch.path >/dev/null 2>&1 \
       || warn "could not enable the switch path unit (systemd offline?)."
     publish_state idle
-    log "Host side converged on profile $prof ($LLM_P_MODEL${LLM_P_STT_MODEL:+ + $LLM_P_STT_MODEL})."
+    log "Host side converged on profile $prof ($LLM_P_MODEL${LLM_P_STT_MODEL:+ + $LLM_P_STT_MODEL}$( [[ "$LLM_P_EMBED" == "1" ]] || printf ', alone: no embeddings' ))."
     exit 0 ;;
   publish-state)
     publish_state idle
@@ -589,11 +623,11 @@ EOF
     TARGET="$want"
     ;;
   list)
-    printf '%-12s %-34s %s\n' PROFILE MODEL NOTES
+    printf '%-14s %-34s %s\n' PROFILE MODEL NOTES
     for p in $LLM_PROFILES; do
       ( llm_profile_apply "$p" "$ENGINE_IMAGE" "$FLASH_NEXT_IMAGE"
         mark=' '; if [[ "$p" == "$CUR_PROFILE" ]]; then mark='*'; fi
-        printf '%s%-11s %-34s %s%s\n' "$mark" "$p" "$LLM_P_MODEL" "$(llm_profile_summary "$p")" \
+        printf '%s%-13s %-34s %s%s\n' "$mark" "$p" "$LLM_P_MODEL" "$(llm_profile_summary "$p")" \
           "${LLM_P_STT_MODEL:+ — with transcription ($LLM_P_STT_MODEL)}" )
     done
     printf '\n(* = active)  switch with: %s <profile>\n' "$0"
@@ -607,6 +641,12 @@ EOF
     printf 'chart values   %s\n' "$(sed -n 's/^  VLLM_MODEL_HIGH: "\(.*\)"/\1/p' "$VALUES" 2>/dev/null | head -1)"
     ctr="$(docker inspect -f '{{.Config.Image}} ({{.State.Status}}, {{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}})' suite366-vllm-llm 2>/dev/null || true)"
     printf 'container      %s\n' "${ctr:-absent}"
+    if embed_on_now; then
+      embed_ctr="$(docker inspect -f '{{.State.Status}}, {{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' suite366-vllm-embed 2>/dev/null || true)"
+      printf 'embeddings     %s (%s)\n' "$(env_get EMBED_MODEL)" "${embed_ctr:-container absent}"
+    else
+      printf 'embeddings     none for this profile (the generative model runs alone)\n'
+    fi
     stt_model="$(env_get STT_MODEL)"
     if [[ -n "$stt_model" ]]; then
       stt_ctr="$(docker inspect -f '{{.State.Status}}, {{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' suite366-vllm-stt 2>/dev/null || true)"
@@ -629,6 +669,8 @@ info "budgets    util=$LLM_P_GPU_MEM_UTIL max_model_len=$LLM_P_MAX_MODEL_LEN slo
 info "app ctx    $LLM_P_CONTEXT_WINDOW tokens"
 info "swappiness ${LLM_P_SWAPPINESS:-host default}"
 info "transcription $(env_get STT_MODEL) -> ${LLM_P_STT_MODEL:-none}"
+info "embeddings $(if embed_on_now; then env_get EMBED_MODEL; else printf none; fi) -> $(embed_model_for "$LLM_P_EMBED" || true)"
+[[ "$LLM_P_EMBED" == "1" ]] || info "           ($TARGET runs the generative model ALONE: no document search, no transcription while it is active)"
 
 if [[ "$CUR_PROFILE" == "$TARGET" && "$DRY_RUN" == 0 ]]; then
   info "Already on $TARGET — re-applying anyway (idempotent, recreates the container)."
@@ -643,8 +685,15 @@ fi
 # registered on purpose keeps its own model list. `SQL_STT_MODEL`, when set,
 # overrides the profile's value: the real run passes what actually came up.
 build_sql() {
-  local models_in="" m stt base_like
+  local models_in="" m stt embed embed_dims base_like
   stt="${SQL_STT_MODEL-$LLM_P_STT_MODEL}"
+  # The embedding row follows the same two rules: `SQL_EMBED_MODEL` is what
+  # actually came up (the real run), the profile's answer otherwise.
+  embed="${SQL_EMBED_MODEL-$(embed_model_for "$LLM_P_EMBED" || true)}"
+  # The vector size the app seeded the row with (pgvector indexes that shape):
+  # the chart's value, 4096 (Qwen3-VL-Embedding-8B) when the file lacks it.
+  embed_dims="$(sed -n 's/^  VLLM_EMBEDDING_DIMENSIONS: "\([0-9]*\)"/\1/p' "$VALUES" 2>/dev/null | head -1)"
+  [[ "$embed_dims" =~ ^[0-9]+$ ]] || embed_dims=4096
   base_like="http://$(env_get BIND_IP):$(env_get PROXY_PORT)/%"
   while IFS= read -r m; do
     if [[ -n "$m" ]]; then models_in+="$(printf "'%s'," "$m")"; fi
@@ -654,6 +703,8 @@ build_sql() {
 \set model '$LLM_P_MODEL'
 \set ctx $LLM_P_CONTEXT_WINDOW
 \set stt '$stt'
+\set embed '$embed'
+\set embed_dims $embed_dims
 \set base_like '$base_like'
 SELECT CASE WHEN to_regclass('"public"."AIModel"') IS NULL THEN 'off' ELSE 'on' END AS have_ai \gset
 \if :have_ai
@@ -716,10 +767,53 @@ WITH ours AS (
      AND org."defaultTranscriptionModelId" IN
          (SELECT id FROM "public"."AIModel" WHERE "providerId" IN (SELECT id FROM ours))
   RETURNING 1
+), e_on AS (
+  -- The embedding row, created or re-enabled when the profile serves the
+  -- engine (the app seeds it at organisation creation, but an organisation
+  -- created while orcasaq-batch was active has none). Same shape as the
+  -- app's seed (vllm-provider.ts), dimensions included: pgvector indexes
+  -- that shape.
+  INSERT INTO "public"."AIModel"
+      (id, "providerId", "modelId", "displayName", "modelType", "contextWindow", "maxOutputTokens",
+       "embeddingDimensions", "supportsTools", "supportsVision", "isEnabled", "createdAt")
+  SELECT gen_random_uuid()::text, o.id, :'embed', :'embed', 'EMBEDDING', 8192, 0,
+         :embed_dims, false, false, true, now()
+    FROM ours o WHERE :'embed' <> ''
+  ON CONFLICT ("providerId", "modelId") DO UPDATE
+     SET "isEnabled" = true
+  RETURNING id, "providerId"
+), e_off AS (
+  -- Every other embedding row of ours goes dark (all of them when the profile
+  -- runs the generative model alone): an indexing job must not call a route
+  -- nothing serves.
+  UPDATE "public"."AIModel" SET "isEnabled" = false
+   WHERE "modelType" = 'EMBEDDING' AND "isEnabled" = true
+     AND "providerId" IN (SELECT id FROM ours)
+     AND "modelId" IS DISTINCT FROM :'embed'
+  RETURNING id
+), oe_set AS (
+  -- Each organisation's default embedding model, when unset or one of ours;
+  -- a default an admin pointed at another provider is kept.
+  UPDATE "public"."Organization" org SET "defaultEmbeddingModelId" = e.id
+    FROM e_on e JOIN ours p ON p.id = e."providerId"
+   WHERE org.id = p."organizationId"
+     AND org."defaultEmbeddingModelId" IS DISTINCT FROM e.id
+     AND (org."defaultEmbeddingModelId" IS NULL
+          OR org."defaultEmbeddingModelId" IN
+             (SELECT id FROM "public"."AIModel" WHERE "providerId" IN (SELECT id FROM ours)))
+  RETURNING 1
+), oe_clear AS (
+  UPDATE "public"."Organization" org SET "defaultEmbeddingModelId" = NULL
+   WHERE :'embed' = ''
+     AND org."defaultEmbeddingModelId" IN
+         (SELECT id FROM "public"."AIModel" WHERE "providerId" IN (SELECT id FROM ours))
+  RETURNING 1
 )
 SELECT 'aimodel=' || (SELECT count(*) FROM m) || ' agent=' || (SELECT count(*) FROM a)
     || ' stt_on=' || (SELECT count(*) FROM s_on) || ' stt_off=' || (SELECT count(*) FROM s_off)
-    || ' stt_default=' || ((SELECT count(*) FROM o_set) + (SELECT count(*) FROM o_clear));
+    || ' stt_default=' || ((SELECT count(*) FROM o_set) + (SELECT count(*) FROM o_clear))
+    || ' embed_on=' || (SELECT count(*) FROM e_on) || ' embed_off=' || (SELECT count(*) FROM e_off)
+    || ' embed_default=' || ((SELECT count(*) FROM oe_set) + (SELECT count(*) FROM oe_clear));
 \else
 \echo aimodel=no-table agent=no-table
 \endif
@@ -731,9 +825,11 @@ if [[ "$DRY_RUN" == 1 ]]; then
   echo; info "llm/.env would become:"
   printf '      LLM_PROFILE=%s\n      LLM_MODEL=%s\n      VLLM_LLM_IMAGE=%s\n      LLM_GPU_MEM_UTIL=%s\n      LLM_MAX_MODEL_LEN=%s\n      LLM_MAX_NUM_SEQS=%s\n      LLM_MTP_TOKENS=%s\n      STT_MODEL=%s\n      STT_PORT=%s\n      COMPOSE_PROFILES=%s\n' \
     "$TARGET" "$LLM_P_MODEL" "$LLM_P_IMAGE" "$LLM_P_GPU_MEM_UTIL" "$LLM_P_MAX_MODEL_LEN" "$LLM_P_MAX_NUM_SEQS" "$LLM_P_MTP_TOKENS" \
-    "$LLM_P_STT_MODEL" "${STT_PORT_CUR:-8003}" "${LLM_P_STT_MODEL:+stt}"
+    "$LLM_P_STT_MODEL" "${STT_PORT_CUR:-8003}" "$(llm_compose_profiles "$LLM_P_EMBED" "$LLM_P_STT_MODEL")"
   echo; info "values.yaml: VLLM_MODEL_{HIGH,LIGHT,VISION} -> $LLM_P_MODEL, VLLM_MAX_CONTEXT_WINDOW -> $LLM_P_CONTEXT_WINDOW"
   info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
+  dry_embed="$(embed_model_for "$LLM_P_EMBED" || true)"
+  info "             VLLM_MODEL_EMBEDDING -> ${dry_embed:-\"\" (this profile runs the generative model alone)}"
   echo; info "SQL:"; build_sql | sed 's/^/      /'
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
     echo; info "image build: $LLM_P_IMAGE (from $LLM_FLASH_NEXT_BASE_IMAGE + llm/$LLM_P_BUILD_DIR/, unless already built)"
@@ -747,6 +843,11 @@ if [[ "$DRY_RUN" == 1 ]]; then
     info "transcription container: taken down first, then suite366-vllm-stt up after the engine is healthy"
   else
     echo; info "transcription container: suite366-vllm-stt taken down before the engine starts, and stays down"
+  fi
+  if [[ "$LLM_P_EMBED" == "1" ]]; then
+    info "embedding container: suite366-vllm-embed kept (or brought back after the engine is healthy)"
+  else
+    info "embedding container: suite366-vllm-embed taken down before the engine starts, and stays down"
   fi
   exit 0
 fi
@@ -777,6 +878,7 @@ set_env_stt_keys
 # A box from before the JIT caches or before profiles: give the compose every
 # key it interpolates, with the installer's defaults.
 set_env_default CACHE_DIR "$DATA_DIR/cache"
+set_env_default EMBED_MODEL "$LLM_EMBED_MODEL_DEFAULT"
 set_env_default EMBED_MAX_MODEL_LEN "8192"
 mkdir -p "$(env_get CACHE_DIR)/vllm" "$(env_get CACHE_DIR)/flashinfer" "$(env_get CACHE_DIR)/triton"
 
@@ -792,7 +894,7 @@ rollback() {
   cp "$ENV_BACKUP" "$ENV_FILE"
   if [[ "$SYSCTL_WAS_PRESENT" == 0 ]]; then rm -f "$VLLM_SYSCTL_FILE"; fi
   # The whole stack, not just vllm-llm: the restored .env decides whether the
-  # transcription container (taken down above when the target had none) comes
+  # side engines (taken down above when the target had no room for them) come
   # back with the previous engine.
   ( cd "$LLM_DIR" && docker compose up -d >/dev/null 2>&1 ) || true
   publish_state error "$TARGET" "the $TARGET engine did not come up; rolled back to ${CUR_PROFILE:-the previous model}"
@@ -806,10 +908,18 @@ rollback() {
 # share MINUS everything else resident when it profiles — Gemma at 0.45 got
 # 222k tokens of KV with the transcription engine up during its start and
 # ~300k without (2026-09-25). Taking it down here and bringing it back in 3b
-# gives every switch the same baseline (the embed only), so a profile's KV
-# does not depend on which profile ran before.
+# gives every switch the same baseline (the embed only, when the target keeps
+# it), so a profile's KV does not depend on which profile ran before.
 ( cd "$LLM_DIR" && docker compose --profile stt rm -sf vllm-stt >/dev/null 2>&1 ) || true
 docker rm -f suite366-vllm-stt >/dev/null 2>&1 || true
+# The embed goes down too when the target runs alone: its 0.80 share is the
+# embed's 20 GiB, and vLLM's start-up check (free memory >= share x total)
+# fails with the embed resident. Brought back in 3c when the target keeps it.
+if [[ "$LLM_P_EMBED" != "1" ]]; then
+  log "Taking the embedding engine down ($TARGET runs the generative model alone)"
+  ( cd "$LLM_DIR" && docker compose --profile embed rm -sf vllm-embed >/dev/null 2>&1 ) || true
+  docker rm -f suite366-vllm-embed >/dev/null 2>&1 || true
+fi
 # From here the app's UI can follow along in state.json.
 publish_state running "$TARGET" "starting the $TARGET engine"
 log "Recreating suite366-vllm-llm on $TARGET"
@@ -865,6 +975,37 @@ if [[ -n "$LLM_P_STT_MODEL" ]]; then
   fi
 fi
 
+# --- 3c. the embedding engine, where the profile has one ----------------------
+# The same contract as the transcription engine: not a rollback condition, and
+# what did not come up is left OUT of the chart and the database. Coming from
+# orcasaq-batch the container does not exist and is created here; otherwise it
+# is already running and `up` leaves it alone.
+EMBED_SERVED=""
+if [[ "$LLM_P_EMBED" == "1" ]]; then
+  publish_state running "$TARGET" "starting the embedding engine ($(env_get EMBED_MODEL))"
+  log "Starting suite366-vllm-embed ($(env_get EMBED_MODEL))"
+  if ( cd "$LLM_DIR" && docker compose --profile embed up -d vllm-embed >/dev/null ); then
+    embed_deadline=$(( $(date +%s) + 1200 ))
+    while :; do
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' suite366-vllm-embed 2>/dev/null || echo gone)"
+      state="$(docker inspect -f '{{.State.Status}}' suite366-vllm-embed 2>/dev/null || echo gone)"
+      if [[ "$health" == healthy ]]; then EMBED_SERVED="$(env_get EMBED_MODEL)"; break; fi
+      if [[ "$state" != running ]]; then warn "embedding container state: $state"; break; fi
+      if [[ "$(date +%s)" -ge "$embed_deadline" ]]; then warn "embedding engine still $health after 20 min"; break; fi
+      publish_state running "$TARGET" "waiting for the embedding engine ($health)"
+      sleep 10
+    done
+  else
+    warn "docker compose could not start vllm-embed."
+  fi
+  if [[ -n "$EMBED_SERVED" ]]; then
+    info "embedding engine healthy."
+  else
+    warn "The embedding engine did not come up; the generative model is unaffected."
+    warn "  Document search stays OFF in the app until it does. Logs: docker logs suite366-vllm-embed"
+  fi
+fi
+
 # --- 4. the chart values the app reads ----------------------------------------
 # From here the engine is ALREADY serving the new model. A failure below must be
 # reported with the command that finishes the job, never abort the script: dying
@@ -879,6 +1020,10 @@ if [[ -f "$VALUES" ]]; then
     || warn "could not rewrite VLLM_MODEL_* in $VALUES"
   sed -i -E "s#^(\s*VLLM_MAX_CONTEXT_WINDOW:\s*).*#\1\"$LLM_P_CONTEXT_WINDOW\"#" "$VALUES" \
     || warn "could not rewrite VLLM_MAX_CONTEXT_WINDOW in $VALUES"
+  # Empty when the profile runs alone: the app then says "no embedding model"
+  # (document indexing refuses cleanly) instead of 502s on /v1/embeddings.
+  sed -i -E "s#^(\s*VLLM_MODEL_EMBEDDING:\s*).*#\1\"$EMBED_SERVED\"#" "$VALUES" \
+    || warn "could not rewrite VLLM_MODEL_EMBEDDING in $VALUES"
   if grep -qE '^\s*VLLM_MODEL_TRANSCRIPTION:' "$VALUES"; then
     sed -i -E "s#^(\s*VLLM_MODEL_TRANSCRIPTION:\s*).*#\1\"$STT_SERVED\"#" "$VALUES" \
       || warn "could not rewrite VLLM_MODEL_TRANSCRIPTION in $VALUES"
@@ -909,6 +1054,7 @@ pg_deploy() {
 }
 log "Realigning the model ids stored in Postgres"
 SQL_STT_MODEL="$STT_SERVED"
+SQL_EMBED_MODEL="$EMBED_SERVED"
 pg="$(pg_deploy)"
 if [[ -z "$pg" ]]; then
   warn "No -postgres deployment found in ns $NAMESPACE — database NOT updated."
@@ -958,7 +1104,8 @@ PYW
   rm -f "$wav"
 fi
 
-publish_state success "$TARGET" "now serving $LLM_P_MODEL${STT_SERVED:+ + $STT_SERVED for transcription}"
+publish_state success "$TARGET" "now serving $LLM_P_MODEL${STT_SERVED:+ + $STT_SERVED for transcription}${EMBED_SERVED:+ + $EMBED_SERVED for embeddings}"
 set -e
-log "Now serving $LLM_P_MODEL ($TARGET)${STT_SERVED:+ with $STT_SERVED for transcription}."
+log "Now serving $LLM_P_MODEL ($TARGET)${STT_SERVED:+ with $STT_SERVED for transcription}${EMBED_SERVED:+ and $EMBED_SERVED for embeddings}."
+[[ "$LLM_P_EMBED" == "1" ]] || info "The generative model runs alone: no document search and no transcription until another profile is switched to."
 info "Check it end to end:  $0 status"
