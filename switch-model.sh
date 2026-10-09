@@ -348,8 +348,13 @@ embed_model_for() { # embed_model_for EMBED_FLAG -> model id or empty
   [[ "$1" == "1" ]] || return 0
   m="$(env_get EMBED_MODEL)"; printf '%s' "${m:-$LLM_EMBED_MODEL_DEFAULT}"
 }
-# Whether the embed container should exist right now, from .env's COMPOSE_PROFILES.
-embed_on_now() { case ",$(env_get COMPOSE_PROFILES)," in *,embed,*) return 0 ;; *) return 1 ;; esac; }
+# Whether the embed is served right now: .env lists it, or the container runs
+# (a box whose .env predates the `embed` compose profile has it running
+# unlisted until converge rewrites the key).
+embed_on_now() {
+  case ",$(env_get COMPOSE_PROFILES)," in *,embed,*) return 0 ;; esac
+  [[ "$(docker inspect -f '{{.State.Status}}' suite366-vllm-embed 2>/dev/null || true)" == running ]]
+}
 
 # nginx reads its config once at start; a new nginx.conf laid down under the
 # running proxy is invisible until told. A reload is zero-downtime and a no-op
@@ -669,7 +674,7 @@ info "budgets    util=$LLM_P_GPU_MEM_UTIL max_model_len=$LLM_P_MAX_MODEL_LEN slo
 info "app ctx    $LLM_P_CONTEXT_WINDOW tokens"
 info "swappiness ${LLM_P_SWAPPINESS:-host default}"
 info "transcription $(env_get STT_MODEL) -> ${LLM_P_STT_MODEL:-none}"
-info "embeddings $(if embed_on_now; then env_get EMBED_MODEL; else printf none; fi) -> $(embed_model_for "$LLM_P_EMBED" || true)"
+info "embeddings $(if embed_on_now; then env_get EMBED_MODEL; else printf none; fi) -> $(if [[ "$LLM_P_EMBED" == "1" ]]; then embed_model_for 1; else printf none; fi)"
 [[ "$LLM_P_EMBED" == "1" ]] || info "           ($TARGET runs the generative model ALONE: no document search, no transcription while it is active)"
 
 if [[ "$CUR_PROFILE" == "$TARGET" && "$DRY_RUN" == 0 ]]; then

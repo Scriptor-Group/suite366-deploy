@@ -60,6 +60,8 @@ echo "docker $*" >> "$DOCKER_LOG"
 case "$1 $2" in
   "inspect -f")
     # health / state / image for any container; healthy so the waits return at once
+    # STUB_NO_EMBED=1: the embed container does not exist (a box on orcasaq-batch).
+    if [[ "$4" == suite366-vllm-embed && "${STUB_NO_EMBED:-0}" == 1 ]]; then exit 1; fi
     case "$3" in
       *Health*) echo healthy ;;
       *Status*) echo running ;;
@@ -191,7 +193,7 @@ absent "qwen27b : le conteneur embed n'est pas retiré" "$(cat "$BOX2/docker.log
 # une part, il la garde.
 BB="$WORK/batch-box"; mkbox "$BB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq-batch"; mkdir -p "$BB/systemd"
 sed -i -e 's|^VLLM_IMAGE=.*|VLLM_IMAGE=ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1|' -e 's|^LLM_GPU_MEM_UTIL=.*|LLM_GPU_MEM_UTIL=0.80|' "$BB/llm/.env"
-out="$(conv "$BB")"; rc=$?
+out="$(STUB_NO_EMBED=1 conv "$BB")"; rc=$?
 check "orcasaq-batch : converge sort en 0"            "$rc" "0"
 check "orcasaq-batch : aucun profil compose"          "$(envv "$BB" COMPOSE_PROFILES)" ""
 check "orcasaq-batch : STT_MODEL vide"                "$(envv "$BB" STT_MODEL)" ""
