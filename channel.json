@@ -3,11 +3,11 @@
   "chart_version": "0.10.3",
   "app_version": "1.12.2",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
-  "updater_sha256": "e0564b8118d9eb302b60c4de3ff152e499b635bb15f3968416a6c570b7bdc449",
-  "backup_sha256": "c28c0e1264b46d814371b45e1d2a48a8c3ad5e31fa4a16c61e6d2a7bcef6853e",
-  "host_layer_sha256": "b44337ad42f343c310264208e5f9edd8ffb7fe255f35f6efb98be57fb1ce0966",
+  "updater_sha256": "2733f30c05fffb9ae71da75ee3ca3683cce9926a0e01dd83ea754eef1ba4f1e6",
+  "backup_sha256": "ddfc08bc36eea900c71b69da1efbff4e7d87fa65fba19532d1ddd63587e28022",
+  "host_layer_sha256": "5701985b0d3a463710e4cd32123890ec31721efaa43ea48cf7eb09f5be249d5c",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "vLLM: ONE unified image (official v0.30.0 + exllamav3/EXL3 + audio extras + Gemma template, published by CI) for qwen27b/orcasaq/gemma, the transcription engine and the embed - nothing to compile on the box any more; Gemma off the 0.19 nightly, prefix cache restored (--disable-hybrid-kv-cache-manager); nginx resolves every backend per request (no more crossed routes after a restart); Flash-Next keeps its own image on v0.29.0"
+  "notes": "New model profile orcasaq-batch: OrcaSAQ alone on the box (embed and transcription engines down, 0.80 of the pool = 1.9M tokens of KV, 8 parallel requests of 262k) for code agents run in batch; the embed is behind a compose profile like transcription, and a switch moves its chart value and database rows the same way"
 }

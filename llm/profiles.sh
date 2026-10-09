@@ -1,17 +1,18 @@
 # shellcheck shell=bash
 # =============================================================================
-# llm/profiles.sh — the four generative models the appliance can serve, and
-# the transcription model that rides along with the ones that leave room for it.
+# llm/profiles.sh — the five profiles the appliance can serve (four generative
+# models, one of them twice), and the two side engines — embeddings and
+# transcription — that ride along with the profiles that leave room for them.
 #
 # SINGLE source of truth, sourced by two callers that cannot share code
 # otherwise: lib/config.sh at install time, and switch-model.sh on a running
 # box (a standalone script, no lib/). Keep it dependency-free: no logging
 # helpers, no `set -e` assumptions, pure parameter assignment.
 #
-# A profile is the whole recipe, not just a model id. The four differ in the
-# share of the unified pool they can take and the context they can actually
-# seat — every number here was measured on the test Spark and the reasoning
-# lives next to it. The vLLM FLAGS live in llm/serve-llm.sh, which runs inside
+# A profile is the whole recipe, not just a model id. They differ in the
+# share of the unified pool they can take, the context they can actually seat
+# and which side engines run next to them — every number here was measured on
+# the test Spark and the reasoning lives next to it. The vLLM FLAGS live in llm/serve-llm.sh, which runs inside
 # the container; this file is the host-side table.
 #
 # Images: three of the four profiles, the transcription engine and the embed
@@ -22,10 +23,27 @@
 # =============================================================================
 
 # Order matters: it is the order the operator sees in `switch-model.sh --list`.
-LLM_PROFILES="qwen27b orcasaq flash-next gemma"
+LLM_PROFILES="qwen27b orcasaq orcasaq-batch flash-next gemma"
 
 llm_profile_known() { # llm_profile_known KEY
   case " $LLM_PROFILES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# --- Embeddings ----------------------------------------------------------------
+# The second vLLM, Qwen3-VL-Embedding-8B in pooling mode on /v1/embeddings: what
+# the app's document search and knowledge indexing call. ~20 GiB resident
+# (0.20 of the pool to clear vLLM's start-up check, a 4 GiB KV budget in the
+# compose). Every profile serves it except the one that exists to take its
+# memory (orcasaq-batch): LLM_P_EMBED says which. Behind a compose profile like
+# the transcription engine, so that a switch can take it down and bring it back
+# (llm_compose_profiles writes COMPOSE_PROFILES). The model id itself stays
+# EMBED_MODEL in llm/.env — the same for every profile that serves one.
+LLM_EMBED_MODEL_DEFAULT="Qwen/Qwen3-VL-Embedding-8B"
+llm_compose_profiles() { # llm_compose_profiles EMBED_FLAG STT_MODEL -> COMPOSE_PROFILES for .env
+  local out=""
+  [[ "${1:-1}" == "1" ]] && out="embed"
+  [[ -n "${2:-}" ]] && out="${out:+$out,}stt"
+  printf '%s' "$out"
 }
 
 # --- Transcription (speech-to-text) -------------------------------------------
@@ -100,7 +118,8 @@ llm_flash_next_image() { # llm_flash_next_image [PATCHES_COMMIT] -> the tag of t
 # NEEDS_BUILD (0|1) with BUILD_DIR (the llm/ subdirectory holding the
 # Dockerfile the image is built from, when NEEDS_BUILD is 1), SWAPPINESS
 # (empty = leave the host default), STT_MODEL (the transcription model served
-# next to it; empty = none).
+# next to it; empty = none), EMBED (1 = the embedding engine runs next to it,
+# 0 = it is taken down: the profile needs its memory).
 #
 # The LLM_P_ prefix is not decoration: it keeps the profile's values distinct
 # from the operator's, so install-time code can write `${LLM_MODEL:-$LLM_P_MODEL}`
@@ -136,6 +155,7 @@ llm_profile_apply() {
       LLM_P_SWAPPINESS=""
       # 34 GiB free measured next to it.
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
+      LLM_P_EMBED="1"
       ;;
     orcasaq)
       # OrcaSAQ-2-27B: Qwen3.8-27B again, quantised by orcarouter with a
@@ -174,6 +194,44 @@ llm_profile_apply() {
       LLM_P_BUILD_DIR=""
       LLM_P_SWAPPINESS=""
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
+      LLM_P_EMBED="1"
+      ;;
+    orcasaq-batch)
+      # OrcaSAQ again, ALONE on the box: no embedding engine, no transcription
+      # engine, the whole pool for one generative model. For code agents run
+      # in batch — many parallel requests, each with as much context as the
+      # model has — where document search and dictation are not what the box
+      # is for. Measured 2026-10-09 on the test Spark (vLLM 0.30, unified
+      # image), embed and transcription down: at 0.80 the KV cache is
+      # 1,897,981 fp8 tokens = 7.2 full 262k requests (771,787 at 0.45 next to
+      # the two side engines); 110/121 GiB used, 10-14 GiB available under
+      # load, no memory pressure, 0 errors over an hour of benches. 0.85 would
+      # leave ~4 GiB: no. Single-stream speed is orcasaq's (31 t/s prose, 42
+      # code, 1,040 tok/s of prefill); the aggregate over parallel streams
+      # plateaus at ~75 t/s from 8 streams on (66 t/s over 4, 73 over 8, 78
+      # over 16 — the EXL3 decode is compute-bound in batch, with or without
+      # the MTP head), so 8 slots: a 9th request queues at no cost in
+      # throughput, where 16 slots only stretched every stream to 5.6 t/s.
+      # MTP k=3 stays: it wins up to 4 streams (66 against 47 t/s) and ties at
+      # 8. Context is the model's native 262k; a 242k-token prompt prefills in
+      # 410 s (590 tok/s, attention slows with length) and hits the prefix
+      # cache in 6 s afterwards, which is what an agent loop relies on. YaRN to
+      # 1M was measured working (2.05 requests of 1M) and left out: 484k tokens
+      # took 21 min of prefill and the model card warns static YaRN costs
+      # quality on short texts.
+      LLM_P_MODEL="orcarouter/OrcaSAQ-2-27B"
+      LLM_P_IMAGE="$engine_image"
+      LLM_P_GPU_MEM_UTIL="0.80"
+      LLM_P_MAX_MODEL_LEN="262144"
+      LLM_P_MAX_NUM_SEQS="8"
+      LLM_P_CONTEXT_WINDOW="200000"
+      LLM_P_MTP_TOKENS="3"
+      LLM_P_NEEDS_BUILD="0"
+      LLM_P_BUILD_DIR=""
+      LLM_P_SWAPPINESS=""
+      # Both side engines down: 0.80 is their memory.
+      LLM_P_STT_MODEL=""
+      LLM_P_EMBED="0"
       ;;
     flash-next)
       # 176B ultra-sparse MoE, 6B active. 123.5 GB on disk for 121.6 GiB of RAM:
@@ -199,6 +257,7 @@ llm_profile_apply() {
       LLM_P_SWAPPINESS="10"
       # 5 GiB free and swap already in use: nothing else fits beside it.
       LLM_P_STT_MODEL=""
+      LLM_P_EMBED="1"
       ;;
     gemma)
       # The appliance's original model, kept so a box can go back to what it
@@ -233,6 +292,7 @@ llm_profile_apply() {
       # Measured 2026-09-25 with the share above: both engines up, 87/121 GiB
       # used, 35 s of French transcribed in 2.6 s through the proxy.
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
+      LLM_P_EMBED="1"
       ;;
     *) return 1 ;;
   esac
@@ -243,6 +303,7 @@ llm_profile_summary() { # llm_profile_summary KEY
   case "$1" in
     qwen27b)    printf 'dense 27B, NVFP4 — 262k context, ~20 t/s, real headroom' ;;
     orcasaq)    printf 'dense 27B, 3.2-bit EXL3 — 262k context, ~38 t/s, 12 GB of weights' ;;
+    orcasaq-batch) printf 'the same 27B EXL3 ALONE on the box — 8 parallel requests of 262k (1.9M tokens of KV), no embeddings, no transcription' ;;
     flash-next) printf 'MoE 176B-A6B — 131k context, ~30 t/s, n-gram table on the NVMe, no memory headroom, own image (vLLM 0.29)' ;;
     gemma)      printf 'MoE 26B-A4B — 262k context, ~30 t/s, the model the appliance shipped with' ;;
   esac

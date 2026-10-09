@@ -218,6 +218,11 @@ VLLM_LLM_IMAGE="${VLLM_LLM_IMAGE:-$LLM_P_IMAGE}"
 # empty turns it off on a box that needs the memory for something else — `-`
 # not `:-`, so that empty is an answer, as for LLM_MTP_TOKENS below.
 LLM_STT_MODEL="${LLM_STT_MODEL-$LLM_P_STT_MODEL}"
+# Embeddings: the profile decides too (LLM_P_EMBED; orcasaq-batch runs the
+# generative model alone). What the chart's VLLM_MODEL_EMBEDDING receives:
+# EMBED_MODEL when the engine runs, empty when it does not, so the app says
+# "no embedding model" instead of calling a route nothing serves.
+if [[ "$LLM_P_EMBED" == "1" ]]; then EMBED_MODEL_SERVED="$EMBED_MODEL"; else EMBED_MODEL_SERVED=""; fi
 VLLM_STT_IMAGE_SET="${VLLM_STT_IMAGE:+1}"
 VLLM_STT_IMAGE="${VLLM_STT_IMAGE:-$VLLM_IMAGE}"
 # Tiny URL-path proxy unifying the two vLLM instances behind a single
@@ -273,7 +278,8 @@ LICENSE_MIN_APP="${LICENSE_MIN_APP:-1.12.0}"
 #
 # The GENERATIVE side is profile-driven (llm/profiles.sh carries each model's
 # measured fraction, context and slot count, with the reasoning next to it).
-# Only the embed is fixed here, because it runs unchanged under all four.
+# Only the embed is fixed here, because it runs unchanged under every profile
+# that serves it (orcasaq-batch takes it down).
 #
 #   EMBED 0.20 + an explicit 4 GiB KV budget in the compose
 #     (--kv-cache-memory-bytes): ~20 GiB. The fraction alone was the wrong tool:

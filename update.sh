@@ -1874,7 +1874,13 @@ SQL
       *)      info "  stored key accepted on /v1/chat/completions." ;;
     esac
   fi
-  if [[ -n "${EMBED_MODEL:-}" ]]; then
+  # A profile that runs the generative model alone (orcasaq-batch) has no
+  # embed container: nothing to verify there, and "did not answer" would be
+  # a false alarm on every run.
+  if [[ -n "${EMBED_MODEL:-}" ]] && command -v docker >/dev/null 2>&1 \
+     && ! docker inspect suite366-vllm-embed >/dev/null 2>&1; then
+    info "  /v1/embeddings: no embed container (the active profile serves none) — skipped."
+  elif [[ -n "${EMBED_MODEL:-}" ]]; then
     case "$(vllm_verdict "$(vllm_http_code "$base/v1/embeddings" "$dbkey" 30 \
               "{\"model\":\"$EMBED_MODEL\",\"input\":\"ping\"}")")" in
       denied) bad=1; warn "  /v1/embeddings REJECTED the stored key (the embed container is on another key)." ;;

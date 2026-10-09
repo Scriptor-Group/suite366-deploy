@@ -163,7 +163,7 @@ STT_GPU_MEM_UTIL=$LLM_STT_GPU_MEM_UTIL
 STT_KV_CACHE_BYTES=$LLM_STT_KV_CACHE_BYTES
 STT_MAX_MODEL_LEN=$LLM_STT_MAX_MODEL_LEN
 STT_MAX_NUM_SEQS=$LLM_STT_MAX_NUM_SEQS
-COMPOSE_PROFILES=${LLM_STT_MODEL:+stt}
+COMPOSE_PROFILES=$(llm_compose_profiles "$LLM_P_EMBED" "$LLM_STT_MODEL")
 EOF
 )"
   ( umask 077; printf '%s\n' "$env_new" > "$env_file" )
@@ -203,10 +203,14 @@ EOF
   else
     warn "vLLM generative not ready yet (see: docker logs suite366-vllm-llm)."
   fi
-  if wait_http "http://$SUITE_IP:$EMBED_PORT/health" "vLLM embeddings"; then
-    warmup_embed "http://$SUITE_IP:$EMBED_PORT" "$EMBED_MODEL"
+  if [[ "$LLM_P_EMBED" == "1" ]]; then
+    if wait_http "http://$SUITE_IP:$EMBED_PORT/health" "vLLM embeddings"; then
+      warmup_embed "http://$SUITE_IP:$EMBED_PORT" "$EMBED_MODEL"
+    else
+      warn "vLLM embeddings not ready yet (see: docker logs suite366-vllm-embed)."
+    fi
   else
-    warn "vLLM embeddings not ready yet (see: docker logs suite366-vllm-embed)."
+    info "no embedding engine: the $LLM_PROFILE profile runs the generative model alone."
   fi
   if [[ -n "$LLM_STT_MODEL" ]]; then
     if wait_http "http://$SUITE_IP:$STT_PORT/health" "vLLM transcription"; then
@@ -215,8 +219,9 @@ EOF
       warn "vLLM transcription not ready yet (see: docker logs suite366-vllm-stt)."
     fi
   fi
-  # The nginx proxy only becomes healthy once both vLLM backends are healthy
-  # (depends_on: service_healthy). nginx itself starts in ~1s.
+  # The nginx proxy only becomes healthy once the vLLM backends it depends on
+  # are healthy (depends_on: service_healthy; the embed is not required).
+  # nginx itself starts in ~1s.
   if wait_http "http://$SUITE_IP:$PROXY_PORT/health" "vLLM unified proxy"; then
     info "  unified proxy ready at http://$SUITE_IP:$PROXY_PORT/v1"
   else

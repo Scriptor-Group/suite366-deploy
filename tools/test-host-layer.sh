@@ -60,6 +60,8 @@ echo "docker $*" >> "$DOCKER_LOG"
 case "$1 $2" in
   "inspect -f")
     # health / state / image for any container; healthy so the waits return at once
+    # STUB_NO_EMBED=1: the embed container does not exist (a box on orcasaq-batch).
+    if [[ "$4" == suite366-vllm-embed && "${STUB_NO_EMBED:-0}" == 1 ]]; then exit 1; fi
     case "$3" in
       *Health*) echo healthy ;;
       *Status*) echo running ;;
@@ -142,7 +144,7 @@ check ".env : CACHE_DIR par défaut"                 "$(envv "$BOX" CACHE_DIR)" 
 check ".env : pas de tête MTP pour Gemma"           "$(envv "$BOX" LLM_MTP_TOKENS)" ""
 # Depuis le 25/09/2026 Gemma sert la transcription : une box de juillet la reçoit à la convergence.
 check ".env : transcription pour Gemma"             "$(envv "$BOX" STT_MODEL)" "Qwen/Qwen3-ASR-1.7B"
-check ".env : profil compose stt activé"            "$(envv "$BOX" COMPOSE_PROFILES)" "stt"
+check ".env : profils compose embed + stt"          "$(envv "$BOX" COMPOSE_PROFILES)" "embed,stt"
 check ".env : STT_PORT par défaut"                  "$(envv "$BOX" STT_PORT)" "8003"
 if [[ -d "$BOX/cache/vllm" && -d "$BOX/cache/flashinfer" && -d "$BOX/cache/triton" ]]; then ok "caches JIT créés"; else ko "caches JIT créés"; fi
 D="$(cat "$BOX/docker.log")"
@@ -182,7 +184,29 @@ out="$(conv "$BOX2")"
 check "qwen27b : profil reconnu"            "$(envv "$BOX2" LLM_PROFILE)" "qwen27b"
 check "qwen27b : image = l'unifiée construite sur la box" "$(envv "$BOX2" VLLM_LLM_IMAGE)" "suite366/vllm-unified:v0.29.0-u1"
 check "qwen27b : transcription activée"     "$(envv "$BOX2" STT_MODEL)" "Qwen/Qwen3-ASR-1.7B"
-check "qwen27b : profil compose stt"        "$(envv "$BOX2" COMPOSE_PROFILES)" "stt"
+check "qwen27b : profils compose embed + stt" "$(envv "$BOX2" COMPOSE_PROFILES)" "embed,stt"
+absent "qwen27b : le conteneur embed n'est pas retiré" "$(cat "$BOX2/docker.log")" "rm -sf vllm-embed"
+
+# orcasaq-batch tourne SEUL : à la convergence les deux moteurs annexes sont
+# retirés, aucun profil compose n'est écrit, et state.json le dit à l'app.
+# La box a basculé dessus (la bascule a écrit 0.80) ; converge ne relève jamais
+# une part, il la garde.
+BB="$WORK/batch-box"; mkbox "$BB" orcarouter/OrcaSAQ-2-27B "LLM_PROFILE=orcasaq-batch"; mkdir -p "$BB/systemd"
+sed -i -e 's|^VLLM_IMAGE=.*|VLLM_IMAGE=ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1|' -e 's|^LLM_GPU_MEM_UTIL=.*|LLM_GPU_MEM_UTIL=0.80|' "$BB/llm/.env"
+out="$(STUB_NO_EMBED=1 conv "$BB")"; rc=$?
+check "orcasaq-batch : converge sort en 0"            "$rc" "0"
+check "orcasaq-batch : aucun profil compose"          "$(envv "$BB" COMPOSE_PROFILES)" ""
+check "orcasaq-batch : STT_MODEL vide"                "$(envv "$BB" STT_MODEL)" ""
+check "orcasaq-batch : part 0.80"                     "$(envv "$BB" LLM_GPU_MEM_UTIL)" "0.80"
+check "orcasaq-batch : EMBED_MODEL conservé dans .env (le compose l'interpole)" "$(envv "$BB" EMBED_MODEL)" "Qwen/Qwen3-VL-Embedding-8B"
+D="$(cat "$BB/docker.log")"
+contains "orcasaq-batch : conteneur embed retiré"     "$D" "docker compose --profile embed rm -sf vllm-embed"
+contains "orcasaq-batch : conteneur STT retiré"       "$D" "docker compose --profile stt rm -sf vllm-stt"
+contains "orcasaq-batch : l'opérateur sait qu'il tourne seul" "$out" "alone: no embeddings"
+SB="$BB/llm-state/state.json"
+check "orcasaq-batch : state — embed absent"          "$(python3 -c "import json;print(json.load(open('$SB'))['embed']['model'])")" ""
+check "orcasaq-batch : state — la carte du profil le dit" "$(python3 -c "import json;print([p for p in json.load(open('$SB'))['profiles'] if p['key']=='orcasaq-batch'][0]['embed'])")" "False"
+check "qwen27b : state — embed servi"                 "$(python3 -c "import json;print(json.load(open('$BOX2/llm-state/state.json'))['embed']['model'])")" "Qwen/Qwen3-VL-Embedding-8B"
 check "qwen27b : tête MTP à 3"              "$(envv "$BOX2" LLM_MTP_TOKENS)" "3"
 absent "qwen27b : le conteneur STT n'est pas retiré" "$(cat "$BOX2/docker.log")" "rm -sf vllm-stt"
 

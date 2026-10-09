@@ -28,7 +28,7 @@ summary() {
         network-independent so the app keeps working across LAN changes/offline.)
    • Direct vLLM endpoints (debug, from the box):
        - Generative : http://$SUITE_IP:$LLM_PORT/v1   (model: $LLM_MODEL)
-       - Embeddings : http://$SUITE_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)
+       - Embeddings : ${EMBED_MODEL_SERVED:+http://$SUITE_IP:$EMBED_PORT/v1 (model: $EMBED_MODEL)}${EMBED_MODEL_SERVED:-none — the $LLM_PROFILE profile runs the generative model alone}
        - Transcription : ${LLM_STT_MODEL:+http://$SUITE_IP:$STT_PORT/v1 (model: $LLM_STT_MODEL)}${LLM_STT_MODEL:-none — the $LLM_PROFILE profile leaves no room for it}
    • API key (shared by vLLM + Suite 366): fingerprint $(printf '%s' "$VLLM_API_KEY" | sha256sum | cut -c1-12)
        In clear in $DATA_DIR/llm/.env (root-only) — not reprinted here, for the

@@ -101,7 +101,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | the appliance administrator: the only account allowed to register the first organisation (cf. § Licensing and several organisations) |
 | `LICENSE_KEY` | empty | optional instance licence (EdDSA JWT, scope `instance`): several organisations, seats pooled. A secret, kept across re-runs |
-| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `flash-next` or `gemma` (cf. § Choosing a model) |
+| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
 | `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next and OrcaSAQ are built on it (the `gemma` profile pins its own) |
@@ -313,24 +313,26 @@ plumbing, not the AI path.
 
 ## Choosing a model
 
-The appliance serves ONE generative model at a time, out of four that were each
-measured end to end on the test Spark. `LLM_PROFILE` picks it at install time,
-`switch-model.sh` changes it afterwards without a reinstall.
+The appliance serves ONE generative model at a time, out of five profiles (four
+models, one of them in two configurations) that were each measured end to end
+on the test Spark. `LLM_PROFILE` picks it at install time, `switch-model.sh`
+changes it afterwards without a reinstall.
 
-| | `qwen27b` *(default)* | `orcasaq` | `flash-next` | `gemma` |
-|---|---|---|---|---|
-| Model | Qwen3.8-27B-NVFP4 | OrcaSAQ-2-27B | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
-| Shape | dense 27B hybrid | the same 27B, 3.2-bit trellis | MoE 176B, 6B active | MoE 26B, 4B active |
-| On disk | 21.9 GB | 12.3 GB | 123.5 GB | 18 GB |
-| Resident | 20.8 GiB | 11.5 GiB | 77.1 GiB | 18.0 GiB |
-| Context served | 262,144 | 262,144 | 131,072 | 262,144 |
-| Decode, French prose | 19-20 t/s | 38.1 t/s | 26.7 t/s | 28-30 t/s |
-| Decode, code | ~30 t/s | 45.0 t/s | 34.9 t/s | not measured |
-| Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 69k in 33 s | 62k in 65 s |
-| Swap in use, idle | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
-| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
-| Vision | yes | no (text-only checkpoint) | yes | yes |
-| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
+| | `qwen27b` *(default)* | `orcasaq` | `orcasaq-batch` | `flash-next` | `gemma` |
+|---|---|---|---|---|---|
+| Model | Qwen3.8-27B-NVFP4 | OrcaSAQ-2-27B | OrcaSAQ-2-27B, alone on the box | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
+| Shape | dense 27B hybrid | the same 27B, 3.2-bit trellis | the same | MoE 176B, 6B active | MoE 26B, 4B active |
+| On disk | 21.9 GB | 12.3 GB | 12.3 GB | 123.5 GB | 18 GB |
+| Resident | 20.8 GiB | 11.5 GiB | 11.5 GiB + 67 GiB of KV | 77.1 GiB | 18.0 GiB |
+| Context served | 262,144 | 262,144 | 262,144, 8 requests at once | 131,072 | 262,144 |
+| Decode, French prose | 19-20 t/s | 38.1 t/s | 31 t/s alone, ~75 t/s over 8 streams | 26.7 t/s | 28-30 t/s |
+| Decode, code | ~30 t/s | 45.0 t/s | 42 t/s | 34.9 t/s | not measured |
+| Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 35k in 34 s; 242k in 410 s | 69k in 33 s | 62k in 65 s |
+| Swap in use, idle | 0 | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
+| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
+| Vision | yes | no (text-only checkpoint) | no | yes | yes |
+| Embeddings | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B | **none** (its memory is the KV cache) | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B |
+| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | **none** | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
 
 **`qwen27b` is the default** because it leaves the box real headroom: 20.8 GiB
 of weights, a KV cache of ~800k fp8 tokens (3x a full 262k request) and zero
@@ -360,6 +362,29 @@ Tool calling (`qwen3_xml`) and the reasoning parser work as on `qwen27b`. The
 quantiser is not public and the checkpoint was a day old when this was
 measured; its quality claims are the card's, not ours.
 
+**`orcasaq-batch` is the same OrcaSAQ with the whole box to itself**, for code
+agents run in batch: many parallel requests, each with as much context as the
+model has, on a box where document search and dictation are not what it is
+for. The embedding engine and the transcription engine are taken down and the
+generative engine takes 0.80 of the pool instead of 0.45. Measured on
+2026-10-09 (vLLM 0.30, the unified image): the KV cache goes from 771,787 to
+**1,897,981 fp8 tokens — 7.2 full 262k requests in flight** — with the box at
+110/121 GiB and 10-14 GiB still available under load, no memory pressure, no
+error over an hour of benches (0.85 would leave ~4 GiB: no). One stream is
+orcasaq's speed; the aggregate over parallel streams plateaus at ~75 t/s from
+8 streams on (66 t/s over 4, 73 over 8, 78 over 16 — the EXL3 decode is
+compute-bound in batch, with or without the MTP head, which still wins up to 4
+streams), hence 8 slots: a 9th request queues at no cost in throughput, where
+16 slots only stretched every stream to 5.6 t/s. A 242k-token prompt prefills
+in 410 s (590 tok/s — attention slows with length) and hits the prefix cache
+in 6 s afterwards, which is what an agent loop relies on. The context stays the
+model's native 262k: YaRN to 1M was measured working (2.05 requests of 1M of
+KV) and left out, because 484k tokens took 21 minutes of prefill and the model
+card warns that static YaRN costs quality on short texts. While this profile is
+active the app has **no embedding model** (document indexing refuses cleanly,
+existing indexes keep serving nothing new) and **no transcription**; switching
+to any other profile brings both engines and their database rows back.
+
 **`flash-next` is the strongest and the fastest, and it runs at the wall.** The
 checkpoint is 123.5 GiB for 121.6 GiB of RAM; it only fits because the 47.7 GiB
 n-gram table is served from the NVMe by `mmap` instead of being loaded (a token
@@ -385,7 +410,7 @@ parameters against 27B.
 ### Switching
 
 ```bash
-sudo /opt/suite366/switch-model.sh list            # the four, and which is active
+sudo /opt/suite366/switch-model.sh list            # the five, and which is active
 sudo /opt/suite366/switch-model.sh status          # what this box runs right now
 sudo /opt/suite366/switch-model.sh qwen27b --dry-run
 sudo /opt/suite366/switch-model.sh qwen27b
@@ -418,7 +443,7 @@ generative engine: the arm64 vLLM image ships without `soundfile` and `PyAV`
 and decodes no audio at all, and the unified image's ~100 MB audio layer is what
 makes the route work (`llm/unified/Dockerfile`). And the service sits behind a
 **compose profile**
-(`COMPOSE_PROFILES=stt` in `llm/.env`), so `switch-model.sh` can take it down
+(`stt` in `COMPOSE_PROFILES` in `llm/.env`), so `switch-model.sh` can take it down
 before the new generative model starts — always, even when the target serves
 one too: on unified memory vLLM sizes its KV cache as its share minus whatever
 else is resident when it profiles, and Gemma measured 222k tokens of KV with the
@@ -429,6 +454,21 @@ and each organisation's default; a switch to a profile without one disables the
 row and clears the default, so the UI says "no transcription model configured"
 instead of failing on a route nothing serves. `LLM_STT_MODEL=` (empty) at
 install turns it off for a box that needs the memory elsewhere.
+
+### Embeddings
+
+The **embedding engine** (`suite366-vllm-embed`, Qwen3-VL-Embedding-8B in
+pooling mode, ~20 GiB resident) runs next to every profile but `orcasaq-batch`,
+and since that profile exists it sits behind a compose profile of its own
+(`embed` in `COMPOSE_PROFILES`), with the proxy's dependency on it marked
+`required: false`. `switch-model.sh` applies the same three-place rule to it as
+to transcription: the container goes down before an engine that needs its
+memory starts and comes back once another profile's engine is healthy, the
+chart's `VLLM_MODEL_EMBEDDING` is emptied or restored, and the `AIModel`
+`EMBEDDING` rows of the box's own vLLM provider are disabled or re-enabled (and
+created when an organisation was born while the engine was down) along with
+each organisation's default embedding model. The app's own reconcile does the
+same at boot, so the two paths agree whichever runs first.
 
 The new engine must report healthy before the chart or the database are touched.
 If it does not come up, `.env` is restored, the previous engine is brought back,
@@ -463,7 +503,7 @@ the container runtime. Two consequences bit us:
   to embed chunks of a few hundred tokens. `--kv-cache-memory-bytes 4GiB` skips
   the profiler entirely: the container drops from ~36 GiB to ~20 GiB, and the
   fraction only has to clear the start-up check. Without that cap Flash-Next did
-  not fit at all. This applies to all three profiles and is why `EMBED_GPU_MEM_UTIL`
+  not fit at all. This applies to every profile that serves the embed and is why `EMBED_GPU_MEM_UTIL`
   is 0.20 and not 0.30.
 
 **Kernels.** On sm_121, vLLM v0.29.0 and later select the native W4A4 NVFP4
@@ -473,7 +513,7 @@ appliance used to run is vLLM 0.19, which only knew the Marlin weight-only path:
 it dequantised FP4 to FP16 and never touched the FP4 tensor cores. That is the
 single biggest reason the profiles run a release rather than a nightly.
 
-**The images.** Three of the four profiles, the transcription engine and the
+**The images.** Four of the five profiles, the transcription engine and the
 embed run ONE image, the **unified image** (`llm/unified/Dockerfile`): the
 official `vllm/vllm-openai:v0.30.0` plus exllamav3 and the EXL3 plugin, the
 audio extras and Gemma's chat template. CI publishes it on every change to
@@ -618,7 +658,7 @@ tools/test-update-diffs.sh            self-test: an update is a roll FORWARD; a 
 tools/test-dual-names.sh              self-test: values.yaml renders one name set, or two, and never a mix
 tools/test-local-certs.sh             self-test: the LAN certs name a real issuer, and a re-run never replaces a working certificate
 tools/test-vllm-db.sh                 self-test: a key change reaches the database row, a stale row fails the install, a loading model does not
-tools/test-llm-profiles.sh            self-test: the four profiles resolve to what was measured, and a switch moves all three copies of the model id
+tools/test-llm-profiles.sh            self-test: the five profiles resolve to what was measured, and a switch moves all three copies of the model id
 update.sh                             update checker/applier (check | apply | scan-usb | install-units); run by the daily timer + app triggers
 tools/build-offline-package.sh        build a SIGNED offline update package for an air-gapped appliance
 tools/sign-channel.sh                 pin updater_sha256 + sign channel.json (run on every channel bump)
@@ -632,7 +672,7 @@ values.yaml                           Helm values (@DOMAIN@/@HOST_IP@/etc. token
 switch-model.sh                       switch the generative model on a running box (list | status | <profile> [--dry-run] | converge) — .env, chart values and the database
 host-layer.sh                         GENERATED (tools/bundle-host-layer.sh): switch-model.sh + llm/ in one file, pinned in channel.json as host_layer_sha256, laid down by install.sh and update.sh
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
-llm/profiles.sh                       the four models and their measured budgets, the transcription model each allows, and the image tags; the ONE table install.sh and switch-model.sh share
+llm/profiles.sh                       the five profiles and their measured budgets, the side engines (embed, transcription) each allows, and the image tags; the ONE table install.sh and switch-model.sh share
 llm/unified/                          the UNIFIED vLLM image (official v0.30.0 + exllamav3/EXL3 + audio extras + Gemma template): published by CI, pulled by the boxes, built on a box only over a plain upstream image
 .github/workflows/publish-vllm-image.yml  builds llm/unified/ on a hosted arm64 runner and publishes ghcr.io/scriptor-group/suite-366-vllm:<base>-u<rev> (immutable tags)
 tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)

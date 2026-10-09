@@ -41,8 +41,8 @@ head_ "llm/profiles.sh"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/llm/profiles.sh"
 
-check "les quatre profils sont déclarés" "$LLM_PROFILES" "qwen27b orcasaq flash-next gemma"
-for p in qwen27b orcasaq flash-next gemma; do
+check "les cinq profils sont déclarés" "$LLM_PROFILES" "qwen27b orcasaq orcasaq-batch flash-next gemma"
+for p in qwen27b orcasaq orcasaq-batch flash-next gemma; do
   if llm_profile_known "$p"; then ok "profil connu : $p"; else ko "profil connu : $p"; fi
 done
 if llm_profile_known nope; then ko "un profil inconnu est refusé"; else ok "un profil inconnu est refusé"; fi
@@ -67,6 +67,26 @@ check "orcasaq : contexte app"  "$LLM_P_CONTEXT_WINDOW" "200000"
 check "orcasaq : fraction"      "$LLM_P_GPU_MEM_UTIL"   "0.45"
 check "orcasaq : swappiness hôte" "$LLM_P_SWAPPINESS"   ""
 check "orcasaq : transcription Qwen3-ASR" "$LLM_P_STT_MODEL" "$STT_MODEL"
+check "orcasaq : embed servi"   "$LLM_P_EMBED"          "1"
+
+# orcasaq-batch : le même modèle SEUL sur la box, mesuré le 09/10/2026 — 0.80 =
+# 1,9 M tokens de KV (7,2 requêtes de 262k), 8 slots (le cumul plafonne à ~75 t/s
+# dès 8 flux), ni embed ni transcription : c'est leur mémoire qu'il prend.
+llm_profile_apply orcasaq-batch "$UNIFIED" "$FLASH"
+check "orcasaq-batch : même modèle qu'orcasaq" "$LLM_P_MODEL" "orcarouter/OrcaSAQ-2-27B"
+check "orcasaq-batch : image = l'image moteur (unifiée)" "$LLM_P_IMAGE" "$UNIFIED"
+check "orcasaq-batch : fraction 0.80 (seul)" "$LLM_P_GPU_MEM_UTIL" "0.80"
+check "orcasaq-batch : 8 slots"       "$LLM_P_MAX_NUM_SEQS"   "8"
+check "orcasaq-batch : contexte natif 262k" "$LLM_P_MAX_MODEL_LEN" "262144"
+check "orcasaq-batch : contexte app"  "$LLM_P_CONTEXT_WINDOW" "200000"
+check "orcasaq-batch : tête MTP à 3"  "$LLM_P_MTP_TOKENS"     "3"
+check "orcasaq-batch : pas de build"  "$LLM_P_NEEDS_BUILD"    "0"
+check "orcasaq-batch : pas de transcription" "$LLM_P_STT_MODEL" ""
+check "orcasaq-batch : pas d'embed"   "$LLM_P_EMBED"          "0"
+check "profils compose : embed + stt" "$(llm_compose_profiles 1 "$STT_MODEL")" "embed,stt"
+check "profils compose : embed seul (flash-next)" "$(llm_compose_profiles 1 "")" "embed"
+check "profils compose : aucun (orcasaq-batch)" "$(llm_compose_profiles 0 "")" ""
+check "modèle d'embedding par défaut"  "$LLM_EMBED_MODEL_DEFAULT" "Qwen/Qwen3-VL-Embedding-8B"
 # Le tag porte la base ET la révision : l'une ou l'autre bouge, la box reconstruit et CI republie.
 check "tag de l'image unifiée construite sur la box" "$(llm_unified_image "$BASE")" "$UNIFIED"
 check "tag de l'image unifiée publiée par CI"        "$(llm_unified_registry_image "$BASE")" "$REGISTRY"
@@ -119,6 +139,10 @@ contains "qwen27b : KV en fp8"                     "$q" "--kv-cache-dtype fp8"
 contains "qwen27b : chargement fastsafetensors"    "$q" "--load-format fastsafetensors"
 contains "qwen27b : tête MTP à 3"                  "$q" -- '"num_speculative_tokens":3'
 absent   "qwen27b : pas le gabarit Gemma"          "$q" "tool_chat_template_gemma4"
+# orcasaq-batch suit la recette orcasaq : seuls les budgets changent, et ils arrivent par l'env.
+b="$(serve orcasaq-batch)"
+o="$(serve orcasaq)"
+check    "orcasaq-batch : même ligne vllm qu'orcasaq" "$b" "$o"
 
 o="$(serve orcasaq)"
 contains "orcasaq : parseur de raisonnement qwen3" "$o" "--reasoning-parser qwen3"
@@ -219,7 +243,12 @@ contains ".dockerignore : .env exclu du contexte"     "$(cat "$REPO_ROOT/llm/.do
 contains "values.yaml : VLLM_MODEL_TRANSCRIPTION"     "$(cat "$REPO_ROOT/values.yaml")" 'VLLM_MODEL_TRANSCRIPTION: "@STT_MODEL@"'
 contains "lib/suite.sh : substitue @STT_MODEL@"       "$(cat "$REPO_ROOT/lib/suite.sh")" '@STT_MODEL@|$LLM_STT_MODEL'
 V="$(cat "$REPO_ROOT/lib/vllm.sh")"
-contains "lib/vllm.sh : COMPOSE_PROFILES dans .env"   "$V" 'COMPOSE_PROFILES=${LLM_STT_MODEL:+stt}'
+contains "lib/vllm.sh : COMPOSE_PROFILES dans .env (embed + stt selon le profil)" "$V" 'COMPOSE_PROFILES=$(llm_compose_profiles "$LLM_P_EMBED" "$LLM_STT_MODEL")'
+contains "lib/vllm.sh : l'embed n'est attendu que si le profil le sert" "$V" 'if [[ "$LLM_P_EMBED" == "1" ]]; then'
+contains "lib/suite.sh : le chart reçoit l'embed servi, pas le modèle brut" "$(cat "$REPO_ROOT/lib/suite.sh")" '@EMBED_MODEL@|$EMBED_MODEL_SERVED'
+contains "compose : l'embed derrière un profil"      "$(cat "$REPO_ROOT/llm/docker-compose.yml")" 'profiles: ["embed"]'
+contains "compose : le proxy n'exige pas l'embed"    "$(python3 -c "
+import re,sys; t=open('$REPO_ROOT/llm/docker-compose.yml').read(); i=t.index('vllm-proxy:'); print(t[i:])")" 'required: false'
 contains "lib/vllm.sh : STT_MODEL dans .env"          "$V" 'STT_MODEL=$LLM_STT_MODEL'
 contains "lib/vllm.sh : résout l'image moteur avant d'écrire .env" "$V" "ensure_engine_image"
 contains "lib/vllm.sh : ne construit que Flash-Next à part"  "$V" 'if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then build_profile_image "$VLLM_LLM_IMAGE" "$LLM_P_BUILD_DIR"; fi'
@@ -270,8 +299,15 @@ contains "dry-run : le renommage LLM est borné à NOS providers"   "$d" '"provi
 absent   "dry-run : plus de renommage sur TOUT provider VLLM"      "$d" "WHERE provider = 'VLLM')"
 contains "dry-run : les agents suivent leur organisation"         "$d" '"organizationId" IN (SELECT "organizationId" FROM ours)'
 contains "dry-run : ours est défini avant d'être lu (CTE non récursive)" "$d" "WITH ours AS ("
-# La ligne d'embedding ne doit JAMAIS être réécrite : elle sert un autre modèle.
-absent "dry-run : ne touche pas l'embedding"    "$d" "Qwen3-VL-Embedding"
+# La ligne d'embedding n'est jamais RENOMMÉE (elle sert un autre modèle) ; elle
+# est allumée/éteinte avec l'embed, comme la ligne de transcription. Cette fausse
+# box n'a pas EMBED_MODEL dans .env : le défaut de l'installeur est pris, jamais ''.
+contains "dry-run : le renommage ne vise que les lignes LLM" "$d" '"modelType" = '"'"'LLM'"'"' AND "supportsTranscription" = false'
+contains "dry-run qwen27b : SQL — la ligne d'embedding est servie" "$d" "\\set embed 'Qwen/Qwen3-VL-Embedding-8B'"
+contains "dry-run qwen27b : SQL — dimensions du vecteur" "$d" "\\set embed_dims 4096"
+contains "dry-run qwen27b : SQL — défaut d'organisation (embedding)" "$d" 'SET "defaultEmbeddingModelId" = e.id'
+contains "dry-run qwen27b : chart informé (embedding)" "$d" "VLLM_MODEL_EMBEDDING -> Qwen/Qwen3-VL-Embedding-8B"
+contains "dry-run qwen27b : conteneur embed conservé" "$d" "suite366-vllm-embed kept"
 absent "dry-run : ne modifie rien"              "$(cat "$BOX/llm/.env")" "qwen27b"
 
 # Flash-Next et OrcaSAQ demandent un build, chacun depuis son contexte ; seul
@@ -292,7 +328,7 @@ absent   "dry-run orcasaq : aucun build de l'image Flash-Next" "$o_" "image buil
 # --- 3b. la transcription suit le profil ---------------------------------------
 head_ "switch-model.sh : transcription"
 contains "dry-run qwen27b : STT_MODEL dans .env"        "$d" "STT_MODEL=$STT_MODEL"
-contains "dry-run qwen27b : profil compose stt activé"  "$d" "COMPOSE_PROFILES=stt"
+contains "dry-run qwen27b : profils compose embed + stt" "$d" "COMPOSE_PROFILES=embed,stt"
 # La fausse box date d'avant la transcription (pas de STT_PORT) : le port doit
 # tomber sur 8003, pas sur vide — le vide envoyait le warm-up sur le 80 de Traefik.
 contains "dry-run qwen27b : STT_PORT par défaut sur une box d'avant" "$d" "STT_PORT=8003"
@@ -309,13 +345,30 @@ contains "dry-run qwen27b : SQL — id fourni (Prisma ne le génère que côté 
 contains "dry-run : le renommage LLM épargne la ligne de transcription" "$d" '"modelType" = '"'"'LLM'"'"' AND "supportsTranscription" = false'
 # Vers un profil sans transcription : tout s'éteint, rien ne reste à moitié allumé.
 contains "dry-run flash-next : STT_MODEL vidé"          "$f" "STT_MODEL="$'\n'
-contains "dry-run flash-next : profil compose désactivé" "$f" "COMPOSE_PROFILES="$'\n'
+contains "dry-run flash-next : profil compose embed seul" "$f" "COMPOSE_PROFILES=embed"$'\n'
 contains "dry-run flash-next : conteneur arrêté AVANT le moteur" "$f" "taken down before the engine starts"
 contains "dry-run flash-next : SQL — modèle vide"       "$f" "\\set stt ''"
 contains "dry-run flash-next : SQL — défaut effacé"     "$f" 'SET "defaultTranscriptionModelId" = NULL'
 absent   "dry-run flash-next : pas d'image moteur à construire" "$f" "image build: $UNIFIED"
-# La ligne d'embedding reste hors de portée, transcription comprise.
-absent   "dry-run : le SQL ne cite jamais l'embedding"  "$d$f" "Qwen3-VL-Embedding"
+# Vers orcasaq-batch : les DEUX moteurs annexes tombent avant le moteur, le
+# chart et la base le disent, et aucun des deux ne reste à moitié allumé.
+head_ "switch-model.sh : orcasaq-batch (seul sur la box)"
+ob="$(sw orcasaq-batch --dry-run)"
+contains "dry-run orcasaq-batch : fraction 0.80"      "$ob" "LLM_GPU_MEM_UTIL=0.80"
+contains "dry-run orcasaq-batch : 8 slots"            "$ob" "LLM_MAX_NUM_SEQS=8"
+contains "dry-run orcasaq-batch : aucun profil compose" "$ob" "COMPOSE_PROFILES="$'\n'
+contains "dry-run orcasaq-batch : STT_MODEL vidé"      "$ob" "STT_MODEL="$'\n'
+contains "dry-run orcasaq-batch : embed retiré AVANT le moteur" "$ob" "suite366-vllm-embed taken down before the engine starts"
+contains "dry-run orcasaq-batch : chart — pas d'embedding" "$ob" 'VLLM_MODEL_EMBEDDING -> "" (this profile runs the generative model alone)'
+contains "dry-run orcasaq-batch : SQL — embed vide"    "$ob" "\\set embed ''"
+contains "dry-run orcasaq-batch : SQL — lignes EMBEDDING éteintes" "$ob" '"modelType" = '"'"'EMBEDDING'"'"' AND "isEnabled" = true'
+contains "dry-run orcasaq-batch : SQL — défaut embedding effacé" "$ob" 'SET "defaultEmbeddingModelId" = NULL'
+contains "dry-run orcasaq-batch : l'opérateur sait que le modèle tourne seul" "$ob" "runs the generative model ALONE"
+contains "list : orcasaq-batch listé"                  "$l" "orcasaq-batch"
+# La ligne d'embedding suit l'embed (posée/éteinte), elle n'est jamais renommée :
+# le renommage vise les lignes LLM, l'embedding a son propre bloc.
+contains "dry-run : la ligne d'embedding a son propre bloc (jamais renommée)" "$d" "'EMBEDDING', 8192, 0"
+contains "dry-run flash-next : l'embed reste servi"     "$f" "VLLM_MODEL_EMBEDDING -> Qwen/Qwen3-VL-Embedding-8B"
 rm -rf "$BOX"
 
 # --- 4. le pont vers l'app : state.json ---------------------------------------
@@ -330,7 +383,11 @@ if [[ -f "$STATE" ]]; then ok "state.json est écrit"; else ko "state.json est �
 if python3 -m json.tool "$STATE" >/dev/null 2>&1; then ok "state.json est du JSON valide"; else ko "state.json est du JSON valide"; fi
 probe() { python3 -c "import json,sys; d=json.load(open('$STATE')); print($1)" 2>/dev/null; }
 check "state : profil actif"           "$(probe 'd["active"]')" "qwen27b"
-check "state : les quatre profils"     "$(probe 'len(d["profiles"])')" "4"
+check "state : les cinq profils"       "$(probe 'len(d["profiles"])')" "5"
+# Ce que la carte du profil annonce : avec ou sans embed (recherche documentaire).
+check "state : qwen27b annonce son embed"     "$(probe '[p for p in d["profiles"] if p["key"]=="qwen27b"][0]["embed"]')" "True"
+check "state : orcasaq-batch n'en annonce pas" "$(probe '[p for p in d["profiles"] if p["key"]=="orcasaq-batch"][0]["embed"]')" "False"
+check "state : moteur d'embedding publié"      "$(probe 'sorted(d["embed"].keys())')" "['health', 'model', 'state']"
 # La fausse box n'a que la base nue et pas d'image unifiée construite (pas de docker
 # ici) : la bascule compilerait d'abord, et l'UI doit le dire — pour les trois profils.
 check "state : orcasaq demande un build (image unifiée absente)" "$(probe '[p for p in d["profiles"] if p["key"]=="orcasaq"][0]["needs_build"]')" "True"
