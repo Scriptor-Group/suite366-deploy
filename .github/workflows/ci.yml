@@ -70,6 +70,11 @@ jobs:
       # and never let it reach a shell or helm argv.
       - name: Instance licence provisioning self-test
         run: ./tools/test-license.sh
+      # Shutting the box down / rebooting it from the app: the trigger units,
+      # the request recorded before the machine goes, the return recorded at
+      # boot — and power.json present, or the app offers a button nothing honours.
+      - name: Power (shutdown / reboot from the app) self-test
+        run: ./tools/test-power.sh
       # A reboot moved /dev/nvidia-uvm from major 497 to 498. The CDI spec still
       # said 497, so every GPU container got a node on the wrong char device:
       # nvidia-smi fine everywhere, torch.cuda.init() dead, vLLM crash-looping

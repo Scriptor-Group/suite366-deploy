@@ -857,6 +857,16 @@ drive-app pod (`/appliance-update`, wired by the `extraVolumes` block in
 or an apply by dropping a `check-requested` / `apply-requested` trigger file,
 picked up by systemd `.path` units (`suite366-update-check.path`,
 `suite366-update-apply.path`, installed by `update.sh install-units`). The
+same bridge carries **power requests** since 2026-10-12: the app's *Appliance >
+Power* page drops `shutdown-requested` / `reboot-requested`, the matching
+`suite366-power-*.path` units run `update.sh power shutdown|reboot` — the
+trigger is consumed first, who asked is recorded in `power.json` and in the
+host journal, then `systemctl poweroff|reboot` stops k3s and the vLLM stack in
+order — and `suite366-power-booted.service` closes the request in `power.json`
+at the next boot (what the app shows as "back since …"). `power.json`'s
+presence is how the app knows the host takes these requests: a box on an older
+updater shows no Power page until its next apply. `sudo update.sh power reboot`
+does the same by hand. The
 apply reuses the box's install-time parameters (`values.yaml`, `llm/.env`,
 `update.env`) — nothing is re-asked. After each apply, `update.sh` refreshes
 itself from the repo and re-installs the trigger units, so the update mechanism
