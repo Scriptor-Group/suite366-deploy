@@ -1467,6 +1467,12 @@ EOF
   # that never had one — the app's cue that this host takes power requests.
   local verb
   for verb in shutdown reboot; do
+    # ExecStopPost: a trigger the script could not consume (an updater that
+    # predates `power`, a crash before do_power) must not stay there — with
+    # PathExists it re-fires the service until systemd's start limit trips and
+    # the .path unit itself goes failed, deaf to every later request. Seen on
+    # the test Spark 2026-10-12. The request is dropped (the journal says so),
+    # and the app's pick-up timeout tells the admin.
     cat > "$SYSTEMD_DIR/suite366-power-$verb.service" <<EOF
 [Unit]
 Description=Suite 366 — $verb the appliance (triggered from the app UI)
@@ -1474,6 +1480,7 @@ Description=Suite 366 — $verb the appliance (triggered from the app UI)
 [Service]
 Type=oneshot
 ExecStart=$DATA_DIR/update.sh power $verb
+ExecStopPost=-/bin/rm -f $UPDATES_DIR/$verb-requested
 EOF
     cat > "$SYSTEMD_DIR/suite366-power-$verb.path" <<EOF
 [Unit]

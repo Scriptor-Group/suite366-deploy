@@ -89,6 +89,12 @@ contains "the reboot .path watches the app's trigger" "$(cat "$WORK/systemd/suit
 contains "the shutdown .path watches the app's trigger" "$(cat "$WORK/systemd/suite366-power-shutdown.path")" "PathExists=$WORK/data/updates/shutdown-requested"
 contains "the reboot service runs update.sh power reboot" "$(cat "$WORK/systemd/suite366-power-reboot.service")" "ExecStart=$WORK/data/update.sh power reboot"
 contains "the shutdown service runs update.sh power shutdown" "$(cat "$WORK/systemd/suite366-power-shutdown.service")" "ExecStart=$WORK/data/update.sh power shutdown"
+# A trigger left behind by a service that could not consume it (older updater,
+# crash before do_power) re-fires the .path unit until the start limit trips
+# and the .path unit itself goes failed — seen on the test Spark. The unit
+# removes it on the way out, whatever happened.
+contains "the reboot service drops an unconsumed trigger on exit" "$(cat "$WORK/systemd/suite366-power-reboot.service")" "ExecStopPost=-/bin/rm -f $WORK/data/updates/reboot-requested"
+contains "the shutdown service too" "$(cat "$WORK/systemd/suite366-power-shutdown.service")" "ExecStopPost=-/bin/rm -f $WORK/data/updates/shutdown-requested"
 contains "the booted unit runs at every boot" "$(cat "$WORK/systemd/suite366-power-booted.service")" "WantedBy=multi-user.target"
 contains "the booted unit runs update.sh power booted" "$(cat "$WORK/systemd/suite366-power-booted.service")" "ExecStart=$WORK/data/update.sh power booted"
 contains "the five units are enabled together" "$(cat "$WORK/systemctl.log")" "enable --now suite366-update-apply.path suite366-update-check.path suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service"
