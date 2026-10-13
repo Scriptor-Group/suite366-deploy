@@ -1,29 +1,65 @@
 name: Channel signature
 
 # An appliance holding our public key REFUSES a channel manifest that is not
-# signed by it, and refuses an update.sh or backup.sh whose hash does not match
-# the `updater_sha256` / `backup_sha256` inside that signed manifest. All are
-# fail-closed, which is the
-# right behaviour — and it means a forgotten `tools/sign-channel.sh` does not break
+# signed by it, and refuses an update.sh, backup.sh or host-layer.sh whose hash
+# does not match the `updater_sha256` / `backup_sha256` / `host_layer_sha256`
+# inside that signed manifest. All are fail-closed, which is the right
+# behaviour — and it means a forgotten `tools/sign-channel.sh` does not break
 # the fleet, it STOPS it: every box quietly keeps its current version and nobody
 # notices for weeks.
 #
-# So the two things that must never diverge are checked here, on every change:
+# So the things that must never diverge are checked here, on every change:
 #   1. channel.json.sig actually verifies against channel.json
-#   2. channel.json's updater_sha256 matches the update.sh in this tree
-#   3. channel.json's backup_sha256  matches the backup.sh in this tree
+#   2. channel.json's updater_sha256    matches the update.sh in this tree
+#   3. channel.json's backup_sha256     matches the backup.sh in this tree
+#   4. channel.json's host_layer_sha256 matches the host-layer.sh in this tree,
+#      and host-layer.sh is what tools/bundle-host-layer.sh produces from
+#      switch-model.sh and llm/ (so the chain tree -> bundle -> hash ->
+#      signature is read end to end, in one place)
+#
+# These are the three pins tools/sign-channel.sh writes (pin_script): keep the
+# two lists identical, a pin signed there and not checked here is a pin that
+# can go stale unnoticed.
 #
 # (3) is the one that bites quietly: update.sh refreshes itself on every apply,
 # so a stale backup_sha256 leaves a fleet running new updaters and old backup
-# agents, with the nightly job still reporting success.
+# agents, with the nightly job still reporting success. (4) was not checked
+# until 2026-10-13, and llm/ was not in the path filter either: a change under
+# llm/ bundled and committed without re-signing passed here and would have been
+# refused by every box.
 #
 # Needs only the PUBLIC key, so it lives in a repo variable rather than a secret:
 #   Settings > Secrets and variables > Actions > Variables > PACKAGE_PUBLIC_KEY_PEM
+# An UNSET variable fails the job. It used to warn and pass, which made the
+# signature check — the reason this workflow exists — the one step that could
+# be silently absent.
 on:
   push:
-    paths: ['channel.json', 'channel.json.sig', 'update.sh', 'backup.sh']
+    paths:
+      - 'channel.json'
+      - 'channel.json.sig'
+      - 'update.sh'
+      - 'backup.sh'
+      - 'host-layer.sh'
+      - 'switch-model.sh'
+      - 'llm/**'
+      - 'tools/bundle-host-layer.sh'
+      - 'tools/sign-channel.sh'
+      - 'lib/config.sh'
+      - '.github/workflows/channel-signature.yml'
   pull_request:
-    paths: ['channel.json', 'channel.json.sig', 'update.sh', 'backup.sh']
+    paths:
+      - 'channel.json'
+      - 'channel.json.sig'
+      - 'update.sh'
+      - 'backup.sh'
+      - 'host-layer.sh'
+      - 'switch-model.sh'
+      - 'llm/**'
+      - 'tools/bundle-host-layer.sh'
+      - 'tools/sign-channel.sh'
+      - 'lib/config.sh'
+      - '.github/workflows/channel-signature.yml'
   workflow_dispatch:
 
 permissions:
@@ -32,8 +68,23 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: host-layer.sh is what this tree bundles
+        run: |
+          set -euo pipefail
+          # The hash checked next pins the COMMITTED bundle. A bundle that lags
+          # switch-model.sh or llm/ would be signed and shipped as is, so the
+          # bundle is regenerated here and compared byte for byte (it is
+          # deterministic: sorted names, zero mtimes, gzip -n).
+          if ! tools/bundle-host-layer.sh --stdout | cmp -s - host-layer.sh; then
+            echo "::error::host-layer.sh is stale: run tools/bundle-host-layer.sh, then tools/sign-channel.sh, and commit the bundle with channel.json and channel.json.sig."
+            exit 1
+          fi
+          echo "host-layer.sh matches tools/bundle-host-layer.sh ($(bash host-layer.sh list | wc -l) files)"
 
       - name: pinned script hashes match this tree
         run: |
@@ -55,8 +106,9 @@ jobs:
             fi
             echo "$field matches ($got)"
           }
-          check updater_sha256 update.sh
-          check backup_sha256  backup.sh
+          check updater_sha256    update.sh
+          check backup_sha256     backup.sh
+          check host_layer_sha256 host-layer.sh
           # The restic pins are signed too, and lib/config.sh is the single
           # source of truth for them. A channel that disagrees with it means an
           # online box fetches one restic while an install.sh box fetches
@@ -83,16 +135,16 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${PACKAGE_PUBLIC_KEY_PEM:-}" ]]; then
-            echo "::warning::PACKAGE_PUBLIC_KEY_PEM variable not set — signature not verified."
-            echo "::warning::Set it so a stale signature cannot reach the fleet."
-            exit 0
+            echo "::error::vars.PACKAGE_PUBLIC_KEY_PEM is not set, so the signature cannot be checked — and an unchecked signature is what this job exists to refuse."
+            echo "::error::Set it under Settings > Secrets and variables > Actions > Variables: the PUBLIC key (package-release.pub, from tools/gen-package-key.sh)."
+            exit 1
           fi
           if [[ ! -f channel.json.sig ]]; then
             echo "::error::channel.json.sig is missing. Appliances holding the key will refuse this channel."
             exit 1
           fi
-          printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > /tmp/package.pub
-          if ! openssl pkeyutl -verify -rawin -pubin -inkey /tmp/package.pub \
+          printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/package.pub"
+          if ! openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/package.pub" \
                  -sigfile channel.json.sig -in channel.json >/dev/null 2>&1; then
             echo "::error::channel.json.sig does NOT verify against channel.json."
             echo "::error::Every appliance with the key would refuse this channel. Re-sign before merging."

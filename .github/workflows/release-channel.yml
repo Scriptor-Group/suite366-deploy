@@ -102,6 +102,17 @@ jobs:
       sha: ${{ steps.push.outputs.sha }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # The private key is read here, and the commit this job pushes is what
+    # every appliance will fetch and run as root. Both facts belong behind the
+    # `release` environment: with the secret stored on the environment rather
+    # than on the repository, no other workflow or job can read it, and with
+    # required reviewers on the environment a dispatch waits for a second
+    # person before this job starts. Neither setting can be made from a PR:
+    #   Settings > Environments > release > Required reviewers (+ move
+    #   PACKAGE_PRIVATE_KEY_PEM from the repository secrets to the environment)
+    # Do NOT restrict its deployment branches: a dry run from a feature branch
+    # is how a change to this workflow is tested, and it signs too.
+    environment: release
     permissions:
       contents: write   # commit + push the release
       checks: read      # read CI's verdict on this commit
@@ -128,7 +139,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: read the committed channel
         id: cur
@@ -527,9 +538,9 @@ jobs:
           # the same command verify_manifest_signature runs on the box.
           openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/package.pub" \
             -sigfile channel.json.sig -in channel.json
-          # The second pass is the weaker one — channel-signature.yml soft-skips
-          # when the variable is unset, so it can never be the only gate — but it
-          # runs the exact command against the exact PEM the appliances hold.
+          # The second pass runs the exact command against the exact PEM the
+          # appliances hold (channel-signature.yml fails when that variable is
+          # unset; here the derived key above is the gate, so this one may skip).
           if [[ -n "${PACKAGE_PUBLIC_KEY_PEM:-}" ]]; then
             printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/fleet.pub"
             openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/fleet.pub" \
@@ -614,7 +625,7 @@ jobs:
             tools/testdata/values-plain.rendered.yaml > "$RUNNER_TEMP/out/release.diff"
           git --no-pager diff --stat > "$RUNNER_TEMP/out/diffstat.txt"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ inputs.dry_run }}
         with:
           name: channel-${{ steps.plan.outputs.new_app }}-dryrun-${{ github.run_id }}
@@ -760,10 +771,14 @@ jobs:
     concurrency:
       group: release-package-${{ inputs.package_arch }}
       cancel-in-progress: false
+    # Same gate as the channel job: the signing key, and a public GitHub
+    # Release that an air-gapped site will carry to its appliance on a USB
+    # drive. Reviewers are required on the environment, not here.
+    environment: release
     permissions:
       contents: write   # create the release and upload its assets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The channel job pushed a commit; github.sha still points at the tip
           # as it stood when this run was queued. Packaging that one would sign
@@ -835,7 +850,7 @@ jobs:
           ( cd "$pkg" && sha256sum -c --strict --quiet SHA256SUMS )
           echo "package verifies; size: $(du -sh "$pkg" | cut -f1)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: suite366-update-${{ steps.target.outputs.app_version }}-${{ inputs.package_arch }}
           path: ${{ runner.temp }}/dist/
