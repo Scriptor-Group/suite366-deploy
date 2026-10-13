@@ -955,6 +955,18 @@ replaces root-run code any more. Before that, a box without the key trusted TLS
 alone and the daily timer refreshed the updater from `main`: whoever could push
 there was root on every such box within a day.
 
+The signer also stamps a `serial` (seconds since the epoch at signing) and an
+`expires` a year out, and a box remembers the highest serial it accepted
+(root-only, `.private/channel-serial`): an older signed `channel.json` replayed
+from the git history, or an expired one, is refused — it could otherwise walk a
+box back to an updater, a backup agent, a host layer or a vLLM image it had
+moved past, all "signed". A re-sign is a new serial on purpose. Every value the
+manifest names (versions, image reference, pins) is also validated before any
+`sed` rewrites a pin with it. For USB packages, a symlink or special file inside
+the package is refused outright, and the staged copy is verified in full again
+(signature and completeness, not only checksums): what is applied is what was
+verified.
+
 Both paths **fail closed**: a bad signature makes the manifest unusable
 rather than merely suspicious, and a verified USB package can still carry the box
 forward. The practical consequence is that forgetting to re-sign does not break the

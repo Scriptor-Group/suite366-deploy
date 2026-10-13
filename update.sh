@@ -246,7 +246,34 @@ json_esc() {
   s=${s//\"/\\\"}
   s=${s//$'\n'/\\n}
   s=${s//$'\t'/\\t}
-  printf '%s' "$s"
+  s=${s//$'\r'/\\r}
+  # Any other control character (a trigger's content is the pod's to write)
+  # would make the JSON unreadable for the app: dropped rather than escaped.
+  printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+# What a manifest or a package may name. A version is dotted digits with an
+# optional pre-release/build suffix; an image reference a registry path with
+# an optional tag and digest; a pin a sha256. Anything else is refused before
+# it reaches a `sed` that rewrites values.yaml or llm/.env with it.
+# (One function per line would read better; the self-tests extract functions
+# by their `name() {` … `}` lines, so they are written out in full.)
+valid_version() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][A-Za-z0-9.+-]+)?$ ]]
+}
+valid_image_ref() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]]
+}
+valid_sha256() {
+  [[ -z "$1" || "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+validate_target_fields() { # validate_target_fields WHAT CHART APP VLLM -> sets ${WHAT}_error on failure
+  local what="$1" chart="$2" app="$3" vllm="$4" bad=""
+  [[ -z "$chart" ]] || valid_version "$chart"  || bad="chart_version '$chart'"
+  [[ -z "$app" ]]   || valid_version "$app"    || bad="${bad:+$bad, }app_version '$app'"
+  [[ -z "$vllm" ]]  || valid_image_ref "$vllm" || bad="${bad:+$bad, }vllm_image '$vllm'"
+  [[ -z "$bad" ]] && return 0
+  printf -v "${what}_error" '%s' "refusing $what: malformed $bad"
+  return 1
 }
 
 [[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
@@ -590,6 +617,9 @@ fetch_manifest_online() {
 
   local manifest; manifest="$(cat "$tmp")"
   rm -f "$tmp"
+  if ! check_manifest_freshness "$manifest"; then
+    rm -f "$tmp"; warn "$online_error"; return 1
+  fi
   online_channel="$(json_get channel        <<<"$manifest")"
   online_chart="$(json_get chart_version    <<<"$manifest")"
   online_vllm="$(json_get vllm_image        <<<"$manifest")"
@@ -608,6 +638,12 @@ fetch_manifest_online() {
     warn "$online_error ($MANIFEST_URL)"
     return 1
   fi
+  if ! validate_target_fields online "$online_chart" "$online_app" "$online_vllm" \
+     || ! valid_sha256 "$online_updater_sha" || ! valid_sha256 "$online_backup_sha" || ! valid_sha256 "$online_host_sha"; then
+    online_error="${online_error:-refusing online: malformed sha256 pin}"
+    warn "$online_error"; online_chart=""; online_app=""; online_vllm=""; return 1
+  fi
+  remember_manifest_serial "$manifest"
   online_reachable=1
   return 0
 }
@@ -647,6 +683,51 @@ verify_manifest_signature() { # verify_manifest_signature FILE
   online_signed=1
   info "manifest       : signature verified"
   return 0
+}
+
+# --- replay / rollback of a signed manifest --------------------------------------
+# Every channel.json ever published, with its signature, is in the git
+# history: a MITM or a compromised host could serve an old pair and walk a box
+# back to an updater, a backup agent, a host layer and a vLLM image it had
+# moved past — all "signed". So the signer stamps a `serial` (seconds since
+# the epoch at signing) and an `expires`, and the box keeps the highest serial
+# it accepted (root-only): a manifest older than that, or past its expiry, is
+# refused. A manifest with no serial is only accepted by a box that never saw
+# one (the transition), never by one that did.
+CHANNEL_SERIAL_FILE="$PRIVATE_DIR/channel-serial"
+check_manifest_freshness() { # check_manifest_freshness MANIFEST_TEXT -> 0 fresh, 1 refused (online_error set)
+  local manifest="$1" serial expires stored now
+  serial="$(json_get serial  <<<"$manifest")"
+  expires="$(json_get expires <<<"$manifest")"
+  now="$(date -u +%s)"
+  if [[ -n "$serial" && ! "$serial" =~ ^[0-9]{1,12}$ ]]; then
+    online_error="manifest serial '$serial' is not a number"; return 1
+  fi
+  if [[ -n "$expires" ]]; then
+    local exp_s; exp_s="$(date -u -d "$expires" +%s 2>/dev/null || true)"
+    if [[ -z "$exp_s" ]]; then online_error="manifest expiry '$expires' is not a date"; return 1; fi
+    if (( now > exp_s )); then
+      online_error="manifest expired on $expires — a newer channel must be published"; return 1
+    fi
+  fi
+  stored="$(cat "$CHANNEL_SERIAL_FILE" 2>/dev/null || true)"
+  if [[ -n "$stored" ]]; then
+    if [[ -z "$serial" ]]; then
+      online_error="manifest carries no serial while this box already accepted serial $stored (replay of an older channel?)"; return 1
+    fi
+    if (( serial < stored )); then
+      online_error="manifest serial $serial is older than the last accepted ($stored) — replay or rollback refused"; return 1
+    fi
+  fi
+  return 0
+}
+remember_manifest_serial() { # remember_manifest_serial MANIFEST_TEXT
+  local serial; serial="$(json_get serial <<<"$1")"
+  [[ "$serial" =~ ^[0-9]{1,12}$ ]] || return 0
+  ensure_updates_dir
+  local stored; stored="$(cat "$CHANNEL_SERIAL_FILE" 2>/dev/null || echo 0)"
+  (( serial > stored )) || return 0
+  ( umask 077; printf '%s\n' "$serial" > "$CHANNEL_SERIAL_FILE" )
 }
 
 # --- Target state: source 2, a staged offline package --------------------------
@@ -840,6 +921,14 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   for f in manifest.json SHA256SUMS SHA256SUMS.sig; do
     [[ -s "$root/$f" ]] || { pkg_error="incomplete package: $f missing"; return 1; }
   done
+  # 0. Nothing but regular files and directories. `find -type f` below cannot
+  #    see a symlink, so a signed package with `images/zz.tar -> /some/path`
+  #    or `scripts/host-layer.sh -> /opt/suite366/updates/x` (pod-writable)
+  #    added beside the real files passed every later check and was then
+  #    imported or executed as root through the link. Reviewed 2026-10-13.
+  if [[ -n "$(find "$root" ! -type f ! -type d -print -quit 2>/dev/null)" ]]; then
+    pkg_error="package contains a symlink or a special file — refused"; return 1
+  fi
 
   # 1. Is the checksum list itself authentic?
   if ! verify_sig "$root/SHA256SUMS" "$root/SHA256SUMS.sig"; then
@@ -871,6 +960,9 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   pkg_channel="$(json_get channel        <<<"$mf")"
   pkg_chart="$(json_get chart_version    <<<"$mf")"
   pkg_app="$(json_get app_version        <<<"$mf")"
+  if ! validate_target_fields pkg "$pkg_chart" "$pkg_app" "$pkg_vllm" || ! valid_sha256 "$pkg_host_sha"; then
+    pkg_error="${pkg_error:-refusing pkg: malformed sha256 pin}"; return 1
+  fi
   pkg_vllm="$(json_get vllm_image        <<<"$mf")"
   pkg_notes="$(json_get notes            <<<"$mf")"
   pkg_min_from="$(json_get min_from_version <<<"$mf")"
@@ -915,9 +1007,12 @@ pkg_stage() { # pkg_stage ROOT
   rm -rf "$OFFLINE_PKG.new"
   log "Staging package into $OFFLINE_PKG ($((need/1024)) MiB)"
   cp -a "$root/." "$OFFLINE_PKG.new/" || { pkg_error="copy from the drive failed"; return 1; }
-  if ! ( cd "$OFFLINE_PKG.new" && sha256sum -c --strict --quiet SHA256SUMS ) >/dev/null 2>&1; then
+  # The whole verification again, on the COPY: the signature was checked on
+  # the drive, and a device can serve other bytes the second time it is read
+  # (TOCTOU). What is applied is what was verified, or nothing.
+  if ! pkg_verify "$OFFLINE_PKG.new"; then
     rm -rf "$OFFLINE_PKG.new"
-    pkg_error="staged copy failed verification — drive removed mid-copy?"; return 1
+    pkg_error="staged copy failed verification (${pkg_error}) — drive removed or swapped mid-copy?"; return 1
   fi
   rm -rf "$OFFLINE_PKG"
   mv "$OFFLINE_PKG.new" "$OFFLINE_PKG"
