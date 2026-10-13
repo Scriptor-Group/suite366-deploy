@@ -84,6 +84,7 @@ verify() { # verify PKGDIR PUBKEY CUR_APP  -> prints pkg_error, exit status
     PACKAGE_PUBLIC_KEY_NEXT="/nonexistent"
     ensure_package_public_key() { :; }
     eval "$(sed -n "/^verify_sig() {/,/^}/p" "$4")"
+    for fn in valid_version valid_image_ref valid_sha256 validate_target_fields; do eval "$(sed -n "/^$fn() {/,/^}/p" "$4")"; done
     eval "$(sed -n "/^pkg_verify() {/,/^}/p" "$4")"
     if pkg_verify "$1"; then echo "OK"; exit 0; else echo "$pkg_error"; exit 1; fi
   ' _ "$1" "$2" "$3" "$UPDATE_SH"
@@ -149,6 +150,23 @@ mkpkg "$WORK/pkg2" "$WORK/good.key" 1.8.23
 out="$(verify "$WORK/pkg2" "$WORK/absent.pub" 1.8.22)"
 [[ $? -ne 0 && "$out" == *"signature check failed"* ]] \
   && ok "no appliance key => refused (never permissive)" || ko "no appliance key => refused" "$out"
+
+# a symlink INSIDE a signed package: `find -type f` cannot see it, so it used to
+# pass every check and be imported/executed as root through the link.
+mkpkg "$WORK/link" "$WORK/good.key" 1.8.23
+ln -s /etc/hostname "$WORK/link/images/zz.tar"
+out="$(verify "$WORK/link" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"symlink or a special file"* ]] \
+  && ok "a symlink inside a signed package is refused" || ko "a symlink inside a signed package is refused" "$out"
+# a malformed version in a signed manifest never reaches the sed that rewrites the pins
+mkpkg "$WORK/badver" "$WORK/good.key" '1.8.23;rm -rf /'
+out="$(verify "$WORK/badver" "$WORK/good.pub" 1.8.22)"
+[[ $? -ne 0 && "$out" == *"malformed"* ]] \
+  && ok "a malformed app_version is refused (nothing reaches sed)" || ko "a malformed app_version is refused" "$out"
+contains_file() { grep -qF -- "$2" "$1"; }
+contains_file "$UPDATE_SH" 'if ! pkg_verify "$OFFLINE_PKG.new"; then' \
+  && ok "the staged COPY is verified in full (signature + completeness), not only checksummed" \
+  || ko "the staged copy is verified in full" "stage_package does not call pkg_verify on the copy"
 
 # downgrade
 mkpkg "$WORK/down" "$WORK/good.key" 1.8.20
@@ -244,6 +262,45 @@ vg 1.0.0 ""       && ok "anything > empty" || ko "anything > empty"
 # the manifest is signed too. Graduated: strict when the appliance holds our
 # public key, TLS-only when it does not (the public product's posture).
 echo
+echo "== channel manifest freshness (serial / expires) =="
+# The signer stamps a serial and an expiry; a box only moves forward.
+fresh() { # fresh MANIFEST_JSON PRIVATE_DIR -> output ; exit status
+  bash -c '
+    set -uo pipefail
+    PRIVATE_DIR="$2"; online_error=""
+    json_get() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+    ensure_updates_dir() { mkdir -p "$PRIVATE_DIR"; }
+    eval "$(sed -n "/^CHANNEL_SERIAL_FILE=/p" "$3")"
+    eval "$(sed -n "/^check_manifest_freshness() {/,/^}/p" "$3")"
+    eval "$(sed -n "/^remember_manifest_serial() {/,/^}/p" "$3")"
+    if check_manifest_freshness "$1"; then remember_manifest_serial "$1"; echo "FRESH"; else echo "$online_error"; exit 1; fi
+  ' _ "$1" "$2" "$UPDATE_SH"
+}
+PD="$WORK/private"; rm -rf "$PD"
+out="$(fresh '{"serial": "", "expires": ""}' "$PD")"; [[ "$out" == FRESH ]] && ok "no serial, nothing stored yet: accepted (transition)" || ko "transition" "$out"
+out="$(fresh '{"serial": "20", "expires": "2099-01-01T00:00:00Z"}' "$PD")"; [[ "$out" == FRESH ]] && ok "serial 20 accepted and remembered" || ko "serial 20" "$out"
+[[ "$(cat "$PD/channel-serial")" == 20 ]] && ok "…stored root-only" || ko "…stored" "$(cat "$PD/channel-serial" 2>/dev/null)"
+[[ "$(stat -c %a "$PD/channel-serial")" == 600 ]] && ok "…mode 0600" || ko "…mode" "$(stat -c %a "$PD/channel-serial")"
+out="$(fresh '{"serial": "10", "expires": "2099-01-01T00:00:00Z"}' "$PD")"; [[ $? -ne 0 && "$out" == *"older than the last accepted"* ]] && ok "an older serial (replayed channel) is refused" || ko "replay" "$out"
+out="$(fresh '{"serial": "20", "expires": "2099-01-01T00:00:00Z"}' "$PD")"; [[ "$out" == FRESH ]] && ok "the same serial (same manifest) is accepted" || ko "same serial" "$out"
+out="$(fresh '{"serial": "", "expires": ""}' "$PD")"; [[ $? -ne 0 && "$out" == *"carries no serial"* ]] && ok "a manifest without serial is refused once one was accepted" || ko "no serial after one" "$out"
+out="$(fresh '{"serial": "30", "expires": "2000-01-01T00:00:00Z"}' "$PD")"; [[ $? -ne 0 && "$out" == *"expired"* ]] && ok "an expired manifest is refused" || ko "expired" "$out"
+[[ "$(cat "$PD/channel-serial")" == 20 ]] && ok "…and a refused manifest moves nothing" || ko "…refused moves nothing" "$(cat "$PD/channel-serial")"
+out="$(fresh '{"serial": "30", "expires": "2099-01-01T00:00:00Z"}' "$PD")"; [[ "$out" == FRESH && "$(cat "$PD/channel-serial")" == 30 ]] && ok "a newer serial moves the box forward" || ko "newer" "$out"
+out="$(fresh '{"serial": "abc", "expires": ""}' "$PD")"; [[ $? -ne 0 ]] && ok "a non-numeric serial is refused" || ko "non-numeric serial" "$out"
+contains_file "$(dirname "$UPDATE_SH")/tools/sign-channel.sh" 'pin_value serial' \
+  && ok "the signer stamps a serial and an expiry" || ko "the signer stamps a serial" ""
+echo "== values the manifest may name =="
+vv() { bash -c 'eval "$(sed -n "/^valid_version() {/,/^}/p" "$1")"; eval "$(sed -n "/^valid_image_ref() {/,/^}/p" "$1")"; eval "$(sed -n "/^valid_sha256() {/,/^}/p" "$1")"; '"$2" _ "$UPDATE_SH"; }
+vv '' 'valid_version 1.14.0'            && ok "1.14.0 is a version" || ko "1.14.0" ""
+vv '' 'valid_version 0.10.3-rc.1'       && ok "0.10.3-rc.1 is a version" || ko "0.10.3-rc.1" ""
+vv '' '! valid_version "1.14.0; rm -rf /"' && ok "a version with shell text is not" || ko "shell text" ""
+vv '' 'valid_image_ref ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1' && ok "a registry image with a tag is a reference" || ko "image ref" ""
+vv '' 'valid_image_ref ghcr.io/x/y:v1@sha256:0000000000000000000000000000000000000000000000000000000000000000' && ok "…with a digest too" || ko "digest ref" ""
+vv '' '! valid_image_ref "img|cmd"'     && ok "a reference with a pipe is not" || ko "pipe" ""
+vv '' 'valid_sha256 ""'                 && ok "an empty pin is allowed (older manifests)" || ko "empty pin" ""
+vv '' '! valid_sha256 deadbeef'         && ok "a short pin is refused" || ko "short pin" ""
+
 echo "== channel manifest signature =="
 
 mkchannel() { # mkchannel FILE KEY [CHART_VERSION]
