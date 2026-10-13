@@ -77,7 +77,7 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
   (arm64/GB10), but the k3s + app layer runs on amd64 too - handy for testing
   the installer on a plain Ubuntu box (see *[Running without a
   GPU](#running-without-a-gpu-test--non-spark-hosts)* below).
-- **Outbound network** to `get.k3s.io`, `get.helm.sh`, `ghcr.io`,
+- **Outbound network** to `get.k3s.io` (k3s pinned to `K3S_VERSION`, binary verified by the k3s installer), `get.helm.sh` (helm pinned to `HELM_VERSION`, tarball sha256 verified), `ghcr.io`,
   `registry-1.docker.io`, `huggingface.co`, `charts.jetstack.io`. The
   preflight fails loudly if any of these is unreachable.
 
@@ -943,15 +943,19 @@ PACKAGE_PRIVATE_KEY=~/.secrets/package-release.key tools/sign-channel.sh
 git add channel.json channel.json.sig && git commit
 ```
 
-Behaviour on the appliance is **graduated**, so the public one-command install is
-unchanged:
+Behaviour on the appliance is **strict, always** (since 2026-10-13): the public
+key is embedded in `install.sh`/`lib/config.sh` and in `update.sh` itself, written
+to `package-release.pub` by the installer and by the updater where it is missing,
+so a box installed before that date becomes strict at its next `check`. The
+channel manifest must be signed by that key (or by `package-release-next.pub`
+during a rotation), `update.sh`, `backup.sh` and the host layer must match the
+hashes the signed manifest carries, and `update.sh` refreshes itself on `apply`
+only — the admin who confirms an update is the consent; the daily `check` never
+replaces root-run code any more. Before that, a box without the key trusted TLS
+alone and the daily timer refreshed the updater from `main`: whoever could push
+there was root on every such box within a day.
 
-| `package-release.pub` on the box | Channel manifest | `update.sh` refresh |
-|---|---|---|
-| present (fleet) | must be signed by our key, else **refused** | must match the signed `updater_sha256`, else **refused** |
-| absent (default) | TLS-only, as before | TLS-only, as before |
-
-Both strict paths **fail closed**: a bad signature makes the manifest unusable
+Both paths **fail closed**: a bad signature makes the manifest unusable
 rather than merely suspicious, and a verified USB package can still carry the box
 forward. The practical consequence is that forgetting to re-sign does not break the
 fleet, it *stops* it — every box keeps its current version silently. The

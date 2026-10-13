@@ -91,7 +91,10 @@
 #   BACKUP_URL      same, for the backup agent (default: sibling of
 #                   MANIFEST_URL). Governed by the same SELF_UPDATE switch and
 #                   the same signature rules — see converge_backup.
-#   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying offline packages.
+#   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying the channel and the
+#                       offline packages. Written from the embedded default
+#                       when absent (every box is strict since 2026-10-13).
+#   PACKAGE_PUBLIC_KEY_NEXT  a second key accepted during a rotation.
 #                   Absent file => every offline package is refused.
 # =============================================================================
 set -euo pipefail
@@ -108,7 +111,7 @@ DATA_DIR="${DATA_DIR:-/opt/suite366}"
 
 MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/channel.json}"
 # Detached Ed25519 signature over channel.json, published beside it. Required on
-# any appliance that holds PACKAGE_PUBLIC_KEY; ignored on one that does not.
+# every appliance (the key is embedded and installed when missing).
 MANIFEST_SIG_URL="${MANIFEST_SIG_URL:-$MANIFEST_URL.sig}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 NAMESPACE="${NAMESPACE:-suite366}"
@@ -155,6 +158,39 @@ fi
 # outcome (including rejections, which have no staged content to speak for
 # them) and is the only thing `check` needs to read.
 PACKAGE_PUBLIC_KEY="${PACKAGE_PUBLIC_KEY:-$DATA_DIR/package-release.pub}"
+# A second key, accepted alongside the first while a rotation is under way:
+# publish the new public key here (and in install.sh's default) on every box,
+# then sign with the new private key, then retire the old file. Absent = no
+# rotation in progress.
+PACKAGE_PUBLIC_KEY_NEXT="${PACKAGE_PUBLIC_KEY_NEXT:-$DATA_DIR/package-release-next.pub}"
+# The key that signs the channel and the packages, EMBEDDED: until 2026-10-13
+# the public install never installed it (only suite366-fleet did), so a box
+# without it trusted TLS alone — and a daily timer replaced this very script
+# from `main` under that trust. Whoever could push to main was root on every
+# such box within 24 h. The key ships with the installer and with this script
+# (which a box already trusts, since it is running it), it is written where it
+# is missing, and nothing runs unsigned any more. PACKAGE_PUBLIC_KEY_PEM
+# overrides it (a fleet that signs with its own key; the self-test).
+_EMBEDDED_PACKAGE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAAAIj33sDi5EbhWnKHuaH8jt0yPph1+Nvrqdr/A7y3bg=
+-----END PUBLIC KEY-----'
+ensure_package_public_key() {
+  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && return 0
+  local pem="${PACKAGE_PUBLIC_KEY_PEM:-$_EMBEDDED_PACKAGE_PUBLIC_KEY}"
+  ( umask 022; printf '%s\n' "$pem" > "$PACKAGE_PUBLIC_KEY" ) \
+    || die "cannot write the package signing key to $PACKAGE_PUBLIC_KEY — refusing to run without it."
+  info "package signing key installed at $PACKAGE_PUBLIC_KEY (this box now requires signed channels)."
+  logger -t suite366-update "package signing key installed at $PACKAGE_PUBLIC_KEY" 2>/dev/null || true
+}
+# Verify a detached Ed25519 signature with the key, or with the rotation key.
+verify_sig() { # verify_sig FILE SIGFILE
+  local k
+  for k in "$PACKAGE_PUBLIC_KEY" "$PACKAGE_PUBLIC_KEY_NEXT"; do
+    [[ -s "$k" ]] || continue
+    openssl pkeyutl -verify -rawin -pubin -inkey "$k" -sigfile "$2" -in "$1" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 OFFLINE_DIR="$DATA_DIR/offline"
 OFFLINE_PKG="$OFFLINE_DIR/pkg"
 OFFLINE_SRC="$OFFLINE_DIR/source.json"
@@ -583,17 +619,14 @@ fetch_manifest_online() {
 # UNUSABLE rather than merely suspicious (fail closed; a verified USB package can
 # still carry the box forward).
 #
-# Graduated on purpose: an appliance with no key installed keeps the old
-# TLS-only behaviour, so the public one-command install is unchanged. Fleet boxes
-# always have the key, so they are always strict.
+# Every appliance is strict since 2026-10-13: the key is embedded in this
+# script and in the installer, and written where it is missing
+# (ensure_package_public_key). The graduated "no key = TLS-only" rung that
+# kept the public one-command install unchanged is gone — it is what made
+# a push to `main` root on every box within a day.
 verify_manifest_signature() { # verify_manifest_signature FILE
   local f="$1"
-  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
-    # Said once, not per-run-per-line: this is the documented posture of the
-    # public product, not a misconfiguration.
-    info "manifest       : unsigned (no $PACKAGE_PUBLIC_KEY — TLS-only trust)"
-    return 0
-  fi
+  ensure_package_public_key
   have openssl || { online_error="openssl missing, cannot verify the manifest signature"; warn "$online_error"; return 1; }
 
   local sig; sig="$(mktemp)"
@@ -603,8 +636,7 @@ verify_manifest_signature() { # verify_manifest_signature FILE
     warn "$online_error — refusing the manifest (this appliance requires signed channels)."
     return 1
   fi
-  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
-        -sigfile "$sig" -in "$f" >/dev/null 2>&1; then
+  if ! verify_sig "$f" "$sig"; then
     rm -f "$sig"
     online_error="manifest signature INVALID — not signed by this appliance's key"
     warn "$online_error"
@@ -804,16 +836,13 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   pkg_error=""
   pkg_chart=""; pkg_app=""; pkg_vllm=""; pkg_channel=""; pkg_notes=""; pkg_min_from=""; pkg_host_sha=""
 
-  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
-    pkg_error="no package signing key on this appliance ($PACKAGE_PUBLIC_KEY)"; return 1
-  fi
+  ensure_package_public_key
   for f in manifest.json SHA256SUMS SHA256SUMS.sig; do
     [[ -s "$root/$f" ]] || { pkg_error="incomplete package: $f missing"; return 1; }
   done
 
   # 1. Is the checksum list itself authentic?
-  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
-        -sigfile "$root/SHA256SUMS.sig" -in "$root/SHA256SUMS" >/dev/null 2>&1; then
+  if ! verify_sig "$root/SHA256SUMS" "$root/SHA256SUMS.sig"; then
     pkg_error="signature check failed — package not signed by this appliance's key"; return 1
   fi
   # 2. Is the manifest actually covered by it? (a manifest outside SHA256SUMS
@@ -1195,14 +1224,15 @@ PY
 # --- the host layer: fetch, verify, lay down, converge --------------------------
 # Same trust ladder as backup.sh, for the same reason: switch-model.sh runs as
 # root and rewrites the vLLM stack. Key present + signed manifest + matching
-# hash -> lay down; key present, anything else -> REFUSE; no key -> TLS-only.
+# hash -> lay down; anything else -> REFUSE. The key is always present since
+# 2026-10-13 (ensure_package_public_key): there is no TLS-only rung any more.
 # Staging (files on disk) and applying (containers, units) are separate so
 # that the compose in place is the NEW one before any container is recreated:
 # on a legacy compose a base-image move would drag the LLM along with it.
 host_layer_new_sha=""
 stage_host_layer_online() {
-  local strict=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1
   if [[ "$strict" == 1 ]]; then
     if [[ "${online_signed:-0}" != "1" ]]; then
       warn "not laying down the host layer: the channel manifest was not signature-verified."; return 1
@@ -1688,13 +1718,17 @@ EOF
 # wrote the file, and the file runs as root on the next apply.
 #
 # Graduated, same as the manifest check:
-#   key present + signed manifest + matching hash -> install
-#   key present, anything else                    -> REFUSE (fail closed)
-#   no key installed                              -> TLS-only, as before
+#   signed manifest + matching hash -> install
+#   anything else                   -> REFUSE (fail closed)
+# The TLS-only rung is gone (ensure_package_public_key). And this runs on
+# `apply` only — `check` used to call it too, which meant the daily timer
+# replaced this script without anyone asking: the admin who confirms an
+# update in the UI is the consent, and the refreshed updater is what then
+# performs that apply.
 self_update() {
   [[ "$SELF_UPDATE" == "1" ]] || return 0
-  local strict=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1
 
   if [[ "$strict" == 1 ]]; then
     if [[ "${online_signed:-0}" != "1" ]]; then
@@ -1741,9 +1775,8 @@ self_update() {
 # Same trust ladder as self_update, for the same reason: backup.sh runs as root,
 # nightly, holding the destination's credentials.
 #
-#   key present + signed manifest + matching hash -> install
-#   key present, anything else                    -> REFUSE (fail closed)
-#   no key installed                              -> TLS-only, as before
+#   signed manifest + matching hash -> install
+#   anything else                   -> REFUSE (fail closed; the key is always there)
 #
 # Two things make this more than a copy of self_update:
 #
@@ -1758,8 +1791,8 @@ self_update() {
 #     "unconfigured" to the UI rather than looking installed and being empty.
 converge_backup() {
   [[ "$SELF_UPDATE" == "1" ]] || return 0
-  local strict=0 fresh=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1 fresh=0
   [[ -x "$BACKUP_AGENT" ]] || fresh=1
 
   if [[ "$strict" == 1 ]]; then
@@ -2363,9 +2396,9 @@ require_cluster_tools() {
 case "$MODE" in
   check)
     require_cluster_tools
+    ensure_package_public_key
     fetch_manifest_online || true
     load_offline_source
-    self_update_first
     survey
     notify
     write_host_json
@@ -2383,6 +2416,7 @@ case "$MODE" in
     ;;
   apply)
     require_cluster_tools
+    ensure_package_public_key
     fetch_manifest_online || true
     load_offline_source
     self_update_first

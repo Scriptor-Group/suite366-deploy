@@ -78,7 +78,12 @@ verify() { # verify PKGDIR PUBKEY CUR_APP  -> prints pkg_error, exit status
       [[ "$1" != "$2" ]] || return 1
       [[ "$(printf "%s\n%s\n" "$1" "$2" | sort -V | tail -1)" == "$1" ]]
     }
-    # Pull pkg_verify out of the real update.sh, verbatim.
+    # Pull pkg_verify out of the real update.sh, verbatim — and the signature
+    # helper it calls since the trust bootstrap (the key under test is the one
+    # the harness generated, so the embedded default is never written).
+    PACKAGE_PUBLIC_KEY_NEXT="/nonexistent"
+    ensure_package_public_key() { :; }
+    eval "$(sed -n "/^verify_sig() {/,/^}/p" "$4")"
     eval "$(sed -n "/^pkg_verify() {/,/^}/p" "$4")"
     if pkg_verify "$1"; then echo "OK"; exit 0; else echo "$pkg_error"; exit 1; fi
   ' _ "$1" "$2" "$3" "$UPDATE_SH"
@@ -136,11 +141,14 @@ out="$(verify "$WORK/nosig" "$WORK/good.pub" 1.8.22)"
 [[ $? -ne 0 && "$out" == *"SHA256SUMS.sig missing"* ]] \
   && ok "unsigned package refused" || ko "unsigned package refused" "$out"
 
-# no public key on the appliance => refuse everything
+# no public key file on the appliance: since 2026-10-13 the updater writes the
+# embedded production key there first (ensure_package_public_key, stubbed out
+# in this harness), so a package signed by any OTHER key is refused — never
+# accepted on TLS alone.
 mkpkg "$WORK/pkg2" "$WORK/good.key" 1.8.23
 out="$(verify "$WORK/pkg2" "$WORK/absent.pub" 1.8.22)"
-[[ $? -ne 0 && "$out" == *"no package signing key"* ]] \
-  && ok "no appliance key => refused" || ko "no appliance key => refused" "$out"
+[[ $? -ne 0 && "$out" == *"signature check failed"* ]] \
+  && ok "no appliance key => refused (never permissive)" || ko "no appliance key => refused" "$out"
 
 # downgrade
 mkpkg "$WORK/down" "$WORK/good.key" 1.8.20
@@ -274,6 +282,14 @@ verify_manifest() { # verify_manifest MANIFEST_FILE PUBKEY [serve_sig=1]
       [[ -n "$dest" && -s "$src" ]] || return 22
       cp "$src" "$dest"
     }
+    # The real helpers the function calls since the trust bootstrap: the
+    # embedded key is written where the key file is missing, verify_sig tries
+    # the key and the rotation key.
+    PACKAGE_PUBLIC_KEY_NEXT="/nonexistent"
+    logger() { :; }
+    eval "$(sed -n "/^_EMBEDDED_PACKAGE_PUBLIC_KEY=/,/^-----END PUBLIC KEY-----/p" "$4")"
+    eval "$(sed -n "/^ensure_package_public_key() {/,/^}/p" "$4")"
+    eval "$(sed -n "/^verify_sig() {/,/^}/p" "$4")"
     eval "$(sed -n "/^verify_manifest_signature() {/,/^}/p" "$4")"
     if verify_manifest_signature "$1"; then echo "OK signed=$online_signed"; else echo "$online_error"; exit 1; fi
   ' _ "$1" "$2" "${3:-1}" "$UPDATE_SH"
@@ -284,11 +300,16 @@ out="$(verify_manifest "$WORK/ch.json" "$WORK/good.pub")" \
   && [[ "$out" == "OK signed=1" ]] && ok "signed manifest accepted, marked verified" \
   || ko "signed manifest accepted" "$out"
 
-# No key on the appliance -> permissive, and NOT marked verified (so self_update
-# stays in TLS-only mode rather than believing it has a guarantee).
-out="$(verify_manifest "$WORK/ch.json" "$WORK/absent.pub")" \
-  && [[ "$out" == "OK signed=0" ]] && ok "no appliance key => permissive, not marked verified" \
-  || ko "no appliance key => permissive" "$out"
+# No key file on the appliance -> the embedded production key is written there
+# and the manifest, signed by the harness key, is REFUSED. This used to be the
+# "TLS-only, permissive" rung: it is what made a push to main root on every
+# box without the key, and it is gone (2026-10-13).
+out="$(verify_manifest "$WORK/ch.json" "$WORK/absent-strict.pub")"
+[[ $? -ne 0 && "$out" == *"INVALID"* ]] \
+  && ok "no appliance key => the embedded key is installed and a foreign manifest is refused" \
+  || ko "no appliance key => strict" "$out"
+[[ "$(sed -n 2p "$WORK/absent-strict.pub" 2>/dev/null)" == "MCowBQYDK2VwAyEAAAIj33sDi5EbhWnKHuaH8jt0yPph1+Nvrqdr/A7y3bg=" ]] \
+  && ok "…and the key written is the production one" || ko "…and the key written is the production one" "$(cat "$WORK/absent-strict.pub" 2>/dev/null)"
 
 # Signed by the wrong key.
 mkchannel "$WORK/evilch.json" "$WORK/evil.key"
