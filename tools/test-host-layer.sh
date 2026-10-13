@@ -128,6 +128,11 @@ BOX="$WORK/gemma-box"; mkbox "$BOX" nvidia/Gemma-4-26B-A4B-NVFP4; mkdir -p "$BOX
 out="$(conv "$BOX")"; rc=$?
 check "converge sort en 0"                          "$rc" "0"
 contains "reconnaît le profil d'après le modèle"    "$out" "profile for nvidia/Gemma-4-26B-A4B-NVFP4: gemma"
+# Les images remplacées ne partaient jamais : converge élague les orphelines,
+# et seulement elles (-a emporterait l'image que le retour arrière renomme).
+contains "converge : élague les images orphelines"  "$(cat "$BOX/docker.log")" "docker image prune -f"
+absent   "…jamais -a"                               "$(cat "$BOX/docker.log")" "prune -a"
+contains "converge : le dit"                        "$out" "dangling images pruned"
 check ".env : LLM_PROFILE posé"                     "$(envv "$BOX" LLM_PROFILE)" "gemma"
 # Une box de juillet a une base NUE dans VLLM_IMAGE : l'image moteur est celle
 # que la box construit par-dessus (le stub la dit déjà construite), et VLLM_IMAGE

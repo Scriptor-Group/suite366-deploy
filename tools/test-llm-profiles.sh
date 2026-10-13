@@ -118,6 +118,15 @@ check "gemma : fraction abaissée à 0.45 pour la transcription" "$LLM_P_GPU_MEM
 check "gemma : transcription Qwen3-ASR" "$LLM_P_STT_MODEL" "$STT_MODEL"
 absent "plus aucune image par profil dans la table" "$(grep 'LLM_P_IMAGE=' "$REPO_ROOT/llm/profiles.sh")" "cu130-nightly"
 
+# Ce que le checkpoint occupe une fois téléchargé (la ligne « On disk » du README,
+# arrondie) : switch-model.sh y ajoute 10 Go et refuse un premier téléchargement
+# qui ne tiendrait pas — 133 Go de Flash-Next sur un disque déjà plein meurent à
+# mi-chemin et laissent un hub/models--… que checkpoint_on_disk prend pour présent.
+for pair in qwen27b:25 orcasaq:15 orcasaq-batch:15 flash-next:140 gemma:20; do
+  llm_profile_apply "${pair%%:*}" "$UNIFIED" "$FLASH"
+  check "${pair%%:*} : ${pair##*:} Go sur disque" "$LLM_P_DISK_GB" "${pair##*:}"
+done
+
 if llm_profile_apply bogus "$UNIFIED" "$FLASH" 2>/dev/null; then
   ko "llm_profile_apply refuse un profil inconnu"
 else
@@ -231,6 +240,22 @@ absent   "nginx : plus aucun bloc upstream statique"  "$N" "upstream vllm_"
 # Un bloc upstream statique ferait refuser le démarrage à nginx quand le service
 # est absent, et emporterait le LLM et l'embedding avec lui.
 absent   "nginx : pas d'upstream statique vers vllm-stt" "$N" "server vllm-stt:8000"
+# 13/10/2026 : vLLM ne demande la clé que sur /v1/* ; relayé en catch-all, le
+# proxy répondait /tokenize, /invocations, /metrics et /version SANS clé à tout
+# pod de la box. Seul /v1/ est relayé, le reste est un 404 du proxy lui-même.
+contains "nginx : relais /v1/ (préfixe) vers le LLM" "$N" "location /v1/ {"
+root_loc="$(sed -n '/^    location \/ {/,/^    }/p' "$REPO_ROOT/llm/nginx.conf")"
+contains "nginx : location / existe et répond 404"  "$root_loc" "return 404;"
+absent   "nginx : plus de relais nu sur location /"  "$root_loc" "proxy_pass"
+check    "nginx : deux relais vers le LLM, /v1/models et /v1/" "$(grep -c 'set                \$llm_upstream' "$REPO_ROOT/llm/nginx.conf")" "2"
+contains "nginx : /health reste servi par le proxy"  "$N" "location = /health {"
+
+# Les journaux : rien ne les tournait (ni daemon.json sur DGX OS, ni option
+# ici), et vLLM écrit une ligne par requête. 50 Mo x 5 par conteneur, les quatre.
+contains "compose : rotation json-file déclarée"     "$C" "driver: json-file"
+contains "compose : 50 Mo par fichier"               "$C" 'max-size: "50m"'
+contains "compose : 5 fichiers"                      "$C" 'max-file: "5"'
+check    "compose : les quatre services tournent leurs journaux" "$(grep -c 'logging: \*default-logging' "$REPO_ROOT/llm/docker-compose.yml")" "4"
 
 contains "Dockerfile : soundfile épinglé"             "$X" "soundfile=="
 contains "Dockerfile : PyAV épinglé"                  "$X" "av=="
@@ -325,6 +350,22 @@ contains "dry-run orcasaq : swappiness hôte"     "$o_" "swappiness host default
 contains "dry-run orcasaq : transcription activée" "$o_" "STT_MODEL=$STT_MODEL"
 absent   "dry-run orcasaq : aucun build de l'image Flash-Next" "$o_" "image build: $FLASH"
 
+# Le disque du premier démarrage : la fausse box n'a aucun checkpoint, le dry-run
+# dit ce qu'il faudrait (profil + 10 Go) et ce que le disque a — `df` vient du
+# PATH, donc un faux df fait dire au dry-run ce que la bascule refuserait.
+contains "dry-run qwen27b : 35 Go libres exigés (25 + 10)"  "$d" "needs 35 GB free (25 + 10 margin)"
+contains "dry-run flash-next : 150 Go libres exigés"       "$f" "needs 150 GB free (140 + 10 margin)"
+contains "dry-run flash-next : le téléchargement est annoncé" "$f" "the first start downloads ~140 GB"
+DF="$(mktemp -d)"; printf '#!/bin/sh\nprintf "Avail\\n1G\\n"\n' > "$DF/df"; chmod +x "$DF/df"
+f1="$(PATH="$DF:$PATH" sw flash-next --dry-run)"
+contains "dry-run flash-next : avec 1 Go libre, la bascule refuserait" "$f1" "the switch would refuse to start"
+contains "…en disant ce que le disque a"                   "$f1" "has 1 GB"
+printf '#!/bin/sh\nprintf "Avail\\n500G\\n"\n' > "$DF/df"
+f2="$(PATH="$DF:$PATH" sw flash-next --dry-run)"
+absent   "dry-run flash-next : avec 500 Go libres, rien à refuser" "$f2" "would refuse"
+contains "…et le dry-run le dit"                           "$f2" "has 500 GB"
+rm -rf "$DF"
+
 # --- 3b. la transcription suit le profil ---------------------------------------
 head_ "switch-model.sh : transcription"
 contains "dry-run qwen27b : STT_MODEL dans .env"        "$d" "STT_MODEL=$STT_MODEL"
@@ -398,6 +439,12 @@ check "state : statut de bascule au repos" "$(probe 'd["switch"]["status"]')" "i
 # déjà sur le disque, ou est-ce 133 Go à télécharger ?
 check "state : checkpoint présent détecté" "$(probe '[p for p in d["profiles"] if p["key"]=="qwen27b"][0]["downloaded"]')" "True"
 check "state : checkpoint absent détecté"  "$(probe '[p for p in d["profiles"] if p["key"]=="flash-next"][0]["downloaded"]')" "False"
+# Le checkpoint est là : rien à télécharger, donc rien à exiger du disque.
+# (Un values.yaml : sans lui le dry-run s'arrête dans build_sql, avant la ligne.)
+printf '  VLLM_MODEL_HIGH: "nvidia/Qwen3.8-27B-NVFP4"\n  VLLM_EMBEDDING_DIMENSIONS: "4096"\n' > "$BOX2/values.yaml"
+d2="$(DATA_DIR="$BOX2" bash "$REPO_ROOT/switch-model.sh" qwen27b --dry-run 2>&1)"
+contains "dry-run : checkpoint présent, pas de téléchargement ni d'exigence" "$d2" "already on disk (no download)"
+absent   "…pas de seuil affiché"                     "$d2" "GB free"
 check "state : flash-next demande un build" "$(probe '[p for p in d["profiles"] if p["key"]=="flash-next"][0]["needs_build"]')" "True"
 # Ce que la carte du profil peut annoncer : avec ou sans transcription.
 check "state : qwen27b annonce sa transcription" "$(probe '[p for p in d["profiles"] if p["key"]=="qwen27b"][0]["stt_model"]')" "$STT_MODEL"
