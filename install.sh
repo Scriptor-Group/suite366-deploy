@@ -108,7 +108,7 @@
 #                              s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>.
 #                              EMPTY (default) installs the backup mechanism
 #                              armed but idle — set it later in
-#                              <DATA_DIR>/backup/backup.env.
+#                              <DATA_DIR>/backup-private/backup.env.
 #   BACKUP_S3_ACCESS_KEY,      credentials for that destination
 #   BACKUP_S3_SECRET_KEY,
 #   BACKUP_S3_REGION

@@ -232,13 +232,25 @@ EOF
 # JIT warmup (Inductor/FlashInfer): without this, the first real request can
 # take ~25s (cold codegen, cf. vLLM DGX Spark blog). We exercise the real path
 # once so the first user doesn't pay this latency. Best-effort.
+# The key goes to curl through a 0600 header file (`-H @file`), never on its
+# argv: /proc/*/cmdline is readable by every local process, and a warmup holds
+# that argv for up to five minutes. Same mechanism as vllm_http_code in
+# lib/vllm-db.sh, duplicated because that block is also pasted into the
+# standalone scripts and must stay self-contained.
+warmup_auth_file() { # warmup_auth_file -> PATH
+  local f; f="$(mktemp)"
+  printf 'Authorization: Bearer %s\n' "$VLLM_API_KEY" > "$f"
+  printf '%s' "$f"
+}
 warmup_chat() { # warmup_chat BASE_URL MODEL
-  local base="$1" model="$2"
+  local base="$1" model="$2" hdr
   info "Warming up generative JIT (max_tokens=3)…"
+  hdr="$(warmup_auth_file)"
   curl -fsS -m 120 "$base/v1/chat/completions" \
-    -H "Authorization: Bearer $VLLM_API_KEY" -H "Content-Type: application/json" \
+    -H "@$hdr" -H "Content-Type: application/json" \
     -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":3}" \
     >/dev/null 2>&1 && info "  generative warm." || warn "  generative warmup skipped (curl failed, non-blocking)."
+  rm -f "$hdr"
 }
 # Two seconds of a 440 Hz tone: enough to run the encoder and the decoder once.
 # The transcript is noise; the point is the compiled kernels the first real
@@ -254,23 +266,26 @@ open(sys.argv[1], 'wb').write(hdr + pcm)
 PYW
 }
 warmup_stt() { # warmup_stt BASE_URL MODEL
-  local base="$1" model="$2" wav
+  local base="$1" model="$2" wav hdr
   info "Warming up transcription JIT…"
   wav="$(mktemp --suffix=.wav)"
+  hdr="$(warmup_auth_file)"
   if write_warmup_wav "$wav" && curl -fsS -m 300 "$base/v1/audio/transcriptions" \
-       -H "Authorization: Bearer $VLLM_API_KEY" \
+       -H "@$hdr" \
        -F "model=$model" -F "file=@$wav;type=audio/wav" >/dev/null 2>&1; then
     info "  transcription warm."
   else
     warn "  transcription warmup skipped (curl failed, non-blocking)."
   fi
-  rm -f "$wav"
+  rm -f "$wav" "$hdr"
 }
 warmup_embed() { # warmup_embed BASE_URL MODEL
-  local base="$1" model="$2"
+  local base="$1" model="$2" hdr
   info "Warming up embeddings JIT…"
+  hdr="$(warmup_auth_file)"
   curl -fsS -m 120 "$base/v1/embeddings" \
-    -H "Authorization: Bearer $VLLM_API_KEY" -H "Content-Type: application/json" \
+    -H "@$hdr" -H "Content-Type: application/json" \
     -d "{\"model\":\"$model\",\"input\":\"ping\"}" \
     >/dev/null 2>&1 && info "  embeddings warm." || warn "  embeddings warmup skipped (curl failed, non-blocking)."
+  rm -f "$hdr"
 }

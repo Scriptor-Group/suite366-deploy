@@ -762,11 +762,18 @@ administrators only (box-wide: one repository, one key, every organisation's
 data) — which is the intended route: it sets the destination, tests it immediately, and shows
 the last run, the snapshots and the key fingerprint without anyone opening a
 shell. The page can ask for a destination but can never read the stored
-credentials back: `backup.env` is 0600 and owned by root, so an empty secret
-field means "keep the one already saved".
+credentials back — nor replace them: `backup.env` lives in
+`/opt/suite366/backup-private/` (0700, root, **not** mounted into the pod),
+every field of the request is checked against an allow-list before it is
+written, and the file is read key by key, never sourced. An empty secret field
+means "keep the one already saved". The directory the pod *does* see,
+`/opt/suite366/backup/`, holds only `state.json`, the one-time key reveal and
+the request files it drops — and nothing root reads from there is trusted
+without being moved out of the pod's reach and checked first.
 
 Or at install time, or later by editing
-`/opt/suite366/backup/backup.env` (0600) and running `backup.sh init`:
+`/opt/suite366/backup-private/backup.env` (0600, one `KEY=value` per line) and
+running `backup.sh init`:
 
 ```bash
 curl -fsSL https://get.suite366.ai/install.sh | sudo env \
@@ -815,10 +822,11 @@ data directory at init). So: one secret to preserve, the rest to let go.
 ### Encryption key
 
 `restic` encrypts the repository with a key generated at install, stored
-**only** at `/opt/suite366/backup/repo.pass` (0600) and printed **once** while
-it is created. Lose it and the snapshots are unreadable — by anyone, including
-us. That is the property being bought, and it means the key must leave the
-machine by some deliberate route:
+**only** at `/opt/suite366/backup-private/repo.pass` (0600). The installer
+prints its **fingerprint** and its path, not the key itself — install logs end
+up in tickets — and tells you to read it once with `sudo cat`. Lose it and the
+snapshots are unreadable — by anyone, including us. That is the property being
+bought, and it means the key must leave the machine by some deliberate route:
 
 - **sold** appliance: printed on the card that ships inside the crate;
 - **rented** appliance: escrowed by `suite366-fleet`, with the vault reference
@@ -827,7 +835,12 @@ machine by some deliberate route:
 `backup.sh status` and the state file publish only a 12-character fingerprint of
 the key, never the key. `uninstall.sh` warns before deleting it, because the
 snapshots in the remote repository survive the uninstall and would outlive the
-only copy of their key.
+only copy of their key — and, run unattended (`ASSUME_YES=1`), it **refuses**
+to delete it unless `KEEP_DATA=1` or `I_HAVE_THE_BACKUP_KEY=1` says you have it.
+
+A box installed before the private directory existed keeps its key and its
+destination in `/opt/suite366/backup/`; the first run of the updated agent moves
+both into `backup-private/` and removes the copies the pod could reach.
 
 ### Restore
 
@@ -1037,18 +1050,20 @@ downloaded models**. It is idempotent and best-effort, so re-running it (or
 running it on a partial install) is safe.
 
 ```bash
-curl -fsSL https://get.suite366.ai/uninstall.sh | sudo ASSUME_YES=1 bash
+# unattended: refuses on a box that holds a backup key unless you say you have it
+curl -fsSL https://get.suite366.ai/uninstall.sh | sudo ASSUME_YES=1 I_HAVE_THE_BACKUP_KEY=1 bash
 # or, from a checkout:
-sudo ./uninstall.sh          # prompts for confirmation (type 'yes')
+sudo ./uninstall.sh          # prompts for confirmation (type 'yes'), after warning about the key
 ```
 
 Options (environment variables, like the installer):
 
 | Var | Effect |
 | --- | --- |
-| `ASSUME_YES=1`  | skip the confirmation prompt (**required** for `curl \| bash`, which has no TTY) |
+| `ASSUME_YES=1`  | skip the confirmation prompt (**required** for `curl \| bash`, which has no TTY). Not enough on its own when `/opt/suite366/backup-private/repo.pass` exists: that file is the only copy of the backup encryption key, and deleting it unattended is refused unless one of the next two is also set |
+| `I_HAVE_THE_BACKUP_KEY=1` | you have copied the repository key somewhere safe (or accept losing every snapshot): lets `ASSUME_YES=1` delete it |
 | `KEEP_MODELS=1` | remove `/opt/suite366` but keep the model cache (`…/models`), so a re-install doesn't re-download 15+ GiB |
-| `KEEP_DATA=1`   | leave `/opt/suite366` entirely untouched (models + config + certs) |
+| `KEEP_DATA=1`   | leave `/opt/suite366` entirely untouched (models + config + certs + the backup key) |
 | `KEEP_K3S=1`    | keep k3s + Helm; remove only the Suite 366 workloads (helm release, namespaces, cert-manager) |
 | `PRUNE_IMAGES=1`| also remove the vLLM + nginx Docker images (several GiB) |
 
