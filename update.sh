@@ -48,13 +48,26 @@
 #                 the chart reachable (online, or a staged USB package with
 #                 UPDATE_SOURCE=usb).
 #   license show  describe the licence on this box, or say there is none.
+#   power shutdown | power reboot
+#                 power the box off / reboot it, orderly (systemd stops k3s
+#                 and the vLLM stack first). What the app's Appliance > Power
+#                 page triggers; usable by hand too. Records who asked in
+#                 power.json and the host journal.
+#   power booted  run by suite366-power-booted.service at every boot: closes
+#                 the pending shutdown/reboot in power.json (what the app
+#                 shows as "back since …").
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
 #   state.json        written by `check`  — versions, diff summary, notes
 #   apply.json        written by `apply`  — idle|running|success|error + msg
+#   power.json        written by `power`  — idle|shutting_down|rebooting + who
+#                     asked, when, and when the box was back; its PRESENCE is
+#                     how the app knows this host accepts power requests
 #   check-requested   written by the app  — consumed, triggers `check`
 #   apply-requested   written by the app  — consumed, triggers `apply`
+#   shutdown-requested, reboot-requested
+#                     written by the app  — consumed, triggers `power …`
 # The pod runs as uid/gid 1001 and k8s does NOT apply fsGroup to hostPath
 # volumes, so the dir is root:1001 mode 0770 (group-writable for triggers).
 #
@@ -144,7 +157,15 @@ OFFLINE_SRC="$OFFLINE_DIR/source.json"
 UPDATES_DIR="$DATA_DIR/updates"
 STATE_JSON="$UPDATES_DIR/state.json"
 APPLY_JSON="$UPDATES_DIR/apply.json"
+POWER_JSON="$UPDATES_DIR/power.json"
+# The request being carried out across the reboot (root-only; power.json is
+# what the app reads). Written by `power shutdown|reboot`, closed by `power
+# booted` on the next start.
+POWER_PENDING="$UPDATES_DIR/power-pending"
 APP_GID=1001
+# Where the systemd units go; the self-test (tools/test-power.sh) points it at
+# a temp dir.
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
@@ -183,11 +204,16 @@ ensure_updates_dir() {
 
 # Consume (log + delete) a trigger file dropped by the app, if present. The
 # file content carries the requesting admin's email for the audit trail.
+# Leaves the requester in TRIGGER_WHO (empty when there was no trigger: a
+# manual run) for the callers that record it.
+TRIGGER_WHO=""
 consume_trigger() { # consume_trigger FILENAME
   local f="$UPDATES_DIR/$1" who=""
+  TRIGGER_WHO=""
   [[ -f "$f" ]] || return 0
   who="$(head -c 200 "$f" 2>/dev/null | tr -d '\r\n' || true)"
   rm -f "$f"
+  TRIGGER_WHO="$who"
   info "trigger $1 consumed${who:+ (requested by: $who)}"
   logger -t suite366-update "$1 consumed${who:+ (by: $who)}" 2>/dev/null || true
 }
@@ -263,6 +289,63 @@ write_apply_json() { # write_apply_json STATUS MESSAGE
 }
 EOF
   chmod 0644 "$tmp"; mv -f "$tmp" "$APPLY_JSON"
+}
+
+# --- power.json (read by the app UI) --------------------------------------------
+# status: idle | shutting_down | rebooting. `last` is the most recent request:
+# who asked, when, and when the box was back (empty while it is going down,
+# or for ever after a shutdown nobody followed with a boot). `null` on a box
+# that never had one.
+write_power_json() { # write_power_json STATUS [ACTION REQUESTED_BY REQUESTED_AT COMPLETED_AT]
+  ensure_updates_dir
+  local status="$1" last="null" tmp="$POWER_JSON.tmp"
+  if [[ -n "${2:-}" ]]; then
+    last="$(printf '{"action": "%s", "requested_by": "%s", "requested_at": "%s", "completed_at": "%s"}' \
+      "$(json_esc "$2")" "$(json_esc "${3:-}")" "$(json_esc "${4:-}")" "$(json_esc "${5:-}")")"
+  fi
+  # printf, not a heredoc: the self-test extracts this function by its closing
+  # brace, and a JSON `}` at column 0 inside a heredoc would end it early.
+  printf '{\n  "schema": 1,\n  "status": "%s",\n  "last": %s,\n  "updated_at": "%s"\n}\n' \
+    "$(json_esc "$status")" "$last" "$(now_utc)" > "$tmp"
+  chmod 0644 "$tmp"; mv -f "$tmp" "$POWER_JSON"
+}
+
+# --- power: shut the box down or reboot it, from the app or by hand ----------
+# Orderly: `systemctl poweroff|reboot` stops k3s and suite366-vllm.service (its
+# ExecStop is a compose down) before the kernel goes. `--no-block` so the
+# one-shot service that called us returns before systemd takes it down with
+# everything else. The trigger is consumed BEFORE anything else: a request
+# that fails must not replay at the next boot through the .path unit.
+do_power() { # do_power shutdown | reboot | booted
+  local action="$1" who="" when="" status="" cmd=""
+  case "$action" in
+    shutdown) status=shutting_down; cmd=poweroff ;;
+    reboot)   status=rebooting;     cmd=reboot ;;
+    booted)
+      # What the app shows as "back since …". A boot with nothing pending (a
+      # power cut, a manual reboot, the first install) leaves the record of
+      # the last request alone; it only seeds the file when there is none —
+      # its presence is the app's signal that this host takes power requests.
+      ensure_updates_dir
+      if [[ -f "$POWER_PENDING" ]]; then
+        { IFS= read -r action; IFS= read -r who; IFS= read -r when; } < "$POWER_PENDING" || true
+        rm -f "$POWER_PENDING"
+        write_power_json idle "${action:-reboot}" "$who" "$when" "$(now_utc)"
+        info "power: back after the $action requested by ${who:-the operator} at $when"
+        logger -t suite366-update "power: back after $action${who:+ (by: $who)}" 2>/dev/null || true
+      elif [[ ! -f "$POWER_JSON" ]]; then
+        write_power_json idle
+      fi
+      return 0 ;;
+    *) die "power: unknown action '$action' (use: shutdown | reboot | booted)." ;;
+  esac
+  consume_trigger "$action-requested"
+  who="$TRIGGER_WHO"; when="$(now_utc)"
+  ( umask 077; printf '%s\n%s\n%s\n' "$action" "$who" "$when" > "$POWER_PENDING" )
+  write_power_json "$status" "$action" "$who" "$when" ""
+  log "Power: $action requested by ${who:-the operator} — stopping the services, then the machine"
+  logger -t suite366-update "power: $action${who:+ (by: $who)}" 2>/dev/null || true
+  systemctl --no-block "$cmd" || die "systemctl $cmd failed."
 }
 
 # --- Current state on this box ------------------------------------------------
@@ -1341,7 +1424,7 @@ self_update_first() {
 install_units() {
   ensure_updates_dir
 
-  cat > /etc/systemd/system/suite366-update-apply.service <<EOF
+  cat > "$SYSTEMD_DIR/suite366-update-apply.service" <<EOF
 [Unit]
 Description=Suite 366 — apply update (triggered from the app UI)
 After=network-online.target
@@ -1353,7 +1436,7 @@ EnvironmentFile=-$DATA_DIR/update.env
 ExecStart=$DATA_DIR/update.sh apply
 EOF
 
-  cat > /etc/systemd/system/suite366-update-apply.path <<EOF
+  cat > "$SYSTEMD_DIR/suite366-update-apply.path" <<EOF
 [Unit]
 Description=Suite 366 — watch for apply requests from the app
 
@@ -1366,7 +1449,7 @@ EOF
 
   # A check request reuses the daily-timer service (suite366-update.service,
   # installed by install.sh) — same "update.sh check" one-shot.
-  cat > /etc/systemd/system/suite366-update-check.path <<EOF
+  cat > "$SYSTEMD_DIR/suite366-update-check.path" <<EOF
 [Unit]
 Description=Suite 366 — watch for check requests from the app
 
@@ -1378,10 +1461,60 @@ Unit=suite366-update.service
 WantedBy=multi-user.target
 EOF
 
+  # Power: one .path + one one-shot service per verb, and a boot-time one-shot
+  # that closes the request in power.json once the box is back. `enable --now`
+  # on the latter also runs it right here, which seeds power.json on a box
+  # that never had one — the app's cue that this host takes power requests.
+  local verb
+  for verb in shutdown reboot; do
+    # ExecStopPost: a trigger the script could not consume (an updater that
+    # predates `power`, a crash before do_power) must not stay there — with
+    # PathExists it re-fires the service until systemd's start limit trips and
+    # the .path unit itself goes failed, deaf to every later request. Seen on
+    # the test Spark 2026-10-12. The request is dropped (the journal says so),
+    # and the app's pick-up timeout tells the admin.
+    cat > "$SYSTEMD_DIR/suite366-power-$verb.service" <<EOF
+[Unit]
+Description=Suite 366 — $verb the appliance (triggered from the app UI)
+
+[Service]
+Type=oneshot
+ExecStart=$DATA_DIR/update.sh power $verb
+ExecStopPost=-/bin/rm -f $UPDATES_DIR/$verb-requested
+EOF
+    cat > "$SYSTEMD_DIR/suite366-power-$verb.path" <<EOF
+[Unit]
+Description=Suite 366 — watch for $verb requests from the app
+
+[Path]
+PathExists=$UPDATES_DIR/$verb-requested
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  done
+  cat > "$SYSTEMD_DIR/suite366-power-booted.service" <<EOF
+[Unit]
+Description=Suite 366 — record that the appliance is back after a requested shutdown or reboot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DATA_DIR/update.sh power booted
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   systemctl daemon-reload
-  systemctl enable --now suite366-update-apply.path suite366-update-check.path >/dev/null 2>&1 \
+  systemctl enable --now suite366-update-apply.path suite366-update-check.path \
+      suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service >/dev/null 2>&1 \
     || warn "could not enable trigger path units (systemd offline?)."
-  info "App-trigger units armed (watching $UPDATES_DIR)."
+  # Belt and braces for a systemd that could not start the booted unit (or a
+  # stub): the app must find power.json after install-units, whatever happened.
+  [[ -f "$POWER_JSON" ]] || write_power_json idle
+  info "App-trigger units armed (watching $UPDATES_DIR; power requests included)."
 }
 
 # --- self-update ----------------------------------------------------------------
@@ -2107,7 +2240,10 @@ case "$MODE" in
   license)
     do_license "${2:-}" "${3:-}"
     ;;
+  power)
+    do_power "${2:-}"
+    ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot)"
     ;;
 esac
