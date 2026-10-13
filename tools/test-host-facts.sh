@@ -71,7 +71,7 @@ H
   printf 'DATA_DIR=%s\nSYSTEMD_DIR=%s\nNM_DISPATCHER_DIR=%s\n' "$WORK/data" "$WORK/systemd" "$WORK/nm"
   sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^PRIVATE_DIR=/p; /^POWER_PENDING=/p; /^POWER_PENDING_LEGACY=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
   sed -n '/^now_utc() {/,/}$/p' "$REPO/update.sh"
-  for f in json_esc ensure_updates_dir private_tmp publish_file write_power_json host_lan_interfaces write_host_json do_host_facts install_units; do
+  for f in json_esc ensure_updates_dir private_tmp published_ok publish_file write_power_json host_lan_interfaces write_host_json do_host_facts install_units; do
     sed -n "/^$f() {/,/^}/p" "$REPO/update.sh"
   done
 } > "$WORK/prelude.sh"
