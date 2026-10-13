@@ -78,7 +78,12 @@ verify() { # verify PKGDIR PUBKEY CUR_APP  -> prints pkg_error, exit status
       [[ "$1" != "$2" ]] || return 1
       [[ "$(printf "%s\n%s\n" "$1" "$2" | sort -V | tail -1)" == "$1" ]]
     }
-    # Pull pkg_verify out of the real update.sh, verbatim.
+    # Pull pkg_verify out of the real update.sh, verbatim — and the signature
+    # helper it calls since the trust bootstrap (the key under test is the one
+    # the harness generated, so the embedded default is never written).
+    PACKAGE_PUBLIC_KEY_NEXT="/nonexistent"
+    ensure_package_public_key() { :; }
+    eval "$(sed -n "/^verify_sig() {/,/^}/p" "$4")"
     eval "$(sed -n "/^pkg_verify() {/,/^}/p" "$4")"
     if pkg_verify "$1"; then echo "OK"; exit 0; else echo "$pkg_error"; exit 1; fi
   ' _ "$1" "$2" "$3" "$UPDATE_SH"

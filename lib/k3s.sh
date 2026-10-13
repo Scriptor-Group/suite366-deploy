@@ -42,7 +42,9 @@ EOF
     # certs that bypass RBAC). Diagnostics on the host go via `sudo k3s
     # kubectl ...` (k3s embeds kubectl + reads /etc/rancher/k3s/k3s.yaml as
     # root automatically).
-    curl -sfL https://get.k3s.io | sh - \
+    # Pinned (lib/config.sh K3S_VERSION): the installer script fetches that
+    # release and verifies the binary against the release's sha256sum file.
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" sh - \
       || die "k3s install failed (network? see above)."
     info "k3s installed."
   fi
@@ -58,7 +60,31 @@ EOF
   info "Node Ready."
 
   if ! have helm; then
-    log "Installing Helm"
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    log "Installing Helm $HELM_VERSION"
+    install_helm || die "helm install failed."
   fi
+}
+
+# Helm from the release tarball, verified against the sha256 pinned in
+# lib/config.sh — not `get-helm-3 | bash` from helm's `main` branch, which
+# ran whatever that script was on the day, as root.
+install_helm() {
+  local arch sha url tmp got
+  case "$(uname -m)" in
+    aarch64|arm64) arch=arm64; sha="$HELM_SHA256_ARM64" ;;
+    x86_64|amd64)  arch=amd64; sha="$HELM_SHA256_AMD64" ;;
+    *) warn "no pinned helm build for $(uname -m)"; return 1 ;;
+  esac
+  url="https://get.helm.sh/helm-$HELM_VERSION-linux-$arch.tar.gz"
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL -m 120 "$url" -o "$tmp/helm.tgz"; then warn "could not fetch $url"; rm -rf "$tmp"; return 1; fi
+  got="$(sha256sum "$tmp/helm.tgz" | awk '{print $1}')"
+  if [[ "$got" != "$sha" ]]; then
+    warn "REFUSING helm tarball from $url — sha256 does not match the pinned one."
+    warn "  expected $sha"; warn "  got      $got"
+    rm -rf "$tmp"; return 1
+  fi
+  tar -xzf "$tmp/helm.tgz" -C "$tmp" "linux-$arch/helm" \
+    && install -m 0755 "$tmp/linux-$arch/helm" /usr/local/bin/helm
+  local rc=$?; rm -rf "$tmp"; return $rc
 }
