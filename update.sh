@@ -263,6 +263,13 @@ private_tmp() { # private_tmp NAME -> path
   ensure_updates_dir
   mktemp "$PRIVATE_DIR/$1.XXXXXX"
 }
+# A published file is "there" only when it is a regular file root wrote: a
+# symlink the pod planted under its name (seen on gb10-812nqm4, 2026-10-13:
+# power.json -> /etc/hostname) passed `-f`, so the file was never rewritten and
+# the app's page broke. Such an entry counts as absent and gets replaced.
+published_ok() { # published_ok FILE
+  [[ -f "$1" && ! -L "$1" && -O "$1" ]]   # -O: owned by us (root on the box)
+}
 # Publish a file for the pod: 0644, then renamed into place (never written in
 # place, never chmod-ed in place — see PRIVATE_DIR).
 publish_file() { # publish_file TMP DEST
@@ -433,7 +440,7 @@ do_power() { # do_power shutdown | reboot | booted
         write_power_json idle "${action:-reboot}" "$who" "$when" "$(now_utc)"
         info "power: back after the $action requested by ${who:-the operator} at $when"
         logger -t suite366-update "power: back after $action${who:+ (by: $who)}" 2>/dev/null || true
-      elif [[ ! -f "$POWER_JSON" ]]; then
+      elif ! published_ok "$POWER_JSON"; then
         write_power_json idle
       fi
       return 0 ;;
@@ -1694,7 +1701,7 @@ EOF
     || warn "could not enable trigger path units (systemd offline?)."
   # Belt and braces for a systemd that could not start the booted unit (or a
   # stub): the app must find power.json after install-units, whatever happened.
-  [[ -f "$POWER_JSON" ]] || write_power_json idle
+  published_ok "$POWER_JSON" || write_power_json idle
   write_host_json
   info "App-trigger units armed (watching $UPDATES_DIR; power requests included; host facts published)."
 }

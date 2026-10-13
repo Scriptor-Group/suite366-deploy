@@ -58,7 +58,7 @@ H
   # The paths and the helpers, as update.sh defines them.
   sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^PRIVATE_DIR=/p; /^POWER_PENDING=/p; /^POWER_PENDING_LEGACY=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p; /^TRIGGER_REFUSED=/p' "$REPO/update.sh"
   sed -n '/^now_utc() {/,/}$/p' "$REPO/update.sh"
-  for f in json_esc ensure_updates_dir private_tmp publish_file trigger_ok consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
+  for f in json_esc ensure_updates_dir private_tmp published_ok publish_file trigger_ok consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
     sed -n "/^$f() {/,/^}/p" "$REPO/update.sh"
   done
   # chown to a gid this user may not have: the self-test runs unprivileged —
@@ -199,6 +199,14 @@ if [[ -L "$WORK/data/updates/power.json" ]]; then ko "the published file replace
 check "…and is a regular 0644 file" "$(stat -c '%F %a' "$WORK/data/updates/power.json")" "regular file 644"
 check "the private working dir is root-only" "$(stat -c %a "$WORK/data/.private")" "700"
 check "nothing root-owned but the published files is left in the shared dir" "$(find "$WORK/data/updates" -mindepth 1 ! -name '*.json' ! -name '*.tmp' -printf '%f ' 2>/dev/null)" ""
+# A symlink planted IN PLACE of power.json (not as a temp name): it used to
+# pass `-f`, so booted/install-units never rewrote it and the page broke.
+reset_box; run "ensure_updates_dir" >/dev/null
+printf 'canary\n' > "$WORK/canary2"; ln -s "$WORK/canary2" "$WORK/data/updates/power.json"
+out="$(run "do_power booted")"; RC=$?
+if [[ -L "$WORK/data/updates/power.json" ]]; then ko "a planted power.json symlink is replaced at boot"; else ok "a planted power.json symlink is replaced at boot"; fi
+check "…the canary it pointed at is untouched" "$(cat "$WORK/canary2")" "canary"
+check "…and power.json is valid again" "$(jq_ 'd["status"]')" "idle"
 # A box that rebooted on the previous updater: its record was in the shared dir.
 reset_box; run "ensure_updates_dir" >/dev/null
 printf 'reboot\nold@acme.example\n2026-10-12T15:00:00Z\n' > "$WORK/data/updates/power-pending"
