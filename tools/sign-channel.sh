@@ -122,6 +122,12 @@ pin_value() { # pin_value FIELD VALUE
 }
 
 cfg() { sed -n "s/^$1=\"\\\${$1:-\([^}]*\)}\"/\1/p" "$REPO_ROOT/lib/config.sh" | head -1; }
+# Anti-replay: a serial (seconds since the epoch) a box only ever moves
+# forward on, and an expiry a year out — an old channel.json + .sig pair from
+# the git history must not be able to walk a box back. A re-sign is a new
+# serial on purpose. (update.sh check_manifest_freshness is the other half.)
+pin_value serial  "$(date -u +%s)"
+pin_value expires "$(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
 pin_value restic_version      "$(cfg RESTIC_VERSION)"
 pin_value restic_sha256_arm64 "$(cfg RESTIC_SHA256_ARM64)"
 pin_value restic_sha256_amd64 "$(cfg RESTIC_SHA256_AMD64)"

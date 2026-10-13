@@ -308,16 +308,23 @@ CDI_SPEC="${CDI_SPEC:-/etc/cdi/nvidia.yaml}"
 # appliance ships with the mechanism armed but idle: `backup.sh run` then
 # reports "unconfigured" and exits 0 rather than failing nightly. Set
 # BACKUP_REPO (any restic backend; S3 is the intended one) at install time, or
-# later in $DATA_DIR/backup/backup.env.
+# later in $DATA_DIR/backup-private/backup.env.
 #   BACKUP_REPO=s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>
+# Two directories: $BACKUP_DIR is SHARED with the drive-app pod (hostPath, the
+# UI reads state.json there and drops its requests), $BACKUP_PRIVATE_DIR is
+# root-only and holds everything root reads back — the credentials, the key,
+# the restic cache. The pod can write the first; nothing it writes may ever
+# be read as config by root (backup.sh's header has the review that drew the line).
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
+BACKUP_PRIVATE_DIR="${BACKUP_PRIVATE_DIR:-$DATA_DIR/backup-private}"
 BACKUP_REPO="${BACKUP_REPO:-}"
 BACKUP_S3_ACCESS_KEY="${BACKUP_S3_ACCESS_KEY:-}"
 BACKUP_S3_SECRET_KEY="${BACKUP_S3_SECRET_KEY:-}"
 BACKUP_S3_REGION="${BACKUP_S3_REGION:-}"
 # Repository encryption key. Generated when empty; kept 0600 in
-# $BACKUP_DIR/repo.pass and printed ONCE at the end of the install. There is no
-# recovery path if it is lost — that is the property being bought, and the
+# $BACKUP_PRIVATE_DIR/repo.pass — only its fingerprint and its path are printed
+# at the end of the install, never the key (install logs end up in tickets).
+# There is no recovery path if it is lost — that is the property being bought, and the
 # reason a rented box escrows it (suite366-fleet) and a sold one ships it on a
 # card inside the crate.
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
@@ -342,14 +349,29 @@ MODELS_DIR="${MODELS_DIR:-$DATA_DIR/models}"
 # JIT caches mounted into the vLLM containers (torch.compile, FlashInfer,
 # Triton) — see llm/docker-compose.yml. Disposable; rebuilt in ~3 min if lost.
 CACHE_DIR="${CACHE_DIR:-$DATA_DIR/cache}"
-# Ed25519 PUBLIC key that signs OFFLINE update packages (built by
-# tools/build-offline-package.sh). Path to a PEM file — when the file is
-# ABSENT, `update.sh scan-usb` refuses every package, which is the correct
-# default for a box with no offline-update entitlement. Deployments that want
-# USB updates drop the key there (suite366-fleet does it at install time).
-# Separate keypair from the LICENSE key: different lifecycle, different blast
-# radius, and a license key must never acquire code-execution meaning.
+# Ed25519 PUBLIC key that signs the channel manifest, the updater, the backup
+# agent, the host layer and the OFFLINE packages (tools/sign-channel.sh,
+# tools/build-offline-package.sh). Path to a PEM file, WRITTEN BY THE
+# INSTALLER from the embedded default below (lib/updater.sh) — until
+# 2026-10-13 the public install never installed it and a box without it
+# trusted TLS alone while a daily timer refreshed root-run scripts from
+# `main`. Separate keypair from the LICENSE key: different lifecycle,
+# different blast radius, and a license key must never acquire
+# code-execution meaning. Override the PEM with PACKAGE_PUBLIC_KEY_PEM (a
+# deployment signing with its own key).
 PACKAGE_PUBLIC_KEY="${PACKAGE_PUBLIC_KEY:-$DATA_DIR/package-release.pub}"
+_DEFAULT_PACKAGE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAAAIj33sDi5EbhWnKHuaH8jt0yPph1+Nvrqdr/A7y3bg=
+-----END PUBLIC KEY-----'
+PACKAGE_PUBLIC_KEY_PEM="${PACKAGE_PUBLIC_KEY_PEM:-$_DEFAULT_PACKAGE_PUBLIC_KEY}"
+# Pinned versions of what the installer executes as root. Bump deliberately:
+# k3s with its release notes (the k3s installer verifies the binary against
+# the release's sha256sum file itself), helm with the sha256 of each tarball
+# (https://get.helm.sh/helm-<v>-linux-<arch>.tar.gz.sha256sum).
+K3S_VERSION="${K3S_VERSION:-v1.36.2+k3s1}"
+HELM_VERSION="${HELM_VERSION:-v3.21.3}"
+HELM_SHA256_ARM64="67f58155079ff9ffab98ba5c88daff0ed9b542f3a4732f5dd426dde7dd0f5244"
+HELM_SHA256_AMD64="15e041a93a590dce8100f39385cd98c84a765c9e36aeeb9e2dc6ff9e4769e2e0"
 ASSUME_YES="${ASSUME_YES:-0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 

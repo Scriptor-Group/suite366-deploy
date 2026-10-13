@@ -253,9 +253,9 @@ livekit:
 #  /opt/suite366/backup   -> /appliance-backup  (APPLIANCE_BACKUP_DIR)
 #    backup.sh publishes state.json there (last run, snapshots, destination,
 #    key fingerprint) and the app drops run-/test-/configure-requested triggers.
-#    The credentials themselves live in backup.env inside that directory at
-#    0600, so the pod can ASK for a destination but can never read back the
-#    secret it set.
+#    The credentials themselves live in backup.env under /opt/suite366/backup-private
+#    (0700 root, NOT mounted), so the pod can ASK for a destination but can
+#    never read back — or replace — the secret it set.
 #
 #  /opt/suite366/remote   -> /appliance-remote  (APPLIANCE_REMOTE_DIR)
 #    Remote publication toggle, RENTED fleet appliances only. remote.sh

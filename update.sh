@@ -56,6 +56,11 @@
 #   power booted  run by suite366-power-booted.service at every boot: closes
 #                 the pending shutdown/reboot in power.json (what the app
 #                 shows as "back since …").
+#   host-facts    publish host.json: the hostname and the box's CURRENT LAN
+#                 addresses, for the app's Appliance overview ("reach me at
+#                 192.168.1.72"). Run at boot, by NetworkManager on every
+#                 address change, by `check` and by install-units; cheap,
+#                 offline-safe, no cluster needed.
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
@@ -64,6 +69,8 @@
 #   power.json        written by `power`  — idle|shutting_down|rebooting + who
 #                     asked, when, and when the box was back; its PRESENCE is
 #                     how the app knows this host accepts power requests
+#   host.json         written by `host-facts` — hostname, LAN interfaces and
+#                     their current addresses, the internal IP
 #   check-requested   written by the app  — consumed, triggers `check`
 #   apply-requested   written by the app  — consumed, triggers `apply`
 #   shutdown-requested, reboot-requested
@@ -84,7 +91,10 @@
 #   BACKUP_URL      same, for the backup agent (default: sibling of
 #                   MANIFEST_URL). Governed by the same SELF_UPDATE switch and
 #                   the same signature rules — see converge_backup.
-#   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying offline packages.
+#   PACKAGE_PUBLIC_KEY  PEM Ed25519 public key verifying the channel and the
+#                       offline packages. Written from the embedded default
+#                       when absent (every box is strict since 2026-10-13).
+#   PACKAGE_PUBLIC_KEY_NEXT  a second key accepted during a rotation.
 #                   Absent file => every offline package is refused.
 # =============================================================================
 set -euo pipefail
@@ -101,7 +111,7 @@ DATA_DIR="${DATA_DIR:-/opt/suite366}"
 
 MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/Scriptor-Group/suite366-deploy/main/channel.json}"
 # Detached Ed25519 signature over channel.json, published beside it. Required on
-# any appliance that holds PACKAGE_PUBLIC_KEY; ignored on one that does not.
+# every appliance (the key is embedded and installed when missing).
 MANIFEST_SIG_URL="${MANIFEST_SIG_URL:-$MANIFEST_URL.sig}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 NAMESPACE="${NAMESPACE:-suite366}"
@@ -130,16 +140,24 @@ BACKUP_AGENT="$DATA_DIR/backup.sh"
 HOST_LAYER_URL="${HOST_LAYER_URL:-${MANIFEST_URL%/*}/host-layer.sh}"
 HOST_LAYER_STAMP="$DATA_DIR/llm/.host-layer.sha256"
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
-BACKUP_ENV="${BACKUP_ENV:-$BACKUP_DIR/backup.env}"
+# Root-only sibling of the shared directory: backup.env and repo.pass moved
+# there in Oct 2026 (the pod could write the shared one — backup.sh's header).
+# A box whose agent has not run since still has them in the old place, so both
+# are looked at, the private one first.
+BACKUP_PRIVATE_DIR="${BACKUP_PRIVATE_DIR:-$DATA_DIR/backup-private}"
+BACKUP_ENV="${BACKUP_ENV:-$BACKUP_PRIVATE_DIR/backup.env}"
 RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
 # One line, read deliberately rather than sourcing the file: backup.env also
 # carries the destination's S3 credentials, and the updater has no business
-# holding them even briefly.
-if [[ -f "$BACKUP_ENV" ]]; then
-  _rb="$(sed -n 's/^RESTIC_BIN=//p' "$BACKUP_ENV" | head -1)"
-  [[ -n "$_rb" ]] && RESTIC_BIN="$_rb"
-  unset _rb
-fi
+# holding them even briefly. Only a regular file owned by root is read: the
+# legacy location is writable by the pod.
+for _bf in "$BACKUP_ENV" "$BACKUP_DIR/backup.env"; do
+  [[ ! -L "$_bf" && -f "$_bf" && -O "$_bf" ]] || continue
+  _rb="$(sed -n 's/^RESTIC_BIN=//p' "$_bf" | head -1)"
+  [[ "$_rb" =~ ^/[A-Za-z0-9._/-]+$ ]] && RESTIC_BIN="$_rb"
+  break
+done
+unset _bf _rb
 
 # --- Offline (USB) package source ---------------------------------------------
 # A verified package is COPIED off the removable drive into $OFFLINE_PKG so the
@@ -148,6 +166,39 @@ fi
 # outcome (including rejections, which have no staged content to speak for
 # them) and is the only thing `check` needs to read.
 PACKAGE_PUBLIC_KEY="${PACKAGE_PUBLIC_KEY:-$DATA_DIR/package-release.pub}"
+# A second key, accepted alongside the first while a rotation is under way:
+# publish the new public key here (and in install.sh's default) on every box,
+# then sign with the new private key, then retire the old file. Absent = no
+# rotation in progress.
+PACKAGE_PUBLIC_KEY_NEXT="${PACKAGE_PUBLIC_KEY_NEXT:-$DATA_DIR/package-release-next.pub}"
+# The key that signs the channel and the packages, EMBEDDED: until 2026-10-13
+# the public install never installed it (only suite366-fleet did), so a box
+# without it trusted TLS alone — and a daily timer replaced this very script
+# from `main` under that trust. Whoever could push to main was root on every
+# such box within 24 h. The key ships with the installer and with this script
+# (which a box already trusts, since it is running it), it is written where it
+# is missing, and nothing runs unsigned any more. PACKAGE_PUBLIC_KEY_PEM
+# overrides it (a fleet that signs with its own key; the self-test).
+_EMBEDDED_PACKAGE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAAAIj33sDi5EbhWnKHuaH8jt0yPph1+Nvrqdr/A7y3bg=
+-----END PUBLIC KEY-----'
+ensure_package_public_key() {
+  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && return 0
+  local pem="${PACKAGE_PUBLIC_KEY_PEM:-$_EMBEDDED_PACKAGE_PUBLIC_KEY}"
+  ( umask 022; printf '%s\n' "$pem" > "$PACKAGE_PUBLIC_KEY" ) \
+    || die "cannot write the package signing key to $PACKAGE_PUBLIC_KEY — refusing to run without it."
+  info "package signing key installed at $PACKAGE_PUBLIC_KEY (this box now requires signed channels)."
+  logger -t suite366-update "package signing key installed at $PACKAGE_PUBLIC_KEY" 2>/dev/null || true
+}
+# Verify a detached Ed25519 signature with the key, or with the rotation key.
+verify_sig() { # verify_sig FILE SIGFILE
+  local k
+  for k in "$PACKAGE_PUBLIC_KEY" "$PACKAGE_PUBLIC_KEY_NEXT"; do
+    [[ -s "$k" ]] || continue
+    openssl pkeyutl -verify -rawin -pubin -inkey "$k" -sigfile "$2" -in "$1" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 OFFLINE_DIR="$DATA_DIR/offline"
 OFFLINE_PKG="$OFFLINE_DIR/pkg"
 OFFLINE_SRC="$OFFLINE_DIR/source.json"
@@ -158,14 +209,27 @@ UPDATES_DIR="$DATA_DIR/updates"
 STATE_JSON="$UPDATES_DIR/state.json"
 APPLY_JSON="$UPDATES_DIR/apply.json"
 POWER_JSON="$UPDATES_DIR/power.json"
-# The request being carried out across the reboot (root-only; power.json is
-# what the app reads). Written by `power shutdown|reboot`, closed by `power
-# booted` on the next start.
-POWER_PENDING="$UPDATES_DIR/power-pending"
+HOST_JSON="$UPDATES_DIR/host.json"
 APP_GID=1001
+# Root-only working space, OUTSIDE the directory the pod can write. Every
+# file root publishes into $UPDATES_DIR is produced here and then renamed into
+# place: a rename replaces whatever sits at the destination — a symlink the pod
+# planted included — where writing `$UPDATES_DIR/x.tmp` directly would have
+# followed that symlink and overwritten any file on the host as root (the
+# directory is root:1001 0770 without sticky bit, so the pod can create and
+# rename entries in it). Reviewed 2026-10-13; nothing root-owned lives in the
+# shared directory any more except what the app is meant to read.
+PRIVATE_DIR="$DATA_DIR/.private"
+# The request being carried out across the reboot. Written by `power
+# shutdown|reboot`, closed by `power booted` on the next start. Root-only and
+# out of the pod's reach (it used to sit in $UPDATES_DIR, where the pod could
+# delete or replace it: migrated on first read).
+POWER_PENDING="$PRIVATE_DIR/power-pending"
+POWER_PENDING_LEGACY="$UPDATES_DIR/power-pending"
 # Where the systemd units go; the self-test (tools/test-power.sh) points it at
 # a temp dir.
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+NM_DISPATCHER_DIR="${NM_DISPATCHER_DIR:-/etc/NetworkManager/dispatcher.d}"
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
@@ -190,27 +254,99 @@ json_esc() {
   s=${s//\"/\\\"}
   s=${s//$'\n'/\\n}
   s=${s//$'\t'/\\t}
-  printf '%s' "$s"
+  s=${s//$'\r'/\\r}
+  # Any other control character (a trigger's content is the pod's to write)
+  # would make the JSON unreadable for the app: dropped rather than escaped.
+  printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+# What a manifest or a package may name. A version is dotted digits with an
+# optional pre-release/build suffix; an image reference a registry path with
+# an optional tag and digest; a pin a sha256. Anything else is refused before
+# it reaches a `sed` that rewrites values.yaml or llm/.env with it.
+# (One function per line would read better; the self-tests extract functions
+# by their `name() {` … `}` lines, so they are written out in full.)
+valid_version() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][A-Za-z0-9.+-]+)?$ ]]
+}
+valid_image_ref() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]]
+}
+valid_sha256() {
+  [[ -z "$1" || "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+validate_target_fields() { # validate_target_fields WHAT CHART APP VLLM -> sets ${WHAT}_error on failure
+  local what="$1" chart="$2" app="$3" vllm="$4" bad=""
+  [[ -z "$chart" ]] || valid_version "$chart"  || bad="chart_version '$chart'"
+  [[ -z "$app" ]]   || valid_version "$app"    || bad="${bad:+$bad, }app_version '$app'"
+  [[ -z "$vllm" ]]  || valid_image_ref "$vllm" || bad="${bad:+$bad, }vllm_image '$vllm'"
+  [[ -z "$bad" ]] && return 0
+  printf -v "${what}_error" '%s' "refusing $what: malformed $bad"
+  return 1
 }
 
 [[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
 
 # --- App <-> host shared dir --------------------------------------------------
 ensure_updates_dir() {
-  mkdir -p "$UPDATES_DIR"
+  mkdir -p "$UPDATES_DIR" "$PRIVATE_DIR"
   chown "root:$APP_GID" "$UPDATES_DIR"
   chmod 0770 "$UPDATES_DIR"
+  chmod 0700 "$PRIVATE_DIR"
+}
+# A temp file in the root-only working space, for a file bound for $UPDATES_DIR.
+private_tmp() { # private_tmp NAME -> path
+  ensure_updates_dir
+  mktemp "$PRIVATE_DIR/$1.XXXXXX"
+}
+# A published file is "there" only when it is a regular file root wrote: a
+# symlink the pod planted under its name (seen on gb10-812nqm4, 2026-10-13:
+# power.json -> /etc/hostname) passed `-f`, so the file was never rewritten and
+# the app's page broke. Such an entry counts as absent and gets replaced.
+published_ok() { # published_ok FILE
+  [[ -f "$1" && ! -L "$1" && -O "$1" ]]   # -O: owned by us (root on the box)
+}
+# Publish a file for the pod: 0644, then renamed into place (never written in
+# place, never chmod-ed in place — see PRIVATE_DIR).
+publish_file() { # publish_file TMP DEST
+  chmod 0644 "$1"; mv -f "$1" "$2"
+}
+# A trigger the pod dropped is only read when it is what the app writes: a
+# regular file (not a symlink pointing root at /etc/shadow or the k3s token —
+# its first 200 bytes used to land in power.json, world-readable), owned by the
+# pod's uid or by root, and small. Anything else is logged and removed, so a
+# .path unit does not re-fire on it for ever.
+trigger_ok() { # trigger_ok FILE -> 0 readable, 1 refused (and removed)
+  local f="$1" owner size
+  [[ -e "$f" || -L "$f" ]] || return 1
+  if [[ -L "$f" || ! -f "$f" ]]; then
+    warn "trigger $(basename "$f") is not a regular file — ignored and removed."
+    logger -t suite366-update "trigger $(basename "$f") refused: not a regular file" 2>/dev/null || true
+    rm -f "$f"; return 1
+  fi
+  owner="$(stat -c %u "$f" 2>/dev/null || echo -1)"; size="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+  if [[ "$owner" != "$APP_GID" && "$owner" != 0 ]] || (( size > 65536 )); then
+    warn "trigger $(basename "$f") refused (owner uid $owner, $size bytes) — removed."
+    logger -t suite366-update "trigger $(basename "$f") refused: owner $owner size $size" 2>/dev/null || true
+    rm -f "$f"; return 1
+  fi
+  return 0
 }
 
 # Consume (log + delete) a trigger file dropped by the app, if present. The
 # file content carries the requesting admin's email for the audit trail.
 # Leaves the requester in TRIGGER_WHO (empty when there was no trigger: a
 # manual run) for the callers that record it.
+# TRIGGER_REFUSED=1 when a trigger was there but refused (not a plain file
+# from the app): the caller must then do NOTHING — a refused request is not a
+# request. Seen on gb10-812nqm4 on 2026-10-13: a symlinked reboot-requested
+# was refused and removed, and the box rebooted anyway.
 TRIGGER_WHO=""
+TRIGGER_REFUSED=0
 consume_trigger() { # consume_trigger FILENAME
   local f="$UPDATES_DIR/$1" who=""
-  TRIGGER_WHO=""
-  [[ -f "$f" ]] || return 0
+  TRIGGER_WHO=""; TRIGGER_REFUSED=0
+  [[ -e "$f" || -L "$f" ]] || return 0
+  trigger_ok "$f" || { TRIGGER_REFUSED=1; return 0; }
   who="$(head -c 200 "$f" 2>/dev/null | tr -d '\r\n' || true)"
   rm -f "$f"
   TRIGGER_WHO="$who"
@@ -223,7 +359,7 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   ensure_updates_dir
   local avail=false; [[ "$1" == "1" ]] && avail=true
   local reachable=false; [[ "${online_reachable:-0}" == "1" ]] && reachable=true
-  local tmp="$STATE_JSON.tmp"
+  local tmp; tmp="$(private_tmp state.json)"
   # schema 2 adds `source` + `sources` (online / usb). Readers tolerating only
   # schema 1 keep working: every field they know is unchanged and still carries
   # the RESOLVED best-of-both target, not just the online one.
@@ -269,7 +405,7 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   }
 }
 EOF
-  chmod 0644 "$tmp"; mv -f "$tmp" "$STATE_JSON"
+  publish_file "$tmp" "$STATE_JSON"
 }
 
 APPLY_STARTED_AT=""
@@ -277,7 +413,7 @@ write_apply_json() { # write_apply_json STATUS MESSAGE
   ensure_updates_dir
   local status="$1" message="$2" finished=""
   case "$status" in success|error) finished="$(now_utc)";; esac
-  local tmp="$APPLY_JSON.tmp"
+  local tmp; tmp="$(private_tmp apply.json)"
   cat > "$tmp" <<EOF
 {
   "schema": 1,
@@ -288,7 +424,7 @@ write_apply_json() { # write_apply_json STATUS MESSAGE
   "updated_at": "$(now_utc)"
 }
 EOF
-  chmod 0644 "$tmp"; mv -f "$tmp" "$APPLY_JSON"
+  publish_file "$tmp" "$APPLY_JSON"
 }
 
 # --- power.json (read by the app UI) --------------------------------------------
@@ -298,7 +434,7 @@ EOF
 # that never had one.
 write_power_json() { # write_power_json STATUS [ACTION REQUESTED_BY REQUESTED_AT COMPLETED_AT]
   ensure_updates_dir
-  local status="$1" last="null" tmp="$POWER_JSON.tmp"
+  local status="$1" last="null" tmp; tmp="$(private_tmp power.json)"
   if [[ -n "${2:-}" ]]; then
     last="$(printf '{"action": "%s", "requested_by": "%s", "requested_at": "%s", "completed_at": "%s"}' \
       "$(json_esc "$2")" "$(json_esc "${3:-}")" "$(json_esc "${4:-}")" "$(json_esc "${5:-}")")"
@@ -307,7 +443,7 @@ write_power_json() { # write_power_json STATUS [ACTION REQUESTED_BY REQUESTED_AT
   # brace, and a JSON `}` at column 0 inside a heredoc would end it early.
   printf '{\n  "schema": 1,\n  "status": "%s",\n  "last": %s,\n  "updated_at": "%s"\n}\n' \
     "$(json_esc "$status")" "$last" "$(now_utc)" > "$tmp"
-  chmod 0644 "$tmp"; mv -f "$tmp" "$POWER_JSON"
+  publish_file "$tmp" "$POWER_JSON"
 }
 
 # --- power: shut the box down or reboot it, from the app or by hand ----------
@@ -327,25 +463,87 @@ do_power() { # do_power shutdown | reboot | booted
       # the last request alone; it only seeds the file when there is none —
       # its presence is the app's signal that this host takes power requests.
       ensure_updates_dir
+      # A box that rebooted on the previous updater left its record in the
+      # shared directory: take it from there once, as long as it is a plain file.
+      if [[ ! -f "$POWER_PENDING" && -f "$POWER_PENDING_LEGACY" && ! -L "$POWER_PENDING_LEGACY" ]]; then
+        mv -f "$POWER_PENDING_LEGACY" "$POWER_PENDING" 2>/dev/null || true
+      fi
+      rm -f "$POWER_PENDING_LEGACY"
       if [[ -f "$POWER_PENDING" ]]; then
         { IFS= read -r action; IFS= read -r who; IFS= read -r when; } < "$POWER_PENDING" || true
         rm -f "$POWER_PENDING"
         write_power_json idle "${action:-reboot}" "$who" "$when" "$(now_utc)"
         info "power: back after the $action requested by ${who:-the operator} at $when"
         logger -t suite366-update "power: back after $action${who:+ (by: $who)}" 2>/dev/null || true
-      elif [[ ! -f "$POWER_JSON" ]]; then
+      elif ! published_ok "$POWER_JSON"; then
         write_power_json idle
       fi
       return 0 ;;
     *) die "power: unknown action '$action' (use: shutdown | reboot | booted)." ;;
   esac
   consume_trigger "$action-requested"
+  if [[ "$TRIGGER_REFUSED" == 1 ]]; then
+    warn "power: the $action request was refused (see above) — nothing done."
+    return 0
+  fi
   who="$TRIGGER_WHO"; when="$(now_utc)"
+  ensure_updates_dir
   ( umask 077; printf '%s\n%s\n%s\n' "$action" "$who" "$when" > "$POWER_PENDING" )
   write_power_json "$status" "$action" "$who" "$when" ""
   log "Power: $action requested by ${who:-the operator} — stopping the services, then the machine"
   logger -t suite366-update "power: $action${who:+ (by: $who)}" 2>/dev/null || true
   systemctl --no-block "$cmd" || die "systemctl $cmd failed."
+}
+
+# --- host.json: where the box is on the network (read by the app UI) ----------
+# The app runs in a pod on 10.42.x and knows nothing of the host's LAN; the
+# admin who wants to reach the box by IP (a .local name that does not resolve,
+# a DNS still to be set up, a laptop plugged straight into it) has nowhere to
+# read it. So the host says it: the interface the default route leaves by
+# first, then every other physical interface with a global address — never the
+# plumbing (suite0, docker, cni, flannel, tailscale, veth, WireGuard). The
+# internal IP (suite0) is listed apart: it is where vLLM listens, not a LAN
+# address. Offline (no default route) every interface still gets listed, so
+# the answer is never empty on a box someone plugged a laptop into.
+host_lan_interfaces() { # -> one "ifname\tv4 v4…\tv6 v6…" line per LAN interface, default-route one first
+  local def; def="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')"
+  ip -j addr show 2>/dev/null | python3 -c '
+import json, re, sys
+skip = re.compile(r"^(lo|suite0|docker|br-|cni|flannel|veth|tailscale|wg|scriptor|virbr|lxc|kube|tun|tap)")
+first = sys.argv[1]
+rows = []
+for i in json.load(sys.stdin):
+    n = i.get("ifname", "")
+    if skip.match(n): continue
+    v4 = [a["local"] for a in i.get("addr_info", []) if a.get("family") == "inet" and a.get("scope") == "global"]
+    v6 = [a["local"] for a in i.get("addr_info", []) if a.get("family") == "inet6" and a.get("scope") == "global"]
+    if not v4 and not v6: continue
+    rows.append((0 if n == first else 1, n, " ".join(v4), " ".join(v6)))
+for _, n, v4, v6 in sorted(rows):
+    print(n + "\t" + v4 + "\t" + v6)
+' "${def:-}"
+}
+write_host_json() {
+  ensure_updates_dir
+  local tmp suite_ip rows="" ifname v4 v6 first=1
+  tmp="$(private_tmp host.json)"
+  suite_ip="$(ip -4 addr show dev suite0 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}')"
+  while IFS=$'\t' read -r ifname v4 v6; do
+    [[ -n "$ifname" ]] || continue
+    [[ "$first" == 1 ]] || rows+=","
+    first=0
+    rows+="$(printf '{"name": "%s", "ipv4": [%s], "ipv6": [%s]}' "$(json_esc "$ifname")" \
+      "$(printf '%s' "$v4" | awk '{for(i=1;i<=NF;i++) printf "%s\"%s\"", (i>1?", ":""), $i}')" \
+      "$(printf '%s' "$v6" | awk '{for(i=1;i<=NF;i++) printf "%s\"%s\"", (i>1?", ":""), $i}')")"
+  done < <(host_lan_interfaces)
+  # printf, not a heredoc: the self-test extracts this function by its closing brace.
+  printf '{\n  "schema": 1,\n  "hostname": "%s",\n  "interfaces": [%s],\n  "internal_ip": "%s",\n  "updated_at": "%s"\n}\n' \
+    "$(json_esc "$(hostname 2>/dev/null || true)")" "$rows" "$(json_esc "$suite_ip")" "$(now_utc)" > "$tmp"
+  publish_file "$tmp" "$HOST_JSON"
+}
+do_host_facts() {
+  write_host_json
+  info "host facts published ($(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(", ".join(a for i in d["interfaces"] for a in i["ipv4"]) or "no LAN address")' "$HOST_JSON" 2>/dev/null || true))."
 }
 
 # --- Current state on this box ------------------------------------------------
@@ -427,6 +625,9 @@ fetch_manifest_online() {
 
   local manifest; manifest="$(cat "$tmp")"
   rm -f "$tmp"
+  if ! check_manifest_freshness "$manifest"; then
+    rm -f "$tmp"; warn "$online_error"; return 1
+  fi
   online_channel="$(json_get channel        <<<"$manifest")"
   online_chart="$(json_get chart_version    <<<"$manifest")"
   online_vllm="$(json_get vllm_image        <<<"$manifest")"
@@ -445,6 +646,12 @@ fetch_manifest_online() {
     warn "$online_error ($MANIFEST_URL)"
     return 1
   fi
+  if ! validate_target_fields online "$online_chart" "$online_app" "$online_vllm" \
+     || ! valid_sha256 "$online_updater_sha" || ! valid_sha256 "$online_backup_sha" || ! valid_sha256 "$online_host_sha"; then
+    online_error="${online_error:-refusing online: malformed sha256 pin}"
+    warn "$online_error"; online_chart=""; online_app=""; online_vllm=""; return 1
+  fi
+  remember_manifest_serial "$manifest"
   online_reachable=1
   return 0
 }
@@ -456,17 +663,14 @@ fetch_manifest_online() {
 # UNUSABLE rather than merely suspicious (fail closed; a verified USB package can
 # still carry the box forward).
 #
-# Graduated on purpose: an appliance with no key installed keeps the old
-# TLS-only behaviour, so the public one-command install is unchanged. Fleet boxes
-# always have the key, so they are always strict.
+# Every appliance is strict since 2026-10-13: the key is embedded in this
+# script and in the installer, and written where it is missing
+# (ensure_package_public_key). The graduated "no key = TLS-only" rung that
+# kept the public one-command install unchanged is gone — it is what made
+# a push to `main` root on every box within a day.
 verify_manifest_signature() { # verify_manifest_signature FILE
   local f="$1"
-  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
-    # Said once, not per-run-per-line: this is the documented posture of the
-    # public product, not a misconfiguration.
-    info "manifest       : unsigned (no $PACKAGE_PUBLIC_KEY — TLS-only trust)"
-    return 0
-  fi
+  ensure_package_public_key
   have openssl || { online_error="openssl missing, cannot verify the manifest signature"; warn "$online_error"; return 1; }
 
   local sig; sig="$(mktemp)"
@@ -476,8 +680,7 @@ verify_manifest_signature() { # verify_manifest_signature FILE
     warn "$online_error — refusing the manifest (this appliance requires signed channels)."
     return 1
   fi
-  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
-        -sigfile "$sig" -in "$f" >/dev/null 2>&1; then
+  if ! verify_sig "$f" "$sig"; then
     rm -f "$sig"
     online_error="manifest signature INVALID — not signed by this appliance's key"
     warn "$online_error"
@@ -488,6 +691,51 @@ verify_manifest_signature() { # verify_manifest_signature FILE
   online_signed=1
   info "manifest       : signature verified"
   return 0
+}
+
+# --- replay / rollback of a signed manifest --------------------------------------
+# Every channel.json ever published, with its signature, is in the git
+# history: a MITM or a compromised host could serve an old pair and walk a box
+# back to an updater, a backup agent, a host layer and a vLLM image it had
+# moved past — all "signed". So the signer stamps a `serial` (seconds since
+# the epoch at signing) and an `expires`, and the box keeps the highest serial
+# it accepted (root-only): a manifest older than that, or past its expiry, is
+# refused. A manifest with no serial is only accepted by a box that never saw
+# one (the transition), never by one that did.
+CHANNEL_SERIAL_FILE="$PRIVATE_DIR/channel-serial"
+check_manifest_freshness() { # check_manifest_freshness MANIFEST_TEXT -> 0 fresh, 1 refused (online_error set)
+  local manifest="$1" serial expires stored now
+  serial="$(json_get serial  <<<"$manifest")"
+  expires="$(json_get expires <<<"$manifest")"
+  now="$(date -u +%s)"
+  if [[ -n "$serial" && ! "$serial" =~ ^[0-9]{1,12}$ ]]; then
+    online_error="manifest serial '$serial' is not a number"; return 1
+  fi
+  if [[ -n "$expires" ]]; then
+    local exp_s; exp_s="$(date -u -d "$expires" +%s 2>/dev/null || true)"
+    if [[ -z "$exp_s" ]]; then online_error="manifest expiry '$expires' is not a date"; return 1; fi
+    if (( now > exp_s )); then
+      online_error="manifest expired on $expires — a newer channel must be published"; return 1
+    fi
+  fi
+  stored="$(cat "$CHANNEL_SERIAL_FILE" 2>/dev/null || true)"
+  if [[ -n "$stored" ]]; then
+    if [[ -z "$serial" ]]; then
+      online_error="manifest carries no serial while this box already accepted serial $stored (replay of an older channel?)"; return 1
+    fi
+    if (( serial < stored )); then
+      online_error="manifest serial $serial is older than the last accepted ($stored) — replay or rollback refused"; return 1
+    fi
+  fi
+  return 0
+}
+remember_manifest_serial() { # remember_manifest_serial MANIFEST_TEXT
+  local serial; serial="$(json_get serial <<<"$1")"
+  [[ "$serial" =~ ^[0-9]{1,12}$ ]] || return 0
+  ensure_updates_dir
+  local stored; stored="$(cat "$CHANNEL_SERIAL_FILE" 2>/dev/null || echo 0)"
+  (( serial > stored )) || return 0
+  ( umask 077; printf '%s\n' "$serial" > "$CHANNEL_SERIAL_FILE" )
 }
 
 # --- Target state: source 2, a staged offline package --------------------------
@@ -677,16 +925,21 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   pkg_error=""
   pkg_chart=""; pkg_app=""; pkg_vllm=""; pkg_channel=""; pkg_notes=""; pkg_min_from=""; pkg_host_sha=""
 
-  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
-    pkg_error="no package signing key on this appliance ($PACKAGE_PUBLIC_KEY)"; return 1
-  fi
+  ensure_package_public_key
   for f in manifest.json SHA256SUMS SHA256SUMS.sig; do
     [[ -s "$root/$f" ]] || { pkg_error="incomplete package: $f missing"; return 1; }
   done
+  # 0. Nothing but regular files and directories. `find -type f` below cannot
+  #    see a symlink, so a signed package with `images/zz.tar -> /some/path`
+  #    or `scripts/host-layer.sh -> /opt/suite366/updates/x` (pod-writable)
+  #    added beside the real files passed every later check and was then
+  #    imported or executed as root through the link. Reviewed 2026-10-13.
+  if [[ -n "$(find "$root" ! -type f ! -type d -print -quit 2>/dev/null)" ]]; then
+    pkg_error="package contains a symlink or a special file — refused"; return 1
+  fi
 
   # 1. Is the checksum list itself authentic?
-  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBLIC_KEY" \
-        -sigfile "$root/SHA256SUMS.sig" -in "$root/SHA256SUMS" >/dev/null 2>&1; then
+  if ! verify_sig "$root/SHA256SUMS" "$root/SHA256SUMS.sig"; then
     pkg_error="signature check failed — package not signed by this appliance's key"; return 1
   fi
   # 2. Is the manifest actually covered by it? (a manifest outside SHA256SUMS
@@ -715,6 +968,9 @@ pkg_verify() { # pkg_verify ROOT — sets pkg_* on success, pkg_error on failure
   pkg_channel="$(json_get channel        <<<"$mf")"
   pkg_chart="$(json_get chart_version    <<<"$mf")"
   pkg_app="$(json_get app_version        <<<"$mf")"
+  if ! validate_target_fields pkg "$pkg_chart" "$pkg_app" "$pkg_vllm" || ! valid_sha256 "$pkg_host_sha"; then
+    pkg_error="${pkg_error:-refusing pkg: malformed sha256 pin}"; return 1
+  fi
   pkg_vllm="$(json_get vllm_image        <<<"$mf")"
   pkg_notes="$(json_get notes            <<<"$mf")"
   pkg_min_from="$(json_get min_from_version <<<"$mf")"
@@ -759,9 +1015,12 @@ pkg_stage() { # pkg_stage ROOT
   rm -rf "$OFFLINE_PKG.new"
   log "Staging package into $OFFLINE_PKG ($((need/1024)) MiB)"
   cp -a "$root/." "$OFFLINE_PKG.new/" || { pkg_error="copy from the drive failed"; return 1; }
-  if ! ( cd "$OFFLINE_PKG.new" && sha256sum -c --strict --quiet SHA256SUMS ) >/dev/null 2>&1; then
+  # The whole verification again, on the COPY: the signature was checked on
+  # the drive, and a device can serve other bytes the second time it is read
+  # (TOCTOU). What is applied is what was verified, or nothing.
+  if ! pkg_verify "$OFFLINE_PKG.new"; then
     rm -rf "$OFFLINE_PKG.new"
-    pkg_error="staged copy failed verification — drive removed mid-copy?"; return 1
+    pkg_error="staged copy failed verification (${pkg_error}) — drive removed or swapped mid-copy?"; return 1
   fi
   rm -rf "$OFFLINE_PKG"
   mv "$OFFLINE_PKG.new" "$OFFLINE_PKG"
@@ -1068,14 +1327,15 @@ PY
 # --- the host layer: fetch, verify, lay down, converge --------------------------
 # Same trust ladder as backup.sh, for the same reason: switch-model.sh runs as
 # root and rewrites the vLLM stack. Key present + signed manifest + matching
-# hash -> lay down; key present, anything else -> REFUSE; no key -> TLS-only.
+# hash -> lay down; anything else -> REFUSE. The key is always present since
+# 2026-10-13 (ensure_package_public_key): there is no TLS-only rung any more.
 # Staging (files on disk) and applying (containers, units) are separate so
 # that the compose in place is the NEW one before any container is recreated:
 # on a legacy compose a base-image move would drag the LLM along with it.
 host_layer_new_sha=""
 stage_host_layer_online() {
-  local strict=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1
   if [[ "$strict" == 1 ]]; then
     if [[ "${online_signed:-0}" != "1" ]]; then
       warn "not laying down the host layer: the channel manifest was not signature-verified."; return 1
@@ -1507,14 +1767,46 @@ ExecStart=$DATA_DIR/update.sh power booted
 WantedBy=multi-user.target
 EOF
 
+  # host.json: at boot once the network is up, and on every address change
+  # through NetworkManager's dispatcher (a plain file write, no service
+  # restart — not the restart storm the mDNS dispatcher hook once caused). A
+  # box without NetworkManager keeps the boot write and the daily `check`.
+  cat > "$SYSTEMD_DIR/suite366-host-facts.service" <<EOF
+[Unit]
+Description=Suite 366 — publish the box's hostname and LAN addresses for the app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DATA_DIR/update.sh host-facts
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [[ -d "$NM_DISPATCHER_DIR" ]]; then
+    cat > "$NM_DISPATCHER_DIR/90-suite366-host-facts" <<EOF
+#!/bin/sh
+# Suite 366 — refresh host.json (the app's "reach me at …") on address changes.
+case "\$2" in
+  up|down|dhcp4-change|dhcp6-change|connectivity-change) exec $DATA_DIR/update.sh host-facts >/dev/null 2>&1 ;;
+esac
+exit 0
+EOF
+    chmod 0755 "$NM_DISPATCHER_DIR/90-suite366-host-facts"
+  fi
+
   systemctl daemon-reload
   systemctl enable --now suite366-update-apply.path suite366-update-check.path \
-      suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service >/dev/null 2>&1 \
+      suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service \
+      suite366-host-facts.service >/dev/null 2>&1 \
     || warn "could not enable trigger path units (systemd offline?)."
   # Belt and braces for a systemd that could not start the booted unit (or a
   # stub): the app must find power.json after install-units, whatever happened.
-  [[ -f "$POWER_JSON" ]] || write_power_json idle
-  info "App-trigger units armed (watching $UPDATES_DIR; power requests included)."
+  published_ok "$POWER_JSON" || write_power_json idle
+  write_host_json
+  info "App-trigger units armed (watching $UPDATES_DIR; power requests included; host facts published)."
 }
 
 # --- self-update ----------------------------------------------------------------
@@ -1529,13 +1821,17 @@ EOF
 # wrote the file, and the file runs as root on the next apply.
 #
 # Graduated, same as the manifest check:
-#   key present + signed manifest + matching hash -> install
-#   key present, anything else                    -> REFUSE (fail closed)
-#   no key installed                              -> TLS-only, as before
+#   signed manifest + matching hash -> install
+#   anything else                   -> REFUSE (fail closed)
+# The TLS-only rung is gone (ensure_package_public_key). And this runs on
+# `apply` only — `check` used to call it too, which meant the daily timer
+# replaced this script without anyone asking: the admin who confirms an
+# update in the UI is the consent, and the refreshed updater is what then
+# performs that apply.
 self_update() {
   [[ "$SELF_UPDATE" == "1" ]] || return 0
-  local strict=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1
 
   if [[ "$strict" == 1 ]]; then
     if [[ "${online_signed:-0}" != "1" ]]; then
@@ -1582,9 +1878,8 @@ self_update() {
 # Same trust ladder as self_update, for the same reason: backup.sh runs as root,
 # nightly, holding the destination's credentials.
 #
-#   key present + signed manifest + matching hash -> install
-#   key present, anything else                    -> REFUSE (fail closed)
-#   no key installed                              -> TLS-only, as before
+#   signed manifest + matching hash -> install
+#   anything else                   -> REFUSE (fail closed; the key is always there)
 #
 # Two things make this more than a copy of self_update:
 #
@@ -1599,8 +1894,8 @@ self_update() {
 #     "unconfigured" to the UI rather than looking installed and being empty.
 converge_backup() {
   [[ "$SELF_UPDATE" == "1" ]] || return 0
-  local strict=0 fresh=0
-  [[ -s "$PACKAGE_PUBLIC_KEY" ]] && strict=1
+  ensure_package_public_key
+  local strict=1 fresh=0
   [[ -x "$BACKUP_AGENT" ]] || fresh=1
 
   if [[ "$strict" == 1 ]]; then
@@ -1662,7 +1957,9 @@ arm_backup_agent() { # arm_backup_agent FRESH(0|1)
   # backup on every daily check, on top of the nightly timer.
   if [[ "$fresh" == 1 ]]; then
     DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
-    if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
+    # The run above migrated a legacy key into the private directory if there
+    # was one; the shared path is still checked for a box whose agent could not run.
+    if [[ ! -s "$BACKUP_PRIVATE_DIR/repo.pass" && ! -s "$BACKUP_DIR/repo.pass" ]]; then
       warn "backups are NOT configured on this appliance (no repository key)."
       warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
     fi
@@ -1794,20 +2091,33 @@ vllm_pg_deploy() {
     | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
 }
 
+# The key reaches curl through a header FILE (`-H @file`, curl >= 7.55), never
+# on its argv: /proc/*/cmdline is readable by every local process, and a chat
+# completion probe keeps that argv alive for up to 60 seconds. mktemp's 0600
+# is the whole protection; the file is removed as soon as curl returns.
+vllm_auth_header_file() { # vllm_auth_header_file KEY -> PATH
+  local f=""
+  f="$(mktemp)" || return 1
+  printf 'Authorization: Bearer %s\n' "$1" > "$f"
+  printf '%s' "$f"
+}
+
 # The one curl here that is NOT `-fsS`, and it has to be: `-f` turns a 401 into
 # exit 22 and throws the status code away, and the status code IS the answer.
 # `|| true` sits INSIDE the substitution so curl's own "000" survives a connect
 # failure (it prints 000 and exits 7).
 vllm_http_code() { # vllm_http_code URL KEY TIMEOUT [JSON_BODY]
-  local url="$1" key="$2" tmo="$3" body="${4:-}" code=""
+  local url="$1" key="$2" tmo="$3" body="${4:-}" code="" hdr=""
+  hdr="$(vllm_auth_header_file "$key")" || { printf '000'; return 0; }
   if [[ -n "$body" ]]; then
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+              -H "@$hdr" -H 'Content-Type: application/json' \
               --data-binary "$body" "$url" 2>/dev/null || true)"
   else
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" "$url" 2>/dev/null || true)"
+              -H "@$hdr" "$url" 2>/dev/null || true)"
   fi
+  rm -f "$hdr"
   printf '%s' "${code:-000}"
 }
 
@@ -2204,11 +2514,12 @@ require_cluster_tools() {
 case "$MODE" in
   check)
     require_cluster_tools
+    ensure_package_public_key
     fetch_manifest_online || true
     load_offline_source
-    self_update_first
     survey
     notify
+    write_host_json
     # Convergence belongs here, not only in `apply`. `apply` runs when there is
     # something to apply; a box sitting on the current version never triggers
     # it, so putting convergence there alone means the appliances that need the
@@ -2223,6 +2534,7 @@ case "$MODE" in
     ;;
   apply)
     require_cluster_tools
+    ensure_package_public_key
     fetch_manifest_online || true
     load_offline_source
     self_update_first
@@ -2243,7 +2555,10 @@ case "$MODE" in
   power)
     do_power "${2:-}"
     ;;
+  host-facts)
+    do_host_facts
+    ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot | host-facts)"
     ;;
 esac

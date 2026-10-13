@@ -45,7 +45,7 @@ curl -fsSL https://get.suite366.ai/install.sh | sudo bash
 |---|---|
 | **k3s** single-node | Traefik (ingress) + local-path (storage) + CoreDNS (k3s defaults) |
 | **vLLM ×2** (Docker host) | generative on `:8001`, embeddings on `:8002`, Blackwell GPU |
-| **nginx proxy** (Docker host) | unifies both vLLM behind `:8000` (single OpenAI-compatible endpoint), wired automatically into the Suite 366 chart |
+| **nginx proxy** (Docker host) | unifies the vLLM engines behind `:8000` (single OpenAI-compatible endpoint; `/v1/*` only, anything else is a 404), wired automatically into the Suite 366 chart |
 | **Suite 366** (`drive` chart 0.7.1) | drive-app + Postgres (pgvector) + Redis + S3 object store (RustFS; MinIO on boxes installed before Oct 2026) + OnlyOffice + LiveKit/TURN, all in-cluster |
 | **Sandbox** (`sandbox` namespace) | code-exec stack (`sandbox-api` + on-demand `sandbox-runner` pods, PSS restricted), wired to drive-app via `SANDBOX_API_URL` and a shared `SANDBOX_API_KEY` |
 | **Workbench** (`workbench` namespace) | per-user persistent dev sandbox (terminal + opencode + Firefox desktop): one pod + one PVC + one NetworkPolicy per user, driven by `sandbox-api`; `/wb-desktop/` and `/dav/` routed to the ws port |
@@ -77,9 +77,14 @@ Total fresh-install time: **~15–30 min** depending on HuggingFace bandwidth
   (arm64/GB10), but the k3s + app layer runs on amd64 too - handy for testing
   the installer on a plain Ubuntu box (see *[Running without a
   GPU](#running-without-a-gpu-test--non-spark-hosts)* below).
-- **Outbound network** to `get.k3s.io`, `get.helm.sh`, `ghcr.io`,
+- **Outbound network** to `get.k3s.io` (k3s pinned to `K3S_VERSION`, binary verified by the k3s installer), `get.helm.sh` (helm pinned to `HELM_VERSION`, tarball sha256 verified), `ghcr.io`,
   `registry-1.docker.io`, `huggingface.co`, `charts.jetstack.io`. The
   preflight fails loudly if any of these is unreachable.
+- **A synchronised clock.** The local CA and every certificate it issues, the
+  instance licence's expiry and restic's snapshot times all read it. The
+  preflight warns when `timedatectl` reports `NTPSynchronized=no` (a dead RTC
+  on a VLAN without outbound UDP/123 installs fine and fails on the first
+  renewal); it does not stop.
 
 ## Parameters (env vars or interactive prompts)
 
@@ -485,7 +490,14 @@ Spark into 16 GiB of swap and a load of 74 and took the app down with it. The
 previous engine is about to be replaced anyway; if the build fails it is brought
 back and nothing else has moved.
 The first start on a model whose checkpoint is not on disk downloads it
-(~133 GB for Flash-Next, 25 min at 85 MB/s).
+(~133 GB for Flash-Next, 25 min at 85 MB/s). The switch refuses to start that
+download when the filesystem under `MODELS_DIR` has less than the profile's
+`LLM_P_DISK_GB` (`llm/profiles.sh`: 25 / 15 / 15 / 140 / 20 GB) plus a 10 GB
+margin free — checked before anything has moved, and `--dry-run` prints the
+requirement next to what the disk has. Once the new engine serves (and at the
+end of a `converge`), dangling Docker images are pruned: `docker image prune
+-f`, never `-a`, so the previous unified image and Flash-Next's own keep their
+tags for a rollback.
 
 ## Measured GB10 realities (read before tuning)
 
@@ -529,6 +541,10 @@ same decode, prefill 20-35 % faster. Flash-Next is the exception: its patch set
 is written against v0.29.0 and on the v0.30.0 base its resident footprint no
 longer leaves room for the embed beside it, so it keeps its own image, built on
 the box over v0.29.0 (`llm/flash-next/`), unchanged.
+Superseded images are not removed on their own: a switch and a `converge`
+prune the **dangling** ones (`docker image prune -f`), and an image a tag still
+names — the previous unified revision, an older nginx — stays until someone
+runs `docker image rm`, because a rollback may name it.
 
 **Start-up.** `--load-format fastsafetensors` loads the 27B's weights in 12 s
 instead of 114. It is NOT used for Flash-Next: the mmap patch hooks the default
@@ -583,10 +599,20 @@ chat + vision, one for pooling/embed). The `suite366-vllm-proxy` container
 
 ```
 client -> http://<HOST_IP>:8000/v1/embeddings        -> vllm-embed:8000
+client -> http://<HOST_IP>:8000/v1/audio/...         -> vllm-stt:8000
 client -> http://<HOST_IP>:8000/v1/chat/completions  -> vllm-llm:8000
 client -> http://<HOST_IP>:8000/v1/models            -> vllm-llm:8000
-client -> http://<HOST_IP>:8000/...                  -> vllm-llm:8000
+client -> http://<HOST_IP>:8000/v1/...               -> vllm-llm:8000
+client -> http://<HOST_IP>:8000/health               -> the proxy itself
+client -> http://<HOST_IP>:8000/<anything else>      -> 404, the proxy itself
 ```
+
+Only `/v1/*` is relayed. vLLM's API-key middleware guards `/v1/*` and nothing
+else, so the catch-all relay the proxy had until 2026-10-13 answered
+`/tokenize`, `/detokenize`, `/invocations`, `/metrics` and `/version` without
+a key to anything that could reach the proxy — every pod on the box (observed
+on the test box). The app speaks `/v1/*` and the proxy's own `/health`; the
+direct engine ports keep the rest for debugging from the host.
 
 We don't use LiteLLM because the GB10's unified memory is already tight
 (~110/121 GiB at idle); a 1.5 GB Python proxy is overkill when URL-path
@@ -689,7 +715,7 @@ dns/avahi-aliases.service             systemd unit publishing mDNS names
 ```bash
 sudo k3s kubectl -n suite366 get pods          # kubeconfig is 0600 (root only)
 sudo /opt/suite366/backup.sh status            # last backup, snapshots, key fingerprint
-docker logs -f suite366-vllm-llm               # generative model logs
+docker logs -f suite366-vllm-llm               # generative model logs (json-file, 50 MB x 5 per container)
 systemctl status suite366-vllm                 # vLLM stack
 systemctl status suite366-avahi-aliases        # mDNS aliases
 ```
@@ -736,11 +762,18 @@ administrators only (box-wide: one repository, one key, every organisation's
 data) — which is the intended route: it sets the destination, tests it immediately, and shows
 the last run, the snapshots and the key fingerprint without anyone opening a
 shell. The page can ask for a destination but can never read the stored
-credentials back: `backup.env` is 0600 and owned by root, so an empty secret
-field means "keep the one already saved".
+credentials back — nor replace them: `backup.env` lives in
+`/opt/suite366/backup-private/` (0700, root, **not** mounted into the pod),
+every field of the request is checked against an allow-list before it is
+written, and the file is read key by key, never sourced. An empty secret field
+means "keep the one already saved". The directory the pod *does* see,
+`/opt/suite366/backup/`, holds only `state.json`, the one-time key reveal and
+the request files it drops — and nothing root reads from there is trusted
+without being moved out of the pod's reach and checked first.
 
 Or at install time, or later by editing
-`/opt/suite366/backup/backup.env` (0600) and running `backup.sh init`:
+`/opt/suite366/backup-private/backup.env` (0600, one `KEY=value` per line) and
+running `backup.sh init`:
 
 ```bash
 curl -fsSL https://get.suite366.ai/install.sh | sudo env \
@@ -789,10 +822,11 @@ data directory at init). So: one secret to preserve, the rest to let go.
 ### Encryption key
 
 `restic` encrypts the repository with a key generated at install, stored
-**only** at `/opt/suite366/backup/repo.pass` (0600) and printed **once** while
-it is created. Lose it and the snapshots are unreadable — by anyone, including
-us. That is the property being bought, and it means the key must leave the
-machine by some deliberate route:
+**only** at `/opt/suite366/backup-private/repo.pass` (0600). The installer
+prints its **fingerprint** and its path, not the key itself — install logs end
+up in tickets — and tells you to read it once with `sudo cat`. Lose it and the
+snapshots are unreadable — by anyone, including us. That is the property being
+bought, and it means the key must leave the machine by some deliberate route:
 
 - **sold** appliance: printed on the card that ships inside the crate;
 - **rented** appliance: escrowed by `suite366-fleet`, with the vault reference
@@ -801,7 +835,12 @@ machine by some deliberate route:
 `backup.sh status` and the state file publish only a 12-character fingerprint of
 the key, never the key. `uninstall.sh` warns before deleting it, because the
 snapshots in the remote repository survive the uninstall and would outlive the
-only copy of their key.
+only copy of their key — and, run unattended (`ASSUME_YES=1`), it **refuses**
+to delete it unless `KEEP_DATA=1` or `I_HAVE_THE_BACKUP_KEY=1` says you have it.
+
+A box installed before the private directory existed keeps its key and its
+destination in `/opt/suite366/backup/`; the first run of the updated agent moves
+both into `backup-private/` and removes the copies the pod could reach.
 
 ### Restore
 
@@ -866,7 +905,12 @@ order — and `suite366-power-booted.service` closes the request in `power.json`
 at the next boot (what the app shows as "back since …"). `power.json`'s
 presence is how the app knows the host takes these requests: a box on an older
 updater shows no Power page until its next apply. `sudo update.sh power reboot`
-does the same by hand. The
+does the same by hand. The host also publishes `host.json` there (hostname, the
+LAN interfaces with their current addresses, the internal IP), refreshed at
+boot, on every address change through a NetworkManager dispatcher hook, and by
+the daily `check`: it is what the app's *Appliance* overview shows as "reach
+this box at 192.168.1.72" — the pod has no other way of knowing the host's LAN.
+The
 apply reuses the box's install-time parameters (`values.yaml`, `llm/.env`,
 `update.env`) — nothing is re-asked. After each apply, `update.sh` refreshes
 itself from the repo and re-installs the trigger units, so the update mechanism
@@ -938,15 +982,31 @@ PACKAGE_PRIVATE_KEY=~/.secrets/package-release.key tools/sign-channel.sh
 git add channel.json channel.json.sig && git commit
 ```
 
-Behaviour on the appliance is **graduated**, so the public one-command install is
-unchanged:
+Behaviour on the appliance is **strict, always** (since 2026-10-13): the public
+key is embedded in `install.sh`/`lib/config.sh` and in `update.sh` itself, written
+to `package-release.pub` by the installer and by the updater where it is missing,
+so a box installed before that date becomes strict at its next `check`. The
+channel manifest must be signed by that key (or by `package-release-next.pub`
+during a rotation), `update.sh`, `backup.sh` and the host layer must match the
+hashes the signed manifest carries, and `update.sh` refreshes itself on `apply`
+only — the admin who confirms an update is the consent; the daily `check` never
+replaces root-run code any more. Before that, a box without the key trusted TLS
+alone and the daily timer refreshed the updater from `main`: whoever could push
+there was root on every such box within a day.
 
-| `package-release.pub` on the box | Channel manifest | `update.sh` refresh |
-|---|---|---|
-| present (fleet) | must be signed by our key, else **refused** | must match the signed `updater_sha256`, else **refused** |
-| absent (default) | TLS-only, as before | TLS-only, as before |
+The signer also stamps a `serial` (seconds since the epoch at signing) and an
+`expires` a year out, and a box remembers the highest serial it accepted
+(root-only, `.private/channel-serial`): an older signed `channel.json` replayed
+from the git history, or an expired one, is refused — it could otherwise walk a
+box back to an updater, a backup agent, a host layer or a vLLM image it had
+moved past, all "signed". A re-sign is a new serial on purpose. Every value the
+manifest names (versions, image reference, pins) is also validated before any
+`sed` rewrites a pin with it. For USB packages, a symlink or special file inside
+the package is refused outright, and the staged copy is verified in full again
+(signature and completeness, not only checksums): what is applied is what was
+verified.
 
-Both strict paths **fail closed**: a bad signature makes the manifest unusable
+Both paths **fail closed**: a bad signature makes the manifest unusable
 rather than merely suspicious, and a verified USB package can still carry the box
 forward. The practical consequence is that forgetting to re-sign does not break the
 fleet, it *stops* it — every box keeps its current version silently. The
@@ -990,18 +1050,20 @@ downloaded models**. It is idempotent and best-effort, so re-running it (or
 running it on a partial install) is safe.
 
 ```bash
-curl -fsSL https://get.suite366.ai/uninstall.sh | sudo ASSUME_YES=1 bash
+# unattended: refuses on a box that holds a backup key unless you say you have it
+curl -fsSL https://get.suite366.ai/uninstall.sh | sudo ASSUME_YES=1 I_HAVE_THE_BACKUP_KEY=1 bash
 # or, from a checkout:
-sudo ./uninstall.sh          # prompts for confirmation (type 'yes')
+sudo ./uninstall.sh          # prompts for confirmation (type 'yes'), after warning about the key
 ```
 
 Options (environment variables, like the installer):
 
 | Var | Effect |
 | --- | --- |
-| `ASSUME_YES=1`  | skip the confirmation prompt (**required** for `curl \| bash`, which has no TTY) |
+| `ASSUME_YES=1`  | skip the confirmation prompt (**required** for `curl \| bash`, which has no TTY). Not enough on its own when `/opt/suite366/backup-private/repo.pass` exists: that file is the only copy of the backup encryption key, and deleting it unattended is refused unless one of the next two is also set |
+| `I_HAVE_THE_BACKUP_KEY=1` | you have copied the repository key somewhere safe (or accept losing every snapshot): lets `ASSUME_YES=1` delete it |
 | `KEEP_MODELS=1` | remove `/opt/suite366` but keep the model cache (`…/models`), so a re-install doesn't re-download 15+ GiB |
-| `KEEP_DATA=1`   | leave `/opt/suite366` entirely untouched (models + config + certs) |
+| `KEEP_DATA=1`   | leave `/opt/suite366` entirely untouched (models + config + certs + the backup key) |
 | `KEEP_K3S=1`    | keep k3s + Helm; remove only the Suite 366 workloads (helm release, namespaces, cert-manager) |
 | `PRUNE_IMAGES=1`| also remove the vLLM + nginx Docker images (several GiB) |
 

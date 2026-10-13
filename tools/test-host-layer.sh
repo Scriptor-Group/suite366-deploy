@@ -128,6 +128,11 @@ BOX="$WORK/gemma-box"; mkbox "$BOX" nvidia/Gemma-4-26B-A4B-NVFP4; mkdir -p "$BOX
 out="$(conv "$BOX")"; rc=$?
 check "converge sort en 0"                          "$rc" "0"
 contains "reconnaît le profil d'après le modèle"    "$out" "profile for nvidia/Gemma-4-26B-A4B-NVFP4: gemma"
+# Les images remplacées ne partaient jamais : converge élague les orphelines,
+# et seulement elles (-a emporterait l'image que le retour arrière renomme).
+contains "converge : élague les images orphelines"  "$(cat "$BOX/docker.log")" "docker image prune -f"
+absent   "…jamais -a"                               "$(cat "$BOX/docker.log")" "prune -a"
+contains "converge : le dit"                        "$out" "dangling images pruned"
 check ".env : LLM_PROFILE posé"                     "$(envv "$BOX" LLM_PROFILE)" "gemma"
 # Une box de juillet a une base NUE dans VLLM_IMAGE : l'image moteur est celle
 # que la box construit par-dessus (le stub la dit déjà construite), et VLLM_IMAGE
@@ -468,9 +473,12 @@ NSBOX="$WORK/ns"; mkdir -p "$NSBOX"; printf 'other:\n  namespace: wrong\nsandbox
 ns="$(DATA_DIR="$NSBOX" bash -c 'eval "$(sed -n "/^restart_sandbox_api() {/,/^}/p" "$1")"; awk "/^sandbox:/{f=1;next} f&&/^[a-z]/{f=0} f&&/^  namespace:/{print \$2; exit}" "$DATA_DIR/values.yaml"' _ "$REPO_ROOT/update.sh")"
 check    "lit le namespace sous sandbox: (pas le premier venu)" "$ns" "sbx"
 
-# --- 6. l'updater se rafraîchit EN PREMIER ----------------------------------------
+# --- 6. l'updater se rafraîchit EN PREMIER — sur apply seulement ----------------------
+# Depuis le 13/10/2026 `check` (le timer quotidien) ne remplace plus update.sh :
+# c'est la confirmation de l'admin (apply) qui vaut consentement, et c'est
+# l'updater rafraîchi qui exécute ensuite cet apply.
 head_ "update.sh self_update_first"
-contains "check : rafraîchissement avant survey"  "$(awk '/^  check\)/,/;;/' "$REPO_ROOT/update.sh" | tr -s ' \n' ' ')" "fetch_manifest_online || true load_offline_source self_update_first survey"
+absent   "check : PAS de rafraîchissement (le timer ne remplace pas du code root)" "$(awk '/^  check\)/,/;;/' "$REPO_ROOT/update.sh")" "self_update_first"
 contains "apply : rafraîchissement avant survey"  "$(awk '/^  apply\)/,/;;/' "$REPO_ROOT/update.sh" | tr -s ' \n' ' ')" "fetch_manifest_online || true load_offline_source self_update_first survey"
 RX="$WORK/reexec"; mkdir -p "$RX"; printf '#!/bin/bash\necho OLD\n' > "$RX/update.sh"; chmod +x "$RX/update.sh"
 out="$(bash -c '

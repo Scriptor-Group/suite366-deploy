@@ -20,6 +20,14 @@ setup_update_timer() {
   fetch "uninstall.sh" > "$DATA_DIR/uninstall.sh"
   chmod 0700 "$DATA_DIR/uninstall.sh"
 
+  # The signing key, so that the first `check` already runs strict (update.sh
+  # writes it too when missing, from the same embedded default). Never
+  # overwritten: a box whose operator installed another key keeps it.
+  if [[ ! -s "$PACKAGE_PUBLIC_KEY" ]]; then
+    ( umask 022; printf '%s\n' "$PACKAGE_PUBLIC_KEY_PEM" > "$PACKAGE_PUBLIC_KEY" )
+    info "package signing key installed at $PACKAGE_PUBLIC_KEY (signed channels required)."
+  fi
+
   # Config consumed by update.sh both on manual runs (sourced) and via the
   # systemd unit (EnvironmentFile). 0600 — it just carries non-secret config,
   # but lives in the root-only $DATA_DIR anyway.
