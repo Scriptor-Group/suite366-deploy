@@ -3,7 +3,7 @@
   "chart_version": "0.10.3",
   "app_version": "1.14.0",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
-  "updater_sha256": "be01195838c9853964f30d389e8a2c37e27ef4099364bf3ee3046a04065cba1c",
+  "updater_sha256": "817e3ad687e92f7fe28bd6d94125fd87d7c726f6ae01efc81bdfaf0c280b5e8a",
   "backup_sha256": "ddfc08bc36eea900c71b69da1efbff4e7d87fa65fba19532d1ddd63587e28022",
   "host_layer_sha256": "5d7ed1b41fd76f275a88c2a7dd9636c669ce5eafd010cc74228c4b4e01afb364",
   "restic_version": "0.19.1",
