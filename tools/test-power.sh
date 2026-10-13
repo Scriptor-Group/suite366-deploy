@@ -39,7 +39,10 @@ absent()   { if grep -qF -- "$3" <<<"$2"; then ko "$1 (present: $3)"; else ok "$
 mkdir -p "$WORK/bin" "$WORK/data" "$WORK/systemd"
 printf '#!/usr/bin/env bash\nprintf "systemctl %%s\\n" "$*" >> "$WORK/systemctl.log"\nexit 0\n' > "$WORK/bin/systemctl"
 printf '#!/usr/bin/env bash\nprintf "logger %%s\\n" "$*" >> "$WORK/logger.log"\nexit 0\n' > "$WORK/bin/logger"
-chmod +x "$WORK/bin/systemctl" "$WORK/bin/logger"
+# install_units also publishes host.json (tools/test-host-facts.sh covers it): a bare `ip`.
+printf '#!/usr/bin/env bash\ncase "$*" in "-j addr show") echo "[]" ;; esac\nexit 0\n' > "$WORK/bin/ip"
+printf '#!/usr/bin/env bash\necho box\n' > "$WORK/bin/hostname"
+chmod +x "$WORK/bin/systemctl" "$WORK/bin/logger" "$WORK/bin/ip" "$WORK/bin/hostname"
 
 # --- harness -----------------------------------------------------------------
 {
@@ -51,11 +54,11 @@ warn() { printf 'WARN %s\n' "$*"; }
 die()  { printf 'DIE %s\n' "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 H
-  printf 'DATA_DIR=%s\nSYSTEMD_DIR=%s\n' "$WORK/data" "$WORK/systemd"
+  printf 'DATA_DIR=%s\nSYSTEMD_DIR=%s\nNM_DISPATCHER_DIR=%s\n' "$WORK/data" "$WORK/systemd" "$WORK/nm"
   # The paths and the helpers, as update.sh defines them.
-  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^POWER_PENDING=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
+  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^POWER_PENDING=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
   sed -n '/^now_utc() {/,/}$/p' "$REPO/update.sh"
-  for f in json_esc ensure_updates_dir consume_trigger write_power_json do_power install_units; do
+  for f in json_esc ensure_updates_dir consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
     sed -n "/^$f() {/,/^}/p" "$REPO/update.sh"
   done
   # chown to a gid this user may not have: the self-test runs unprivileged.
