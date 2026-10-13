@@ -90,7 +90,32 @@ preflight() {
   local avail_g; avail_g=$(df -BG --output=avail "$(dirname "$DATA_DIR")" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
   [[ "${avail_g:-0}" -ge 200 ]] || warn "Disk space ~${avail_g}GB (<200GB recommended: models + images + PVCs)."
 
+  check_time_sync
   check_connectivity
+}
+
+# The clock is read by everything that expires and nothing checked it: the
+# local CA and every certificate it issues (cert-manager refuses a notBefore
+# in the future and a browser refuses one in the past), the instance licence's
+# exp claim, the proxy-pushed certificates, and restic, whose snapshot times
+# and `forget --keep-daily` are the clock's word. A box that boots with a dead
+# RTC and no NTP (a lab VLAN without outbound UDP/123 is common) installs
+# fine and fails a day later on the first renewal. A warning, not a stop: the
+# install itself does not need the time, and the fix is one line. The property
+# is systemd-timesyncd's or chrony's verdict (systemd >= 239 — Ubuntu 22.04
+# has 249), and a host without timedatectl is not judged.
+check_time_sync() {
+  have timedatectl || { info "timedatectl not found — clock sync not checked."; return 0; }
+  local synced
+  synced="$(timedatectl show -p NTPSynchronized 2>/dev/null | sed -n 's/^NTPSynchronized=//p')"
+  case "$synced" in
+    yes) info "Clock: NTP-synchronised." ;;
+    no)  warn "Clock is NOT synchronised (timedatectl NTPSynchronized=no)."
+         warn "  Certificates, the licence expiry and the backups all read it."
+         warn "  Fix before the first renewal/backup: timedatectl set-ntp true, then check"
+         warn "  that UDP/123 is open outbound (timedatectl timesync-status)." ;;
+    *)   warn "Could not read the clock sync state (timedatectl show -p NTPSynchronized)." ;;
+  esac
 }
 
 # Fail LOUDLY if any required endpoint is unreachable (otherwise `curl | sh` /

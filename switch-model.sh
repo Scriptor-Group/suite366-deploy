@@ -415,6 +415,53 @@ checkpoint_on_disk() { # checkpoint_on_disk HF_ID
   [[ -d "$models_dir/hub/models--${1//\//--}" ]]
 }
 
+# The room a first start needs. A profile whose checkpoint is not under
+# MODELS_DIR downloads it on its first boot — 133 GB for Flash-Next, onto the
+# disk that already holds the other checkpoints, the images and the JIT caches
+# — and until 2026-10-13 nothing checked there was room: a download that fills
+# the disk dies mid-way, the engine never reports healthy, the switch rolls
+# back after 60 min, and the hub's models--… directory it leaves behind is
+# what checkpoint_on_disk looks for, so state.json then says "downloaded" of
+# a checkpoint that is not. LLM_P_DISK_GB (llm/profiles.sh) plus a margin for
+# the caches and the logs, read with `df` from PATH so the self-test can stub
+# the disk.
+DISK_MARGIN_GB=10
+free_gb() { # free_gb DIR -> whole GB free on the filesystem holding DIR (its nearest existing parent)
+  local d="$1"
+  while [[ -n "$d" && "$d" != / && ! -d "$d" ]]; do d="$(dirname "$d")"; done
+  df -BG --output=avail "$d" 2>/dev/null | tail -1 | tr -dc '0-9'
+}
+disk_for_first_start() { # -> 0 (fits, or nothing to download), 1 (does not fit); DISK_NOTE says which
+  local models_dir need avail where
+  models_dir="$(env_get MODELS_DIR)"
+  if checkpoint_on_disk "$LLM_P_MODEL"; then
+    DISK_NOTE="$LLM_P_MODEL is already on disk (no download)"
+    return 0
+  fi
+  need=$(( LLM_P_DISK_GB + DISK_MARGIN_GB ))
+  where="${models_dir:-$DATA_DIR (MODELS_DIR unset in .env)}"
+  avail="$(free_gb "${models_dir:-$DATA_DIR}")"
+  if [[ -z "$avail" ]]; then
+    DISK_NOTE="$LLM_P_MODEL is not on disk: the first start downloads ~${LLM_P_DISK_GB} GB and needs ${need} GB free on $where — could not measure the free space, not checked"
+    return 0
+  fi
+  DISK_NOTE="$LLM_P_MODEL is not on disk: the first start downloads ~${LLM_P_DISK_GB} GB, needs ${need} GB free (${LLM_P_DISK_GB} + ${DISK_MARGIN_GB} margin) on $where, has ${avail} GB"
+  [[ "$avail" -ge "$need" ]]
+}
+
+# Superseded images: nothing ever removed them. Every unified revision the
+# channel has named, every Flash-Next build and every nginx tag stayed on the
+# disk the checkpoints share. Dangling only (`-f`, NEVER `-a`): the previous
+# unified image and Flash-Next's own keep their tags and must — a rollback is
+# `docker compose up -d` on the restored .env, which names them — so this
+# reclaims the untagged leftovers (a rebuild under the same tag, a retried
+# build) and nothing a tag still points at.
+prune_images() {
+  local out
+  out="$(docker image prune -f 2>/dev/null | sed -n 's/^Total reclaimed space: //p')" || true
+  info "dangling images pruned${out:+ ($out reclaimed)}"
+}
+
 # state.json — the app reads this and never runs anything itself. Written via
 # tmp+rename so a reader never sees a half-written file.
 publish_state() { # publish_state [SWITCH_STATUS] [TARGET] [MESSAGE]
@@ -549,6 +596,7 @@ case "$TARGET" in
       if wait_healthy suite366-vllm-embed 20 "embedding engine"; then info "embedding engine healthy."; else warn "embedding engine not healthy — check: docker logs suite366-vllm-embed"; fi
     fi
     reload_proxy
+    prune_images || true
     # The app-trigger unit and state.json, exactly as install-units does.
     TARGET=install-units
     ensure_state_dir
@@ -843,6 +891,12 @@ if [[ "$DRY_RUN" == 1 ]]; then
   else
     echo; info "engine image: $ENGINE_IMAGE (the channel's unified image, pulled)"
   fi
+  echo
+  if disk_for_first_start; then
+    info "disk: $DISK_NOTE"
+  else
+    warn "disk: $DISK_NOTE — the switch would refuse to start."
+  fi
   if [[ -n "$LLM_P_STT_MODEL" ]]; then
     echo; info "transcription engine: $STT_IMAGE (the engine image)"
     info "transcription container: taken down first, then suite366-vllm-stt up after the engine is healthy"
@@ -860,6 +914,18 @@ fi
 export KUBECONFIG="$KUBECONFIG_PATH"
 command -v docker >/dev/null || die "docker not found."
 [[ -f "$LLM_DIR/docker-compose.yml" ]] || die "$LLM_DIR/docker-compose.yml missing."
+
+# --- 0. the room the first start needs ---------------------------------------
+# Before the build and before .env moves: a refusal here leaves the box exactly
+# as it was, and the app's UI learns why through state.json.
+if disk_for_first_start; then
+  info "disk: $DISK_NOTE"
+else
+  publish_state error "$TARGET" "not enough disk for the $LLM_P_MODEL download: $DISK_NOTE"
+  die "Not enough disk: $DISK_NOTE.
+      Free the room first (a checkpoint no profile uses under MODELS_DIR/hub/, docker image prune),
+      then re-run: $0 $TARGET"
+fi
 
 # --- 1. the images this profile needs ----------------------------------------
 # A build stops the running engines first (see build_with_engines_down): the
@@ -1112,5 +1178,7 @@ fi
 publish_state success "$TARGET" "now serving $LLM_P_MODEL${STT_SERVED:+ + $STT_SERVED for transcription}${EMBED_SERVED:+ + $EMBED_SERVED for embeddings}"
 set -e
 log "Now serving $LLM_P_MODEL ($TARGET)${STT_SERVED:+ with $STT_SERVED for transcription}${EMBED_SERVED:+ and $EMBED_SERVED for embeddings}."
+# The engines are up on their images: whatever no tag points at any more goes.
+prune_images || true
 [[ "$LLM_P_EMBED" == "1" ]] || info "The generative model runs alone: no document search and no transcription until another profile is switched to."
 info "Check it end to end:  $0 status"

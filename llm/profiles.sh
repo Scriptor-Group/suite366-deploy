@@ -119,7 +119,11 @@ llm_flash_next_image() { # llm_flash_next_image [PATCHES_COMMIT] -> the tag of t
 # Dockerfile the image is built from, when NEEDS_BUILD is 1), SWAPPINESS
 # (empty = leave the host default), STT_MODEL (the transcription model served
 # next to it; empty = none), EMBED (1 = the embedding engine runs next to it,
-# 0 = it is taken down: the profile needs its memory).
+# 0 = it is taken down: the profile needs its memory), DISK_GB (what the
+# checkpoint takes under MODELS_DIR once downloaded — the "On disk" row of
+# the README's table, rounded up to cover the hub's blobs/ + snapshots/
+# layout; switch-model.sh refuses to start a first download that cannot
+# land, with a 10 GB margin on top of this).
 #
 # The LLM_P_ prefix is not decoration: it keeps the profile's values distinct
 # from the operator's, so install-time code can write `${LLM_MODEL:-$LLM_P_MODEL}`
@@ -156,6 +160,8 @@ llm_profile_apply() {
       # 34 GiB free measured next to it.
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       LLM_P_EMBED="1"
+      # 21.9 GB on disk.
+      LLM_P_DISK_GB="25"
       ;;
     orcasaq)
       # OrcaSAQ-2-27B: Qwen3.8-27B again, quantised by orcarouter with a
@@ -195,6 +201,8 @@ llm_profile_apply() {
       LLM_P_SWAPPINESS=""
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       LLM_P_EMBED="1"
+      # 12.3 GB on disk.
+      LLM_P_DISK_GB="15"
       ;;
     orcasaq-batch)
       # OrcaSAQ again, ALONE on the box: no embedding engine, no transcription
@@ -232,6 +240,8 @@ llm_profile_apply() {
       # Both side engines down: 0.80 is their memory.
       LLM_P_STT_MODEL=""
       LLM_P_EMBED="0"
+      # The same checkpoint as orcasaq: 12.3 GB on disk.
+      LLM_P_DISK_GB="15"
       ;;
     flash-next)
       # 176B ultra-sparse MoE, 6B active. 123.5 GB on disk for 121.6 GiB of RAM:
@@ -258,6 +268,9 @@ llm_profile_apply() {
       # 5 GiB free and swap already in use: nothing else fits beside it.
       LLM_P_STT_MODEL=""
       LLM_P_EMBED="1"
+      # 123.5 GB on disk: the one profile whose first download can fill a
+      # disk that already holds two other checkpoints.
+      LLM_P_DISK_GB="140"
       ;;
     gemma)
       # The appliance's original model, kept so a box can go back to what it
@@ -293,6 +306,8 @@ llm_profile_apply() {
       # used, 35 s of French transcribed in 2.6 s through the proxy.
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       LLM_P_EMBED="1"
+      # 18 GB on disk.
+      LLM_P_DISK_GB="20"
       ;;
     *) return 1 ;;
   esac
