@@ -258,12 +258,17 @@ trigger_ok() { # trigger_ok FILE -> 0 readable, 1 refused (and removed)
 # file content carries the requesting admin's email for the audit trail.
 # Leaves the requester in TRIGGER_WHO (empty when there was no trigger: a
 # manual run) for the callers that record it.
+# TRIGGER_REFUSED=1 when a trigger was there but refused (not a plain file
+# from the app): the caller must then do NOTHING — a refused request is not a
+# request. Seen on gb10-812nqm4 on 2026-10-13: a symlinked reboot-requested
+# was refused and removed, and the box rebooted anyway.
 TRIGGER_WHO=""
+TRIGGER_REFUSED=0
 consume_trigger() { # consume_trigger FILENAME
   local f="$UPDATES_DIR/$1" who=""
-  TRIGGER_WHO=""
+  TRIGGER_WHO=""; TRIGGER_REFUSED=0
   [[ -e "$f" || -L "$f" ]] || return 0
-  trigger_ok "$f" || return 0
+  trigger_ok "$f" || { TRIGGER_REFUSED=1; return 0; }
   who="$(head -c 200 "$f" 2>/dev/null | tr -d '\r\n' || true)"
   rm -f "$f"
   TRIGGER_WHO="$who"
@@ -399,6 +404,10 @@ do_power() { # do_power shutdown | reboot | booted
     *) die "power: unknown action '$action' (use: shutdown | reboot | booted)." ;;
   esac
   consume_trigger "$action-requested"
+  if [[ "$TRIGGER_REFUSED" == 1 ]]; then
+    warn "power: the $action request was refused (see above) — nothing done."
+    return 0
+  fi
   who="$TRIGGER_WHO"; when="$(now_utc)"
   ensure_updates_dir
   ( umask 077; printf '%s\n%s\n%s\n' "$action" "$who" "$when" > "$POWER_PENDING" )
