@@ -615,7 +615,17 @@ EOF
     exit 0 ;;
   consume-trigger)
     [[ $EUID -eq 0 ]] || die "run me as root."
-    [[ -f "$TRIGGER" ]] || { info "no pending request."; exit 0; }
+    [[ -e "$TRIGGER" || -L "$TRIGGER" ]] || { info "no pending request."; exit 0; }
+    # Only what the app writes is read: a regular file owned by the pod (or
+    # root), small. The directory is pod-writable, so a symlink here would
+    # make root read any file on the host (same rule as update.sh trigger_ok).
+    if [[ -L "$TRIGGER" || ! -f "$TRIGGER" ]] \
+       || { towner="$(stat -c %u "$TRIGGER")"; [[ "$towner" != "$APP_GID" && "$towner" != 0 ]]; } \
+       || (( $(stat -c %s "$TRIGGER") > 65536 )); then
+      rm -f "$TRIGGER"
+      publish_state error "" "a switch request that was not a plain file from the app was refused"
+      die "trigger $TRIGGER refused: not a regular file from the app — removed."
+    fi
     # Read THEN delete: a request that fails must not replay on the next boot.
     want="$(sed -n 1p "$TRIGGER" | tr -dc 'a-z0-9-' | head -c 32)"
     REQUESTED_BY="$(sed -n 2p "$TRIGGER" | tr -d '\r\n' | head -c 200)"

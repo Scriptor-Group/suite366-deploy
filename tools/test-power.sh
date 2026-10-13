@@ -56,14 +56,16 @@ have() { command -v "$1" >/dev/null 2>&1; }
 H
   printf 'DATA_DIR=%s\nSYSTEMD_DIR=%s\nNM_DISPATCHER_DIR=%s\n' "$WORK/data" "$WORK/systemd" "$WORK/nm"
   # The paths and the helpers, as update.sh defines them.
-  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^POWER_PENDING=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
+  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^PRIVATE_DIR=/p; /^POWER_PENDING=/p; /^POWER_PENDING_LEGACY=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
   sed -n '/^now_utc() {/,/}$/p' "$REPO/update.sh"
-  for f in json_esc ensure_updates_dir consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
+  for f in json_esc ensure_updates_dir private_tmp publish_file trigger_ok consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
     sed -n "/^$f() {/,/^}/p" "$REPO/update.sh"
   done
-  # chown to a gid this user may not have: the self-test runs unprivileged.
+  # chown to a gid this user may not have: the self-test runs unprivileged —
+  # and the test user plays the pod (the uid a trigger must be owned by).
   cat <<'H'
 chown() { :; }
+APP_GID="$(id -u)"
 H
 } > "$WORK/prelude.sh"
 
@@ -117,8 +119,9 @@ check "…who asked" "$(jq_ 'd["last"]["requested_by"]')" "ops@acme.example"
 check "…what" "$(jq_ 'd["last"]["action"]')" "reboot"
 check "…and not back yet" "$(jq_ 'd["last"]["completed_at"]')" ""
 if [[ -n "$(jq_ 'd["last"]["requested_at"]')" ]]; then ok "…requested_at is set"; else ko "…requested_at is set"; fi
-check "the pending file is root-only" "$(stat -c %a "$WORK/data/updates/power-pending")" "600"
-check "…and names the request" "$(sed -n 1,2p "$WORK/data/updates/power-pending" | tr '\n' '|')" "reboot|ops@acme.example|"
+check "the pending file is root-only" "$(stat -c %a "$WORK/data/.private/power-pending")" "600"
+if [[ -e "$WORK/data/updates/power-pending" ]]; then ko "…and OUT of the directory the pod can write"; else ok "…and OUT of the directory the pod can write"; fi
+check "…and names the request" "$(sed -n 1,2p "$WORK/data/.private/power-pending" | tr '\n' '|')" "reboot|ops@acme.example|"
 contains "the host journal names the requester" "$(cat "$WORK/logger.log")" "power: reboot (by: ops@acme.example)"
 contains "the operator sees it" "$out" "Power: reboot requested by ops@acme.example"
 
@@ -129,7 +132,7 @@ check "power.json is idle again" "$(jq_ 'd["status"]')" "idle"
 check "…keeps who asked" "$(jq_ 'd["last"]["requested_by"]')" "ops@acme.example"
 check "…and what" "$(jq_ 'd["last"]["action"]')" "reboot"
 if [[ -n "$(jq_ 'd["last"]["completed_at"]')" ]]; then ok "…and records when the box was back"; else ko "…and records when the box was back"; fi
-if [[ -e "$WORK/data/updates/power-pending" ]]; then ko "the pending file is gone"; else ok "the pending file is gone"; fi
+if [[ -e "$WORK/data/.private/power-pending" ]]; then ko "the pending file is gone"; else ok "the pending file is gone"; fi
 contains "the host journal says so" "$(cat "$WORK/logger.log")" "power: back after reboot (by: ops@acme.example)"
 # A boot with nothing pending (power cut, manual reboot): the record stays.
 before="$(cat "$WORK/data/updates/power.json")"
@@ -153,6 +156,51 @@ contains "…and named" "$out" "unknown action 'halt'"
 if [[ -f "$WORK/systemctl.log" ]]; then ko "…and nothing is called"; else ok "…and nothing is called"; fi
 out="$(run "do_power ''")"; RC=$?
 check "an empty verb is refused" "$RC" "1"
+
+echo "== the shared directory is pod-writable: what root reads and writes there =="
+# A symlink dropped as a trigger: root must not read through it (the first 200
+# bytes used to land in power.json, world-readable), and the .path unit must
+# not re-fire on it for ever — it is removed.
+reset_box; run "ensure_updates_dir" >/dev/null
+printf 'root:x:0:0\n' > "$WORK/secret"; ln -s "$WORK/secret" "$WORK/data/updates/reboot-requested"
+out="$(run "do_power reboot")"; RC=$?
+check "a symlinked trigger exits 0 (the reboot still happens, as an operator request)" "$RC" "0"
+if [[ -e "$WORK/data/updates/reboot-requested" || -L "$WORK/data/updates/reboot-requested" ]]; then ko "the symlink is removed"; else ok "the symlink is removed"; fi
+contains "…and refused by name" "$out" "not a regular file"
+absent "…nothing read through it lands in power.json" "$(cat "$WORK/data/updates/power.json")" "root:x:0:0"
+# A trigger owned by someone else (not the pod, not root) is refused too: here
+# the pod's uid is pretended to be another one, so the test user's file is "someone else's".
+reset_box; run "ensure_updates_dir" >/dev/null
+printf 'x\n' > "$WORK/data/updates/reboot-requested"
+out="$(run "APP_GID=65534; trigger_ok '$WORK/data/updates/reboot-requested' && echo accepted")"; RC=$?
+check "a trigger owned by neither the pod nor root is refused" "$RC" "1"
+contains "…and says so" "$out" "refused (owner uid"
+if [[ -e "$WORK/data/updates/reboot-requested" ]]; then ko "…and removed"; else ok "…and removed"; fi
+# A large file is refused as well (a trigger is a couple of lines).
+reset_box; run "ensure_updates_dir" >/dev/null
+head -c 70000 /dev/zero | tr '\0' 'a' > "$WORK/data/updates/reboot-requested"
+out="$(run "trigger_ok '$WORK/data/updates/reboot-requested' && echo accepted")"; RC=$?
+check "an oversized trigger is refused" "$RC" "1"
+# Every file root publishes is produced in the private dir and RENAMED into
+# place: a symlink the pod planted under the destination's old temp name must
+# not be followed, and the canary it points at must survive intact.
+reset_box; run "ensure_updates_dir" >/dev/null
+printf 'canary\n' > "$WORK/canary"
+for n in power.json state.json apply.json host.json; do ln -s "$WORK/canary" "$WORK/data/updates/$n.tmp"; done
+ln -s "$WORK/canary" "$WORK/data/updates/power.json"
+out="$(run "write_power_json idle; write_host_json")"; RC=$?
+check "writes exit 0 with planted symlinks" "$RC" "0"
+check "the canary is untouched" "$(cat "$WORK/canary")" "canary"
+if [[ -L "$WORK/data/updates/power.json" ]]; then ko "the published file replaced the planted symlink"; else ok "the published file replaced the planted symlink"; fi
+check "…and is a regular 0644 file" "$(stat -c '%F %a' "$WORK/data/updates/power.json")" "regular file 644"
+check "the private working dir is root-only" "$(stat -c %a "$WORK/data/.private")" "700"
+check "nothing root-owned but the published files is left in the shared dir" "$(find "$WORK/data/updates" -mindepth 1 ! -name '*.json' ! -name '*.tmp' -printf '%f ' 2>/dev/null)" ""
+# A box that rebooted on the previous updater: its record was in the shared dir.
+reset_box; run "ensure_updates_dir" >/dev/null
+printf 'reboot\nold@acme.example\n2026-10-12T15:00:00Z\n' > "$WORK/data/updates/power-pending"
+out="$(run "do_power booted")"; RC=$?
+check "a legacy pending record is honoured once" "$(jq_ 'd["last"]["requested_by"]')" "old@acme.example"
+if [[ -e "$WORK/data/updates/power-pending" ]]; then ko "…and removed from the shared dir"; else ok "…and removed from the shared dir"; fi
 
 echo "== booted on a fresh box =="
 reset_box
