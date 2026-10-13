@@ -165,12 +165,23 @@ UPDATES_DIR="$DATA_DIR/updates"
 STATE_JSON="$UPDATES_DIR/state.json"
 APPLY_JSON="$UPDATES_DIR/apply.json"
 POWER_JSON="$UPDATES_DIR/power.json"
-# The request being carried out across the reboot (root-only; power.json is
-# what the app reads). Written by `power shutdown|reboot`, closed by `power
-# booted` on the next start.
-POWER_PENDING="$UPDATES_DIR/power-pending"
 HOST_JSON="$UPDATES_DIR/host.json"
 APP_GID=1001
+# Root-only working space, OUTSIDE the directory the pod can write. Every
+# file root publishes into $UPDATES_DIR is produced here and then renamed into
+# place: a rename replaces whatever sits at the destination — a symlink the pod
+# planted included — where writing `$UPDATES_DIR/x.tmp` directly would have
+# followed that symlink and overwritten any file on the host as root (the
+# directory is root:1001 0770 without sticky bit, so the pod can create and
+# rename entries in it). Reviewed 2026-10-13; nothing root-owned lives in the
+# shared directory any more except what the app is meant to read.
+PRIVATE_DIR="$DATA_DIR/.private"
+# The request being carried out across the reboot. Written by `power
+# shutdown|reboot`, closed by `power booted` on the next start. Root-only and
+# out of the pod's reach (it used to sit in $UPDATES_DIR, where the pod could
+# delete or replace it: migrated on first read).
+POWER_PENDING="$PRIVATE_DIR/power-pending"
+POWER_PENDING_LEGACY="$UPDATES_DIR/power-pending"
 # Where the systemd units go; the self-test (tools/test-power.sh) points it at
 # a temp dir.
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
@@ -206,20 +217,65 @@ json_esc() {
 
 # --- App <-> host shared dir --------------------------------------------------
 ensure_updates_dir() {
-  mkdir -p "$UPDATES_DIR"
+  mkdir -p "$UPDATES_DIR" "$PRIVATE_DIR"
   chown "root:$APP_GID" "$UPDATES_DIR"
   chmod 0770 "$UPDATES_DIR"
+  chmod 0700 "$PRIVATE_DIR"
+}
+# A temp file in the root-only working space, for a file bound for $UPDATES_DIR.
+private_tmp() { # private_tmp NAME -> path
+  ensure_updates_dir
+  mktemp "$PRIVATE_DIR/$1.XXXXXX"
+}
+# A published file is "there" only when it is a regular file root wrote: a
+# symlink the pod planted under its name (seen on gb10-812nqm4, 2026-10-13:
+# power.json -> /etc/hostname) passed `-f`, so the file was never rewritten and
+# the app's page broke. Such an entry counts as absent and gets replaced.
+published_ok() { # published_ok FILE
+  [[ -f "$1" && ! -L "$1" && -O "$1" ]]   # -O: owned by us (root on the box)
+}
+# Publish a file for the pod: 0644, then renamed into place (never written in
+# place, never chmod-ed in place — see PRIVATE_DIR).
+publish_file() { # publish_file TMP DEST
+  chmod 0644 "$1"; mv -f "$1" "$2"
+}
+# A trigger the pod dropped is only read when it is what the app writes: a
+# regular file (not a symlink pointing root at /etc/shadow or the k3s token —
+# its first 200 bytes used to land in power.json, world-readable), owned by the
+# pod's uid or by root, and small. Anything else is logged and removed, so a
+# .path unit does not re-fire on it for ever.
+trigger_ok() { # trigger_ok FILE -> 0 readable, 1 refused (and removed)
+  local f="$1" owner size
+  [[ -e "$f" || -L "$f" ]] || return 1
+  if [[ -L "$f" || ! -f "$f" ]]; then
+    warn "trigger $(basename "$f") is not a regular file — ignored and removed."
+    logger -t suite366-update "trigger $(basename "$f") refused: not a regular file" 2>/dev/null || true
+    rm -f "$f"; return 1
+  fi
+  owner="$(stat -c %u "$f" 2>/dev/null || echo -1)"; size="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+  if [[ "$owner" != "$APP_GID" && "$owner" != 0 ]] || (( size > 65536 )); then
+    warn "trigger $(basename "$f") refused (owner uid $owner, $size bytes) — removed."
+    logger -t suite366-update "trigger $(basename "$f") refused: owner $owner size $size" 2>/dev/null || true
+    rm -f "$f"; return 1
+  fi
+  return 0
 }
 
 # Consume (log + delete) a trigger file dropped by the app, if present. The
 # file content carries the requesting admin's email for the audit trail.
 # Leaves the requester in TRIGGER_WHO (empty when there was no trigger: a
 # manual run) for the callers that record it.
+# TRIGGER_REFUSED=1 when a trigger was there but refused (not a plain file
+# from the app): the caller must then do NOTHING — a refused request is not a
+# request. Seen on gb10-812nqm4 on 2026-10-13: a symlinked reboot-requested
+# was refused and removed, and the box rebooted anyway.
 TRIGGER_WHO=""
+TRIGGER_REFUSED=0
 consume_trigger() { # consume_trigger FILENAME
   local f="$UPDATES_DIR/$1" who=""
-  TRIGGER_WHO=""
-  [[ -f "$f" ]] || return 0
+  TRIGGER_WHO=""; TRIGGER_REFUSED=0
+  [[ -e "$f" || -L "$f" ]] || return 0
+  trigger_ok "$f" || { TRIGGER_REFUSED=1; return 0; }
   who="$(head -c 200 "$f" 2>/dev/null | tr -d '\r\n' || true)"
   rm -f "$f"
   TRIGGER_WHO="$who"
@@ -232,7 +288,7 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   ensure_updates_dir
   local avail=false; [[ "$1" == "1" ]] && avail=true
   local reachable=false; [[ "${online_reachable:-0}" == "1" ]] && reachable=true
-  local tmp="$STATE_JSON.tmp"
+  local tmp; tmp="$(private_tmp state.json)"
   # schema 2 adds `source` + `sources` (online / usb). Readers tolerating only
   # schema 1 keep working: every field they know is unchanged and still carries
   # the RESOLVED best-of-both target, not just the online one.
@@ -278,7 +334,7 @@ write_state_json() { # write_state_json AVAILABLE(0|1)
   }
 }
 EOF
-  chmod 0644 "$tmp"; mv -f "$tmp" "$STATE_JSON"
+  publish_file "$tmp" "$STATE_JSON"
 }
 
 APPLY_STARTED_AT=""
@@ -286,7 +342,7 @@ write_apply_json() { # write_apply_json STATUS MESSAGE
   ensure_updates_dir
   local status="$1" message="$2" finished=""
   case "$status" in success|error) finished="$(now_utc)";; esac
-  local tmp="$APPLY_JSON.tmp"
+  local tmp; tmp="$(private_tmp apply.json)"
   cat > "$tmp" <<EOF
 {
   "schema": 1,
@@ -297,7 +353,7 @@ write_apply_json() { # write_apply_json STATUS MESSAGE
   "updated_at": "$(now_utc)"
 }
 EOF
-  chmod 0644 "$tmp"; mv -f "$tmp" "$APPLY_JSON"
+  publish_file "$tmp" "$APPLY_JSON"
 }
 
 # --- power.json (read by the app UI) --------------------------------------------
@@ -307,7 +363,7 @@ EOF
 # that never had one.
 write_power_json() { # write_power_json STATUS [ACTION REQUESTED_BY REQUESTED_AT COMPLETED_AT]
   ensure_updates_dir
-  local status="$1" last="null" tmp="$POWER_JSON.tmp"
+  local status="$1" last="null" tmp; tmp="$(private_tmp power.json)"
   if [[ -n "${2:-}" ]]; then
     last="$(printf '{"action": "%s", "requested_by": "%s", "requested_at": "%s", "completed_at": "%s"}' \
       "$(json_esc "$2")" "$(json_esc "${3:-}")" "$(json_esc "${4:-}")" "$(json_esc "${5:-}")")"
@@ -316,7 +372,7 @@ write_power_json() { # write_power_json STATUS [ACTION REQUESTED_BY REQUESTED_AT
   # brace, and a JSON `}` at column 0 inside a heredoc would end it early.
   printf '{\n  "schema": 1,\n  "status": "%s",\n  "last": %s,\n  "updated_at": "%s"\n}\n' \
     "$(json_esc "$status")" "$last" "$(now_utc)" > "$tmp"
-  chmod 0644 "$tmp"; mv -f "$tmp" "$POWER_JSON"
+  publish_file "$tmp" "$POWER_JSON"
 }
 
 # --- power: shut the box down or reboot it, from the app or by hand ----------
@@ -336,20 +392,31 @@ do_power() { # do_power shutdown | reboot | booted
       # the last request alone; it only seeds the file when there is none —
       # its presence is the app's signal that this host takes power requests.
       ensure_updates_dir
+      # A box that rebooted on the previous updater left its record in the
+      # shared directory: take it from there once, as long as it is a plain file.
+      if [[ ! -f "$POWER_PENDING" && -f "$POWER_PENDING_LEGACY" && ! -L "$POWER_PENDING_LEGACY" ]]; then
+        mv -f "$POWER_PENDING_LEGACY" "$POWER_PENDING" 2>/dev/null || true
+      fi
+      rm -f "$POWER_PENDING_LEGACY"
       if [[ -f "$POWER_PENDING" ]]; then
         { IFS= read -r action; IFS= read -r who; IFS= read -r when; } < "$POWER_PENDING" || true
         rm -f "$POWER_PENDING"
         write_power_json idle "${action:-reboot}" "$who" "$when" "$(now_utc)"
         info "power: back after the $action requested by ${who:-the operator} at $when"
         logger -t suite366-update "power: back after $action${who:+ (by: $who)}" 2>/dev/null || true
-      elif [[ ! -f "$POWER_JSON" ]]; then
+      elif ! published_ok "$POWER_JSON"; then
         write_power_json idle
       fi
       return 0 ;;
     *) die "power: unknown action '$action' (use: shutdown | reboot | booted)." ;;
   esac
   consume_trigger "$action-requested"
+  if [[ "$TRIGGER_REFUSED" == 1 ]]; then
+    warn "power: the $action request was refused (see above) — nothing done."
+    return 0
+  fi
   who="$TRIGGER_WHO"; when="$(now_utc)"
+  ensure_updates_dir
   ( umask 077; printf '%s\n%s\n%s\n' "$action" "$who" "$when" > "$POWER_PENDING" )
   write_power_json "$status" "$action" "$who" "$when" ""
   log "Power: $action requested by ${who:-the operator} — stopping the services, then the machine"
@@ -387,7 +454,8 @@ for _, n, v4, v6 in sorted(rows):
 }
 write_host_json() {
   ensure_updates_dir
-  local tmp="$HOST_JSON.tmp" suite_ip rows="" ifname v4 v6 first=1
+  local tmp suite_ip rows="" ifname v4 v6 first=1
+  tmp="$(private_tmp host.json)"
   suite_ip="$(ip -4 addr show dev suite0 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}')"
   while IFS=$'\t' read -r ifname v4 v6; do
     [[ -n "$ifname" ]] || continue
@@ -400,7 +468,7 @@ write_host_json() {
   # printf, not a heredoc: the self-test extracts this function by its closing brace.
   printf '{\n  "schema": 1,\n  "hostname": "%s",\n  "interfaces": [%s],\n  "internal_ip": "%s",\n  "updated_at": "%s"\n}\n' \
     "$(json_esc "$(hostname 2>/dev/null || true)")" "$rows" "$(json_esc "$suite_ip")" "$(now_utc)" > "$tmp"
-  chmod 0644 "$tmp"; mv -f "$tmp" "$HOST_JSON"
+  publish_file "$tmp" "$HOST_JSON"
 }
 do_host_facts() {
   write_host_json
@@ -1603,7 +1671,7 @@ EOF
     || warn "could not enable trigger path units (systemd offline?)."
   # Belt and braces for a systemd that could not start the booted unit (or a
   # stub): the app must find power.json after install-units, whatever happened.
-  [[ -f "$POWER_JSON" ]] || write_power_json idle
+  published_ok "$POWER_JSON" || write_power_json idle
   write_host_json
   info "App-trigger units armed (watching $UPDATES_DIR; power requests included; host facts published)."
 }
