@@ -56,6 +56,11 @@
 #   power booted  run by suite366-power-booted.service at every boot: closes
 #                 the pending shutdown/reboot in power.json (what the app
 #                 shows as "back since …").
+#   host-facts    publish host.json: the hostname and the box's CURRENT LAN
+#                 addresses, for the app's Appliance overview ("reach me at
+#                 192.168.1.72"). Run at boot, by NetworkManager on every
+#                 address change, by `check` and by install-units; cheap,
+#                 offline-safe, no cluster needed.
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
@@ -64,6 +69,8 @@
 #   power.json        written by `power`  — idle|shutting_down|rebooting + who
 #                     asked, when, and when the box was back; its PRESENCE is
 #                     how the app knows this host accepts power requests
+#   host.json         written by `host-facts` — hostname, LAN interfaces and
+#                     their current addresses, the internal IP
 #   check-requested   written by the app  — consumed, triggers `check`
 #   apply-requested   written by the app  — consumed, triggers `apply`
 #   shutdown-requested, reboot-requested
@@ -162,10 +169,12 @@ POWER_JSON="$UPDATES_DIR/power.json"
 # what the app reads). Written by `power shutdown|reboot`, closed by `power
 # booted` on the next start.
 POWER_PENDING="$UPDATES_DIR/power-pending"
+HOST_JSON="$UPDATES_DIR/host.json"
 APP_GID=1001
 # Where the systemd units go; the self-test (tools/test-power.sh) points it at
 # a temp dir.
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+NM_DISPATCHER_DIR="${NM_DISPATCHER_DIR:-/etc/NetworkManager/dispatcher.d}"
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
@@ -346,6 +355,56 @@ do_power() { # do_power shutdown | reboot | booted
   log "Power: $action requested by ${who:-the operator} — stopping the services, then the machine"
   logger -t suite366-update "power: $action${who:+ (by: $who)}" 2>/dev/null || true
   systemctl --no-block "$cmd" || die "systemctl $cmd failed."
+}
+
+# --- host.json: where the box is on the network (read by the app UI) ----------
+# The app runs in a pod on 10.42.x and knows nothing of the host's LAN; the
+# admin who wants to reach the box by IP (a .local name that does not resolve,
+# a DNS still to be set up, a laptop plugged straight into it) has nowhere to
+# read it. So the host says it: the interface the default route leaves by
+# first, then every other physical interface with a global address — never the
+# plumbing (suite0, docker, cni, flannel, tailscale, veth, WireGuard). The
+# internal IP (suite0) is listed apart: it is where vLLM listens, not a LAN
+# address. Offline (no default route) every interface still gets listed, so
+# the answer is never empty on a box someone plugged a laptop into.
+host_lan_interfaces() { # -> one "ifname\tv4 v4…\tv6 v6…" line per LAN interface, default-route one first
+  local def; def="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')"
+  ip -j addr show 2>/dev/null | python3 -c '
+import json, re, sys
+skip = re.compile(r"^(lo|suite0|docker|br-|cni|flannel|veth|tailscale|wg|scriptor|virbr|lxc|kube|tun|tap)")
+first = sys.argv[1]
+rows = []
+for i in json.load(sys.stdin):
+    n = i.get("ifname", "")
+    if skip.match(n): continue
+    v4 = [a["local"] for a in i.get("addr_info", []) if a.get("family") == "inet" and a.get("scope") == "global"]
+    v6 = [a["local"] for a in i.get("addr_info", []) if a.get("family") == "inet6" and a.get("scope") == "global"]
+    if not v4 and not v6: continue
+    rows.append((0 if n == first else 1, n, " ".join(v4), " ".join(v6)))
+for _, n, v4, v6 in sorted(rows):
+    print(n + "\t" + v4 + "\t" + v6)
+' "${def:-}"
+}
+write_host_json() {
+  ensure_updates_dir
+  local tmp="$HOST_JSON.tmp" suite_ip rows="" ifname v4 v6 first=1
+  suite_ip="$(ip -4 addr show dev suite0 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}')"
+  while IFS=$'\t' read -r ifname v4 v6; do
+    [[ -n "$ifname" ]] || continue
+    [[ "$first" == 1 ]] || rows+=","
+    first=0
+    rows+="$(printf '{"name": "%s", "ipv4": [%s], "ipv6": [%s]}' "$(json_esc "$ifname")" \
+      "$(printf '%s' "$v4" | awk '{for(i=1;i<=NF;i++) printf "%s\"%s\"", (i>1?", ":""), $i}')" \
+      "$(printf '%s' "$v6" | awk '{for(i=1;i<=NF;i++) printf "%s\"%s\"", (i>1?", ":""), $i}')")"
+  done < <(host_lan_interfaces)
+  # printf, not a heredoc: the self-test extracts this function by its closing brace.
+  printf '{\n  "schema": 1,\n  "hostname": "%s",\n  "interfaces": [%s],\n  "internal_ip": "%s",\n  "updated_at": "%s"\n}\n' \
+    "$(json_esc "$(hostname 2>/dev/null || true)")" "$rows" "$(json_esc "$suite_ip")" "$(now_utc)" > "$tmp"
+  chmod 0644 "$tmp"; mv -f "$tmp" "$HOST_JSON"
+}
+do_host_facts() {
+  write_host_json
+  info "host facts published ($(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(", ".join(a for i in d["interfaces"] for a in i["ipv4"]) or "no LAN address")' "$HOST_JSON" 2>/dev/null || true))."
 }
 
 # --- Current state on this box ------------------------------------------------
@@ -1507,14 +1566,46 @@ ExecStart=$DATA_DIR/update.sh power booted
 WantedBy=multi-user.target
 EOF
 
+  # host.json: at boot once the network is up, and on every address change
+  # through NetworkManager's dispatcher (a plain file write, no service
+  # restart — not the restart storm the mDNS dispatcher hook once caused). A
+  # box without NetworkManager keeps the boot write and the daily `check`.
+  cat > "$SYSTEMD_DIR/suite366-host-facts.service" <<EOF
+[Unit]
+Description=Suite 366 — publish the box's hostname and LAN addresses for the app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DATA_DIR/update.sh host-facts
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [[ -d "$NM_DISPATCHER_DIR" ]]; then
+    cat > "$NM_DISPATCHER_DIR/90-suite366-host-facts" <<EOF
+#!/bin/sh
+# Suite 366 — refresh host.json (the app's "reach me at …") on address changes.
+case "\$2" in
+  up|down|dhcp4-change|dhcp6-change|connectivity-change) exec $DATA_DIR/update.sh host-facts >/dev/null 2>&1 ;;
+esac
+exit 0
+EOF
+    chmod 0755 "$NM_DISPATCHER_DIR/90-suite366-host-facts"
+  fi
+
   systemctl daemon-reload
   systemctl enable --now suite366-update-apply.path suite366-update-check.path \
-      suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service >/dev/null 2>&1 \
+      suite366-power-shutdown.path suite366-power-reboot.path suite366-power-booted.service \
+      suite366-host-facts.service >/dev/null 2>&1 \
     || warn "could not enable trigger path units (systemd offline?)."
   # Belt and braces for a systemd that could not start the booted unit (or a
   # stub): the app must find power.json after install-units, whatever happened.
   [[ -f "$POWER_JSON" ]] || write_power_json idle
-  info "App-trigger units armed (watching $UPDATES_DIR; power requests included)."
+  write_host_json
+  info "App-trigger units armed (watching $UPDATES_DIR; power requests included; host facts published)."
 }
 
 # --- self-update ----------------------------------------------------------------
@@ -2209,6 +2300,7 @@ case "$MODE" in
     self_update_first
     survey
     notify
+    write_host_json
     # Convergence belongs here, not only in `apply`. `apply` runs when there is
     # something to apply; a box sitting on the current version never triggers
     # it, so putting convergence there alone means the appliances that need the
@@ -2243,7 +2335,10 @@ case "$MODE" in
   power)
     do_power "${2:-}"
     ;;
+  host-facts)
+    do_host_facts
+    ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot | host-facts)"
     ;;
 esac

@@ -866,7 +866,12 @@ order — and `suite366-power-booted.service` closes the request in `power.json`
 at the next boot (what the app shows as "back since …"). `power.json`'s
 presence is how the app knows the host takes these requests: a box on an older
 updater shows no Power page until its next apply. `sudo update.sh power reboot`
-does the same by hand. The
+does the same by hand. The host also publishes `host.json` there (hostname, the
+LAN interfaces with their current addresses, the internal IP), refreshed at
+boot, on every address change through a NetworkManager dispatcher hook, and by
+the daily `check`: it is what the app's *Appliance* overview shows as "reach
+this box at 192.168.1.72" — the pod has no other way of knowing the host's LAN.
+The
 apply reuses the box's install-time parameters (`values.yaml`, `llm/.env`,
 `update.env`) — nothing is re-asked. After each apply, `update.sh` refreshes
 itself from the repo and re-installs the trigger units, so the update mechanism
