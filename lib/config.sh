@@ -308,16 +308,23 @@ CDI_SPEC="${CDI_SPEC:-/etc/cdi/nvidia.yaml}"
 # appliance ships with the mechanism armed but idle: `backup.sh run` then
 # reports "unconfigured" and exits 0 rather than failing nightly. Set
 # BACKUP_REPO (any restic backend; S3 is the intended one) at install time, or
-# later in $DATA_DIR/backup/backup.env.
+# later in $DATA_DIR/backup-private/backup.env.
 #   BACKUP_REPO=s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>
+# Two directories: $BACKUP_DIR is SHARED with the drive-app pod (hostPath, the
+# UI reads state.json there and drops its requests), $BACKUP_PRIVATE_DIR is
+# root-only and holds everything root reads back — the credentials, the key,
+# the restic cache. The pod can write the first; nothing it writes may ever
+# be read as config by root (backup.sh's header has the review that drew the line).
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
+BACKUP_PRIVATE_DIR="${BACKUP_PRIVATE_DIR:-$DATA_DIR/backup-private}"
 BACKUP_REPO="${BACKUP_REPO:-}"
 BACKUP_S3_ACCESS_KEY="${BACKUP_S3_ACCESS_KEY:-}"
 BACKUP_S3_SECRET_KEY="${BACKUP_S3_SECRET_KEY:-}"
 BACKUP_S3_REGION="${BACKUP_S3_REGION:-}"
 # Repository encryption key. Generated when empty; kept 0600 in
-# $BACKUP_DIR/repo.pass and printed ONCE at the end of the install. There is no
-# recovery path if it is lost — that is the property being bought, and the
+# $BACKUP_PRIVATE_DIR/repo.pass — only its fingerprint and its path are printed
+# at the end of the install, never the key (install logs end up in tickets).
+# There is no recovery path if it is lost — that is the property being bought, and the
 # reason a rented box escrows it (suite366-fleet) and a sold one ships it on a
 # card inside the crate.
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"

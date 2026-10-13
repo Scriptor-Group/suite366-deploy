@@ -83,20 +83,33 @@ vllm_pg_deploy() {
     | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
 }
 
+# The key reaches curl through a header FILE (`-H @file`, curl >= 7.55), never
+# on its argv: /proc/*/cmdline is readable by every local process, and a chat
+# completion probe keeps that argv alive for up to 60 seconds. mktemp's 0600
+# is the whole protection; the file is removed as soon as curl returns.
+vllm_auth_header_file() { # vllm_auth_header_file KEY -> PATH
+  local f=""
+  f="$(mktemp)" || return 1
+  printf 'Authorization: Bearer %s\n' "$1" > "$f"
+  printf '%s' "$f"
+}
+
 # The one curl here that is NOT `-fsS`, and it has to be: `-f` turns a 401 into
 # exit 22 and throws the status code away, and the status code IS the answer.
 # `|| true` sits INSIDE the substitution so curl's own "000" survives a connect
 # failure (it prints 000 and exits 7).
 vllm_http_code() { # vllm_http_code URL KEY TIMEOUT [JSON_BODY]
-  local url="$1" key="$2" tmo="$3" body="${4:-}" code=""
+  local url="$1" key="$2" tmo="$3" body="${4:-}" code="" hdr=""
+  hdr="$(vllm_auth_header_file "$key")" || { printf '000'; return 0; }
   if [[ -n "$body" ]]; then
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+              -H "@$hdr" -H 'Content-Type: application/json' \
               --data-binary "$body" "$url" 2>/dev/null || true)"
   else
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" "$url" 2>/dev/null || true)"
+              -H "@$hdr" "$url" 2>/dev/null || true)"
   fi
+  rm -f "$hdr"
   printf '%s' "${code:-000}"
 }
 

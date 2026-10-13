@@ -24,7 +24,16 @@
 # being gone, so a re-run (or an uninstall of a partial install) is safe.
 #
 # Options (environment variables, like install.sh):
-#   ASSUME_YES=1    don't prompt for confirmation (required for curl|bash)
+#   ASSUME_YES=1    don't prompt for confirmation (required for curl|bash).
+#                   On a box that holds a backup repository key it is NOT
+#                   enough on its own: deleting $DATA_DIR deletes the only
+#                   copy of the key, and the snapshots in the remote
+#                   repository become unreadable forever. Unattended, that
+#                   needs KEEP_DATA=1 or I_HAVE_THE_BACKUP_KEY=1 as well.
+#   I_HAVE_THE_BACKUP_KEY=1
+#                   you have copied $DATA_DIR/backup-private/repo.pass (or
+#                   backup/repo.pass on an older box) somewhere safe, or you
+#                   accept losing every snapshot: lets ASSUME_YES=1 delete it.
 #   KEEP_DATA=1     leave $DATA_DIR entirely untouched (models + config + certs)
 #   KEEP_MODELS=1   remove $DATA_DIR but PRESERVE the model cache ($MODELS_DIR),
 #                   so a later re-install doesn't re-download 15+ GiB
@@ -96,6 +105,43 @@ KEEP_DATA="${KEEP_DATA:-0}"
 KEEP_MODELS="${KEEP_MODELS:-0}"
 KEEP_K3S="${KEEP_K3S:-0}"
 PRUNE_IMAGES="${PRUNE_IMAGES:-0}"
+I_HAVE_THE_BACKUP_KEY="${I_HAVE_THE_BACKUP_KEY:-0}"
+
+# --- The backup key ----------------------------------------------------------
+# Where the repository key is, if this box has one. backup.sh keeps it in
+# backup-private/ since Oct 2026; a box whose agent never ran since still has
+# it in the shared backup/ directory. Either way, it is the only copy.
+backup_key_file() {
+  local f
+  for f in "$DATA_DIR/backup-private/repo.pass" "$DATA_DIR/backup/repo.pass"; do
+    [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+backup_env_file() {
+  local f
+  for f in "$DATA_DIR/backup-private/backup.env" "$DATA_DIR/backup/backup.env"; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# Removing $DATA_DIR takes repo.pass with it — and the snapshots in the remote
+# repository stay exactly where they are, encrypted with a key that no longer
+# exists anywhere. Nothing else in this teardown is irreversible in that
+# particular way, so it gets its own warning.
+warn_backup_key() { # warn_backup_key KEY_FILE
+  local repo="" envf
+  envf="$(backup_env_file)" && repo="$(sed -n 's/^BACKUP_REPO=//p' "$envf" | head -1)"
+  cat <<EOF
+    ${c_y}!! BACKUP ENCRYPTION KEY${c_0}
+      $1 is about to be deleted, and it is the only
+      copy. ${repo:+The snapshots in $repo }${repo:-Any existing snapshots }will
+      remain and become permanently unreadable.
+      Save the key first (sudo cat $1), or re-run with KEEP_DATA=1.
+
+EOF
+}
 
 # --- Confirmation ------------------------------------------------------------
 confirm() {
@@ -115,28 +161,25 @@ confirm() {
            else echo "$DATA_DIR — removed, INCLUDING the downloaded models"; fi)
 
 EOF
+  local key_file=""
+  if [[ "$KEEP_DATA" != "1" ]]; then key_file="$(backup_key_file)" || key_file=""; fi
   if [[ "$ASSUME_YES" == "1" ]]; then
+    # The documented `curl | sudo ASSUME_YES=1 bash` form used to delete the
+    # key with no warning at all — the warning lived in the interactive branch
+    # only. Unattended, the only safe answer is to refuse unless the caller has
+    # said, in so many words, that the key is in their hands.
+    if [[ -n "$key_file" && "$I_HAVE_THE_BACKUP_KEY" != "1" ]]; then
+      warn_backup_key "$key_file"
+      die "ASSUME_YES=1 would delete the backup encryption key unattended — refusing.
+    Copy it somewhere safe, then re-run with I_HAVE_THE_BACKUP_KEY=1; or keep
+    $DATA_DIR with KEEP_DATA=1."
+    fi
+    [[ -n "$key_file" ]] && warn_backup_key "$key_file"
     warn "ASSUME_YES=1 — proceeding without confirmation."
     return 0
   fi
   tty_usable || die "No TTY for confirmation. Re-run with ASSUME_YES=1 to proceed non-interactively."
-  # Removing $DATA_DIR takes backup/repo.pass with it — and the snapshots in
-  # the remote repository stay exactly where they are, encrypted with a key
-  # that no longer exists anywhere. Nothing else in this teardown is
-  # irreversible in that particular way, so it gets its own warning.
-  if [[ "$KEEP_DATA" != "1" && -s "$DATA_DIR/backup/repo.pass" ]]; then
-    local repo=""
-    [[ -f "$DATA_DIR/backup/backup.env" ]] && \
-      repo="$(sed -n 's/^BACKUP_REPO=//p' "$DATA_DIR/backup/backup.env" | head -1)"
-    cat <<EOF
-    ${c_y}!! BACKUP ENCRYPTION KEY${c_0}
-      $DATA_DIR/backup/repo.pass is about to be deleted, and it is the only
-      copy. ${repo:+The snapshots in $repo }${repo:-Any existing snapshots }will
-      remain and become permanently unreadable.
-      Save the key first, or re-run with KEEP_DATA=1.
-
-EOF
-  fi
+  [[ -n "$key_file" ]] && warn_backup_key "$key_file"
   local ans=""
   read -r -p "    Type 'yes' to proceed: " ans </dev/tty || true
   [[ "$ans" == "yes" ]] || die "Aborted — nothing was changed."
@@ -353,7 +396,7 @@ summary() {
   [[ "$PRUNE_IMAGES" != "1" ]] && kept+=("the vLLM + nginx Docker images (remove: docker rmi <image>)")
   [[ "$KEEP_DATA" == "1" ]]    && kept+=("$DATA_DIR (kept: KEEP_DATA=1)")
   # Deliberate: deleting a customer's backups is not this script's call.
-  [[ -f "$DATA_DIR/backup/backup.env" ]] && \
+  backup_env_file >/dev/null && \
     kept+=("the remote backup repository and every snapshot in it (never touched)")
   [[ "$KEEP_MODELS" == "1" && "$KEEP_DATA" != "1" ]] && kept+=("$MODELS_DIR (kept: KEEP_MODELS=1)")
   local kept_lines="" k

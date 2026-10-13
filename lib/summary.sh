@@ -153,14 +153,14 @@ AI
     backup_block=" Backups         : NOT installed (SKIP_BACKUP=1)."
   elif [[ -n "${BACKUP_REPO:-}" ]]; then
     backup_block=" Backups         : nightly at $BACKUP_SCHEDULE -> $BACKUP_REPO
-                   keep ${BACKUP_KEEP_DAILY}d/${BACKUP_KEEP_WEEKLY}w/${BACKUP_KEEP_MONTHLY}m ; key fingerprint $(sha256sum "$BACKUP_DIR/repo.pass" 2>/dev/null | cut -c1-12)
+                   keep ${BACKUP_KEEP_DAILY}d/${BACKUP_KEEP_WEEKLY}w/${BACKUP_KEEP_MONTHLY}m ; key fingerprint $(sha256sum "$BACKUP_PRIVATE_DIR/repo.pass" 2>/dev/null | cut -c1-12)
                    Now      : sudo $DATA_DIR/backup.sh run
                    State    : sudo $DATA_DIR/backup.sh status
                    !! The encryption key exists ONLY on this box. Store it."
   else
     backup_block=" Backups         : mechanism installed, NO DESTINATION SET.
                    Nothing is being backed up. To turn it on:
-                     sudo \$EDITOR $BACKUP_DIR/backup.env   (BACKUP_REPO=…)
+                     sudo \$EDITOR $BACKUP_PRIVATE_DIR/backup.env   (BACKUP_REPO=…)
                      sudo $DATA_DIR/backup.sh init && sudo $DATA_DIR/backup.sh run"
   fi
 

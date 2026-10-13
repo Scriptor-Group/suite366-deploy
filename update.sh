@@ -130,16 +130,24 @@ BACKUP_AGENT="$DATA_DIR/backup.sh"
 HOST_LAYER_URL="${HOST_LAYER_URL:-${MANIFEST_URL%/*}/host-layer.sh}"
 HOST_LAYER_STAMP="$DATA_DIR/llm/.host-layer.sha256"
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backup}"
-BACKUP_ENV="${BACKUP_ENV:-$BACKUP_DIR/backup.env}"
+# Root-only sibling of the shared directory: backup.env and repo.pass moved
+# there in Oct 2026 (the pod could write the shared one — backup.sh's header).
+# A box whose agent has not run since still has them in the old place, so both
+# are looked at, the private one first.
+BACKUP_PRIVATE_DIR="${BACKUP_PRIVATE_DIR:-$DATA_DIR/backup-private}"
+BACKUP_ENV="${BACKUP_ENV:-$BACKUP_PRIVATE_DIR/backup.env}"
 RESTIC_BIN="${RESTIC_BIN:-$DATA_DIR/bin/restic}"
 # One line, read deliberately rather than sourcing the file: backup.env also
 # carries the destination's S3 credentials, and the updater has no business
-# holding them even briefly.
-if [[ -f "$BACKUP_ENV" ]]; then
-  _rb="$(sed -n 's/^RESTIC_BIN=//p' "$BACKUP_ENV" | head -1)"
-  [[ -n "$_rb" ]] && RESTIC_BIN="$_rb"
-  unset _rb
-fi
+# holding them even briefly. Only a regular file owned by root is read: the
+# legacy location is writable by the pod.
+for _bf in "$BACKUP_ENV" "$BACKUP_DIR/backup.env"; do
+  [[ ! -L "$_bf" && -f "$_bf" && -O "$_bf" ]] || continue
+  _rb="$(sed -n 's/^RESTIC_BIN=//p' "$_bf" | head -1)"
+  [[ "$_rb" =~ ^/[A-Za-z0-9._/-]+$ ]] && RESTIC_BIN="$_rb"
+  break
+done
+unset _bf _rb
 
 # --- Offline (USB) package source ---------------------------------------------
 # A verified package is COPIED off the removable drive into $OFFLINE_PKG so the
@@ -1662,7 +1670,9 @@ arm_backup_agent() { # arm_backup_agent FRESH(0|1)
   # backup on every daily check, on top of the nightly timer.
   if [[ "$fresh" == 1 ]]; then
     DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
-    if [[ ! -s "$BACKUP_DIR/repo.pass" ]]; then
+    # The run above migrated a legacy key into the private directory if there
+    # was one; the shared path is still checked for a box whose agent could not run.
+    if [[ ! -s "$BACKUP_PRIVATE_DIR/repo.pass" && ! -s "$BACKUP_DIR/repo.pass" ]]; then
       warn "backups are NOT configured on this appliance (no repository key)."
       warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
     fi
@@ -1794,20 +1804,33 @@ vllm_pg_deploy() {
     | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
 }
 
+# The key reaches curl through a header FILE (`-H @file`, curl >= 7.55), never
+# on its argv: /proc/*/cmdline is readable by every local process, and a chat
+# completion probe keeps that argv alive for up to 60 seconds. mktemp's 0600
+# is the whole protection; the file is removed as soon as curl returns.
+vllm_auth_header_file() { # vllm_auth_header_file KEY -> PATH
+  local f=""
+  f="$(mktemp)" || return 1
+  printf 'Authorization: Bearer %s\n' "$1" > "$f"
+  printf '%s' "$f"
+}
+
 # The one curl here that is NOT `-fsS`, and it has to be: `-f` turns a 401 into
 # exit 22 and throws the status code away, and the status code IS the answer.
 # `|| true` sits INSIDE the substitution so curl's own "000" survives a connect
 # failure (it prints 000 and exits 7).
 vllm_http_code() { # vllm_http_code URL KEY TIMEOUT [JSON_BODY]
-  local url="$1" key="$2" tmo="$3" body="${4:-}" code=""
+  local url="$1" key="$2" tmo="$3" body="${4:-}" code="" hdr=""
+  hdr="$(vllm_auth_header_file "$key")" || { printf '000'; return 0; }
   if [[ -n "$body" ]]; then
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+              -H "@$hdr" -H 'Content-Type: application/json' \
               --data-binary "$body" "$url" 2>/dev/null || true)"
   else
     code="$(curl -s -o /dev/null -m "$tmo" -w '%{http_code}' \
-              -H "Authorization: Bearer $key" "$url" 2>/dev/null || true)"
+              -H "@$hdr" "$url" 2>/dev/null || true)"
   fi
+  rm -f "$hdr"
   printf '%s' "${code:-000}"
 }
 

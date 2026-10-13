@@ -21,6 +21,13 @@ setup_backup() {
   # state.json; k8s does not fsGroup-chown a hostPath, so the gid is set here.
   chown root:1001 "$BACKUP_DIR" 2>/dev/null || true
   chmod 0770 "$BACKUP_DIR"
+  # The credentials and the repository key do NOT live in that directory: the
+  # pod can write there, and a file root reads from a place the pod writes is
+  # the pod's file (Oct 2026 review — see the header of backup.sh). 0700, root,
+  # not mounted anywhere.
+  mkdir -p "$BACKUP_PRIVATE_DIR"
+  chown root:root "$BACKUP_PRIVATE_DIR" 2>/dev/null || true
+  chmod 0700 "$BACKUP_PRIVATE_DIR"
 
   install_restic || { warn "backup layer incomplete — restic is missing."; return 0; }
   provision_backup_key
@@ -46,13 +53,13 @@ setup_backup() {
       info "First backup succeeded."
     else
       warn "FIRST BACKUP FAILED — the appliance is installed but NOT backed up."
-      warn "  Fix $BACKUP_DIR/backup.env, then: sudo $DATA_DIR/backup.sh run"
+      warn "  Fix $BACKUP_PRIVATE_DIR/backup.env, then: sudo $DATA_DIR/backup.sh run"
     fi
   else
     # shellcheck disable=SC2097,SC2098  # as above
     DATA_DIR="$DATA_DIR" "$DATA_DIR/backup.sh" run >/dev/null 2>&1 || true
     info "No destination set — timer armed and idle."
-    info "  Configure: $BACKUP_DIR/backup.env, then sudo $DATA_DIR/backup.sh init"
+    info "  Configure: $BACKUP_PRIVATE_DIR/backup.env, then sudo $DATA_DIR/backup.sh init"
   fi
 }
 
@@ -104,7 +111,16 @@ install_restic() {
 # it is load-bearing: a new key on a re-install makes every existing snapshot
 # in the destination unreadable.
 provision_backup_key() {
-  local pass_file="$BACKUP_DIR/repo.pass"
+  local pass_file="$BACKUP_PRIVATE_DIR/repo.pass" legacy="$BACKUP_DIR/repo.pass"
+  # A box installed before the private directory existed has its key in the
+  # shared one. It is moved, not regenerated: the re-install that followed the
+  # update would otherwise mint a second key and orphan every snapshot. Only a
+  # regular file owned by root is a key this installer wrote (backup.sh makes
+  # the same decision in migrate_private_files).
+  if [[ ! -e "$pass_file" && ! -L "$legacy" && -f "$legacy" && -O "$legacy" ]]; then
+    mv -fT -- "$legacy" "$pass_file" && chmod 0600 "$pass_file"
+    info "Repository key moved out of the shared directory into $BACKUP_PRIVATE_DIR."
+  fi
   if [[ -s "$pass_file" ]]; then
     info "Repository key already present (fingerprint $(sha256sum "$pass_file" | cut -c1-12))."
     BACKUP_KEY_IS_NEW=0
@@ -117,19 +133,25 @@ provision_backup_key() {
   chmod 0600 "$pass_file"
   BACKUP_KEY_IS_NEW=1
 
-  # Shown ONCE, at the moment it is created, in the same spirit as the LUKS
+  # Said ONCE, at the moment it is created, in the same spirit as the LUKS
   # recovery key in suite366-fleet: an operator who scrolls past it has to be
-  # told, not left to find out during a restore.
+  # told, not left to find out during a restore. The key ITSELF is not printed
+  # any more: an install log is pasted into tickets and CI output as a matter
+  # of routine (lib/summary.sh says why), and that is how a key that must exist
+  # in exactly two places ended up in a third. The fingerprint is enough to
+  # match the file against the card or the vault.
   cat <<EOF
 
 $(printf "${c_y}────────────────────────────────────────────────────────────────────${c_0}")
-$(printf "${c_b} BACKUP ENCRYPTION KEY — shown once, stored only on this machine${c_0}")
+$(printf "${c_b} BACKUP ENCRYPTION KEY — generated, stored only on this machine${c_0}")
 $(printf "${c_y}────────────────────────────────────────────────────────────────────${c_0}")
 
-    $BACKUP_PASSWORD
+    file        : $pass_file  (0600, root-only)
+    fingerprint : $(sha256sum "$pass_file" | cut -c1-12)
 
  Without this key the backups CANNOT be read. Not by us, not by anyone.
- It lives at $pass_file (0600, root-only) and nowhere else.
+ It is deliberately NOT printed here. Read it now, once:
+    sudo cat $pass_file
 
    • sold appliance  : print it on the card that ships inside the crate
    • rented appliance: suite366-fleet escrows it — record the vault reference
@@ -138,23 +160,27 @@ $(printf "${c_y}─────────────────────�
 $(printf "${c_y}────────────────────────────────────────────────────────────────────${c_0}")
 EOF
   if [[ "$ASSUME_YES" == "1" ]] || ! tty_usable; then
-    warn "ASSUME_YES / no TTY — the key above was NOT confirmed as stored."
-    warn "  Capture it from this output before the terminal scrolls away."
+    warn "ASSUME_YES / no TTY — the key was NOT confirmed as stored."
+    warn "  Copy it out of $pass_file before this box leaves your hands."
   else
     local ack=""
     read -r -p " Type STORED once the key is safe: " ack </dev/tty || true
-    [[ "$ack" == "STORED" ]] || warn "Key not confirmed as stored — do it now; it is not shown again."
+    [[ "$ack" == "STORED" ]] || warn "Key not confirmed as stored — do it now: sudo cat $pass_file"
   fi
 }
 
 write_backup_env() {
   # 0600: carries the destination's S3 credentials. Not merged into update.env
   # on purpose — that file is non-secret config an operator edits freely, and
-  # keeping the two apart keeps the blast radius of a stray `cat` small.
+  # keeping the two apart keeps the blast radius of a stray `cat` small. In
+  # the PRIVATE directory: backup.sh reads it key by key, and the pod must
+  # never be able to replace it. A stale copy in the shared directory is
+  # removed by backup.sh's migration on its first run.
   ( umask 077
-    cat > "$BACKUP_DIR/backup.env" <<EOF
+    cat > "$BACKUP_PRIVATE_DIR/backup.env" <<EOF
 # Suite 366 backup destination + retention. Written by install.sh; edit by hand
-# (or, from lot C, from the app UI). 0600 — carries credentials.
+# (or, from lot C, from the app UI). 0600 — carries credentials. Read key by
+# key by backup.sh, never sourced: one value per line, no shell syntax.
 #
 # Any restic backend works; S3 is the intended one:
 #   BACKUP_REPO=s3:s3.fr-par.scw.cloud/<bucket>/<machine-id>
@@ -172,5 +198,5 @@ KUBECONFIG_PATH=$KUBECONFIG_PATH
 RESTIC_BIN=$RESTIC_BIN
 EOF
   )
-  chmod 0600 "$BACKUP_DIR/backup.env"
+  chmod 0600 "$BACKUP_PRIVATE_DIR/backup.env"
 }

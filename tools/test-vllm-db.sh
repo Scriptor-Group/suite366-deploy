@@ -181,6 +181,11 @@ contains "$out" "VERDICT=unknown" "a proxy that never answered -> unknown, NOT a
 contains "$out" "models can still be loading" "…and says why"
 check "…after retrying (6 attempts on a deep check)" 6 "$(grep -c '/v1/models' "$CLOG")"
 absent "$(cat "$CLOG")" " -f " "curl never uses -f: it would turn a 401 into exit 22 and lose the code"
+# /proc/*/cmdline is readable by every local process, and a chat probe holds
+# its argv for up to 60 s: the key travels in a 0600 header file (-H @file).
+absent "$(cat "$CLOG")" "$KEY" "the key never appears on curl's argv"
+contains "$(cat "$CLOG")" "-H @" "…it goes through a header file instead"
+check "…and the header file does not outlive the call" 0 "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'tmp.*' -newer "$WORK/prelude.sh" -user "$(id -un)" -size -1k -exec grep -l 'Authorization: Bearer' {} + 2>/dev/null | wc -l)"
 reset; printf 'rows\n' > "$WORK/pg-out"
 out="$(run "verify_vllm_db_key '$URL' 1")"; RC=$?
 contains "$out" "VERDICT=norow" "table present but no row yet -> norow (fresh install)"
@@ -226,8 +231,8 @@ check "the gate fails the install on 'stale'" 1 "$RC"
 contains "$out" "STORED IN POSTGRES" "…naming the copy at fault"
 
 printf '\n== the three copies cannot drift ==\n'
-for f in vllm_key_sane vllm_url_sane vllm_row_scope vllm_pg_deploy vllm_http_code vllm_verdict \
-         reconcile_vllm_db_key verify_vllm_db_key vllm_local_env reconcile_and_check_vllm_db; do
+for f in vllm_key_sane vllm_url_sane vllm_row_scope vllm_pg_deploy vllm_auth_header_file vllm_http_code \
+         vllm_verdict reconcile_vllm_db_key verify_vllm_db_key vllm_local_env reconcile_and_check_vllm_db; do
   body="$(sed -n "/^$f() {/,/^}/p" "$REPO/lib/vllm-db.sh")"
   # Not padding: without this, a renamed function extracts to three empty
   # strings that compare equal, and the test would pass while guarding nothing
