@@ -3,17 +3,11 @@
   "chart_version": "0.10.3",
   "app_version": "1.14.0",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
-<<<<<<< HEAD
-  "updater_sha256": "fdecdda8211bda7b8c8d175e6bca8d6c18a945e0d1205f7d973a8cc0f903c428",
-  "backup_sha256": "ddfc08bc36eea900c71b69da1efbff4e7d87fa65fba19532d1ddd63587e28022",
-  "host_layer_sha256": "5d7ed1b41fd76f275a88c2a7dd9636c669ce5eafd010cc74228c4b4e01afb364",
-  "serial": "1791902190",
-  "expires": "2027-10-13T14:36:30Z",
-=======
-  "updater_sha256": "60426d916a4833a9dcc4910c5e784bd7e7b3897a08e8b632af40893b8158723d",
+  "updater_sha256": "22232a9509671fff8b679047616f4c5805248d836f112c621564bf36b3424a73",
   "backup_sha256": "1433dd51ade0b9273a23a3cccbdb695f35caf8244ac1fd4053d77b9ebe29ab2c",
-  "host_layer_sha256": "5701985b0d3a463710e4cd32123890ec31721efaa43ea48cf7eb09f5be249d5c",
->>>>>>> origin/fix/backup-bridge-hardening
+  "host_layer_sha256": "a012729852a39ed1b56a388b67dc9699ecdfa9de6dc1aac00ac4dfd0cfb9769c",
+  "serial": "1791909689",
+  "expires": "2027-10-13T16:41:29Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
