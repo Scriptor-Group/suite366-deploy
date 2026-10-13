@@ -56,7 +56,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 H
   printf 'DATA_DIR=%s\nSYSTEMD_DIR=%s\nNM_DISPATCHER_DIR=%s\n' "$WORK/data" "$WORK/systemd" "$WORK/nm"
   # The paths and the helpers, as update.sh defines them.
-  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^PRIVATE_DIR=/p; /^POWER_PENDING=/p; /^POWER_PENDING_LEGACY=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p' "$REPO/update.sh"
+  sed -n '/^UPDATES_DIR=/p; /^STATE_JSON=/p; /^APPLY_JSON=/p; /^POWER_JSON=/p; /^PRIVATE_DIR=/p; /^POWER_PENDING=/p; /^POWER_PENDING_LEGACY=/p; /^HOST_JSON=/p; /^APP_GID=/p; /^TRIGGER_WHO=/p; /^TRIGGER_REFUSED=/p' "$REPO/update.sh"
   sed -n '/^now_utc() {/,/}$/p' "$REPO/update.sh"
   for f in json_esc ensure_updates_dir private_tmp publish_file trigger_ok consume_trigger write_power_json do_power host_lan_interfaces write_host_json install_units; do
     sed -n "/^$f() {/,/^}/p" "$REPO/update.sh"
@@ -164,7 +164,11 @@ echo "== the shared directory is pod-writable: what root reads and writes there 
 reset_box; run "ensure_updates_dir" >/dev/null
 printf 'root:x:0:0\n' > "$WORK/secret"; ln -s "$WORK/secret" "$WORK/data/updates/reboot-requested"
 out="$(run "do_power reboot")"; RC=$?
-check "a symlinked trigger exits 0 (the reboot still happens, as an operator request)" "$RC" "0"
+check "a symlinked trigger exits 0" "$RC" "0"
+# …and does NOTHING: seen for real on gb10-812nqm4 (2026-10-13), the refused
+# request still rebooted the box.
+if [[ -f "$WORK/systemctl.log" ]] && grep -q reboot "$WORK/systemctl.log"; then ko "…and the machine is NOT rebooted"; else ok "…and the machine is NOT rebooted"; fi
+contains "…the operator is told nothing was done" "$out" "nothing done"
 if [[ -e "$WORK/data/updates/reboot-requested" || -L "$WORK/data/updates/reboot-requested" ]]; then ko "the symlink is removed"; else ok "the symlink is removed"; fi
 contains "…and refused by name" "$out" "not a regular file"
 absent "…nothing read through it lands in power.json" "$(cat "$WORK/data/updates/power.json")" "root:x:0:0"
