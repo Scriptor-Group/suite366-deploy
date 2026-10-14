@@ -481,30 +481,51 @@ pvc_host_path() { # pvc_host_path PVC_NAME
 # The password never leaves the cluster and never appears in an argv: the
 # postgres pod already holds POSTGRES_* in its environment, so the dump command
 # reads them there.
+#
+# The dump lands in a file BEFORE restic sees it. It used to be piped straight
+# into `restic backup --stdin`, and restic reads nothing until it has locked the
+# repository and loaded the index from S3: the `kubectl exec` stream sat blocked
+# behind it long enough for the API server to reset the connection, and the
+# nightly run on gb10-812nqm4 failed with a truncated dump on 4 of 8 nights
+# (2026-10-10 → 10-14). The dump itself takes 0.2 s for 21 MB; it was never the
+# slow part. A file in $PRIVATE_DIR (root, 0700) decouples the two, and a short
+# retry covers an API server that really did drop one stream.
+dump_postgres() { # dump_postgres DEPLOY FILE -> 0 when FILE holds a complete dump
+  local deploy="$1" out="$2" try
+  for try in 1 2 3; do
+    if ( umask 077; kc -n "$NAMESPACE" exec "deploy/$deploy" -- \
+           sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
+           > "$out" ) && [[ "$(head -c 5 "$out" 2>/dev/null)" == "PGDMP" ]]
+    then
+      return 0
+    fi
+    warn "pg_dump attempt $try/3 failed."
+    [[ $try -lt 3 ]] && sleep "${PG_DUMP_RETRY_DELAY:-5}"
+  done
+  rm -f "$out"
+  return 1
+}
+
 backup_postgres() {
-  local deploy; deploy="$(discover_pg)"
+  local deploy dump="$PRIVATE_DIR/postgres.dump.partial"
+  deploy="$(discover_pg)"
   [[ -n "$deploy" ]] || { warn "no *-postgres deployment in ns/$NAMESPACE — skipping the database."; return 1; }
   info "postgres: pg_dump from deploy/$deploy"
-  # `if` rather than `|| rc=1`: PIPESTATUS survives only until the next
-  # pipeline, and an assignment IS one — reading it after `|| rc=1` yields the
-  # assignment's status, not the dump's. Under `set -u` that then blew up on
-  # the unset second element and killed the whole run.
-  if kc -n "$NAMESPACE" exec "deploy/$deploy" -- \
-       sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
-     | res backup --stdin --stdin-filename postgres.dump --tag suite366 --tag postgres
-  then
+  # A pg_dump that dies mid-stream still leaves a storable TRUNCATED file. That
+  # is the worst outcome available — it looks like a successful backup until
+  # someone restores it — so it fails the run rather than warning inside a
+  # success. dump_postgres only returns 0 on a clean exit with the magic bytes.
+  if ! dump_postgres "$deploy" "$dump"; then
+    warn "pg_dump failed — refusing to count a truncated dump as a backup."
+    return 1
+  fi
+  # Same snapshot shape as before (stdin, postgres.dump): restore is unchanged.
+  if res backup --stdin --stdin-filename postgres.dump --tag suite366 --tag postgres < "$dump"; then
+    rm -f "$dump"
     return 0
   fi
-  # Which side failed matters: a pg_dump that dies mid-stream still hands
-  # restic a perfectly storable TRUNCATED dump. That is the worst outcome
-  # available — it looks like a successful backup until someone restores it —
-  # so it is reported as a failure of the run, not a warning inside a success.
-  local st=("${PIPESTATUS[@]}")
-  if [[ "${st[0]:-1}" != "0" ]]; then
-    warn "pg_dump failed (exit ${st[0]:-?}) — refusing to count a truncated dump as a backup."
-  else
-    warn "restic refused the database stream (exit ${st[1]:-?})."
-  fi
+  rm -f "$dump"
+  warn "restic refused the database dump."
   return 1
 }
 
@@ -916,13 +937,15 @@ EOF
     | res backup --stdin --stdin-filename pre-restore-app-secret.yaml \
         --tag suite366 --tag pre-restore >/dev/null \
     || warn "could not snapshot the current secret — continuing, but this restore is now one-way."
-  if kc -n "$NAMESPACE" exec "deploy/$pg_deploy" -- \
-       sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
-     | res backup --stdin --stdin-filename pre-restore-postgres.dump \
-         --tag suite366 --tag pre-restore >/dev/null
+  # Through a file, like the nightly dump (see dump_postgres).
+  local pre_dump="$PRIVATE_DIR/pre-restore-postgres.dump.partial"
+  if dump_postgres "$pg_deploy" "$pre_dump" \
+     && res backup --stdin --stdin-filename pre-restore-postgres.dump \
+          --tag suite366 --tag pre-restore < "$pre_dump" >/dev/null
   then info "pre-restore snapshot stored."
   else warn "could not dump the current database — continuing, but this restore is now one-way."
   fi
+  rm -f "$pre_dump"
 
   # --- 3. stop the writers ------------------------------------------------------
   log "3/8  Stopping the app"
