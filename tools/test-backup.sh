@@ -141,6 +141,8 @@ case "\$args" in
     # The dump itself. With \$WORK/pg-fails present it writes a few bytes and
     # THEN fails, which is precisely the truncated-dump case.
     if [[ -f "$WORK/pg-fails" ]]; then printf 'PGDMP-trunc'; exit 1; fi
+    # \$WORK/pg-fails-once: the API server drops ONE stream, then all is well.
+    if [[ -f "$WORK/pg-fails-once" ]]; then rm -f "$WORK/pg-fails-once"; printf 'PGDMP-trunc'; exit 1; fi
     printf 'PGDMP-fake-dump-content'; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -176,7 +178,7 @@ mkdir -p "$BACKUP_DIR"
 # and the caches live here since the Oct 2026 review (backup.sh header).
 PRIV="$DATA/backup-private"
 
-bk() { "$DATA/backup.sh" "$@" >"$WORK/out" 2>&1 </dev/null; }
+bk() { PG_DUMP_RETRY_DELAY=0 "$DATA/backup.sh" "$@" >"$WORK/out" 2>&1 </dev/null; }
 out() { cat "$WORK/out"; }
 state() { cat "$BACKUP_DIR/state.json" 2>/dev/null; }
 field() { sed -n "s/.*\"$1\": *\"\\([^\"]*\\)\".*/\\1/p" "$BACKUP_DIR/state.json" | head -1; }
@@ -240,7 +242,19 @@ bk run; rc=$?
 check "a failed pg_dump makes the run fail" "$rc" "1"
 check "last_run.status is 'partial', not success" "$(field status)" "partial"
 contains "the failing component is named" "postgres" "$(field error)"
+contains "it was retried before giving up" "attempt 3/3" "$(out)"
+absent "no truncated dump reaches restic" "--stdin-filename postgres.dump" "$(cat "$RLOG")"
+check "the partial dump is not left behind" "$(ls "$PRIV"/*.partial 2>/dev/null | wc -l)" "0"
 rm -f "$WORK/pg-fails"
+
+echo "== one dropped exec stream is retried (gb10-812nqm4, 2026-10-10 → 10-14) =="
+touch "$WORK/pg-fails-once"; : > "$RLOG"
+bk run; rc=$?
+check "a single dropped stream does not fail the run" "$rc" "0"
+check "last_run.status is 'success'" "$(field status)" "success"
+contains "the retry is visible in the log" "attempt 1/3 failed" "$(out)"
+contains "the second dump is stored" "--stdin-filename postgres.dump" "$(cat "$RLOG")"
+check "the staged dump is removed after the upload" "$(ls "$PRIV"/*.partial 2>/dev/null | wc -l)" "0"
 
 echo "== an uninitialised repository is initialised =="
 touch "$WORK/no-repo"; : > "$RLOG"
