@@ -41,12 +41,30 @@ deploy_suite() {
   # lines in values.yaml carry a `#@local` tag — stripped when they apply,
   # deleted line by line when they do not. Both states are valid YAML, so the
   # template can be read and diffed as the file that actually ships.
-  local local_lines origins=""
+  #
+  # Proxy mode uses the same device twice more: `#@proxy` lines (the alias
+  # wildcard on the app Ingress, AUTH_TRUST_HOST) exist only there, `#@!proxy`
+  # lines (AUTH_URL, the native-only TLS host list) everywhere else. And
+  # APPLIANCE_ORIGINS, tagged `#@origins`, is rendered whenever there is more
+  # than the canonical origin to describe: LAN names, or proxy aliases, or both.
+  local local_lines proxy_lines notproxy_lines origins_lines origins=""
   if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
     local_lines='s|[[:space:]]*#@local$||'
-    origins="$(appliance_origins_json)"
   else
     local_lines='/#@local$/d'
+  fi
+  if [[ "$HOST_MODE" == "proxy" ]]; then
+    proxy_lines='s|[[:space:]]*#@proxy$||'
+    notproxy_lines='/#@!proxy$/d'
+  else
+    proxy_lines='/#@proxy$/d'
+    notproxy_lines='s|[[:space:]]*#@!proxy$||'
+  fi
+  if [[ -n "${LOCAL_APP_HOST:-}" || "$HOST_MODE" == "proxy" ]]; then
+    origins="$(appliance_origins_json)"
+    origins_lines='s|[[:space:]]*#@origins$||'
+  else
+    origins_lines='/#@origins$/d'
   fi
   local cert_annotation turn_cert_manager
   if [[ "$TLS_MODE" == "provided" || "$TLS_MODE" == "pushed" ]]; then
@@ -63,6 +81,9 @@ deploy_suite() {
   ( umask 077
     fetch "values.yaml" \
       | sed -e "$local_lines" \
+            -e "$proxy_lines" \
+            -e "$notproxy_lines" \
+            -e "$origins_lines" \
             -e "s|@DOMAIN@|$DOMAIN|g" \
             -e "s|@APP_HOST@|$APP_HOST|g" \
             -e "s|@OFFICE_HOST@|$OFFICE_HOST|g" \
@@ -159,11 +180,32 @@ deploy_suite() {
 # Both names are listed, not just the LAN one: an entry that merely restates
 # the canonical origin costs nothing and makes the mapping readable on the box
 # instead of implied by a fallback.
+#
+# In proxy mode a third, wildcard entry covers the aliases Scriptor may add on
+# the proxy at any time (`acme.box.diwy.ai` for a box natively `f94b52`): the
+# app and its socket follow the alias the browser used (`{host}` is filled in
+# by the app per request), OnlyOffice and LiveKit stay on the native
+# infrastructure names, which never change. The app matches it one label deep
+# and lets the exact entries win.
 appliance_origins_json() {
-  printf '[{"host":"%s","appUrl":"https://%s","wsUrl":"wss://%s","officeUrl":"https://%s","livekitUrl":"wss://%s"},' \
-    "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST"
-  printf '{"host":"%s","appUrl":"https://%s","wsUrl":"wss://%s","officeUrl":"https://%s","livekitUrl":"wss://%s"}]' \
-    "$APP_HOST" "$APP_HOST" "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST"
+  local fmt='{"host":"%s","appUrl":"https://%s","wsUrl":"wss://%s","officeUrl":"https://%s","livekitUrl":"wss://%s"}'
+  local -a entries=()
+  local e
+  if [[ -n "${LOCAL_APP_HOST:-}" ]]; then
+    # shellcheck disable=SC2059  # the format is the constant above
+    e="$(printf "$fmt" "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_APP_HOST" "$LOCAL_OFFICE_HOST" "$LOCAL_LIVEKIT_HOST")"
+    entries+=("$e")
+  fi
+  # shellcheck disable=SC2059
+  e="$(printf "$fmt" "$APP_HOST" "$APP_HOST" "$APP_HOST" "$OFFICE_HOST" "$LIVEKIT_HOST")"
+  entries+=("$e")
+  if [[ "${HOST_MODE:-}" == "proxy" ]]; then
+    # shellcheck disable=SC2059
+    e="$(printf "$fmt" "*.$DOMAIN" "{host}" "{host}" "$OFFICE_HOST" "$LIVEKIT_HOST")"
+    entries+=("$e")
+  fi
+  local IFS=,
+  printf '[%s]' "${entries[*]}"
 }
 
 

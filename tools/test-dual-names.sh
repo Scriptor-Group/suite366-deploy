@@ -13,6 +13,10 @@
 #   • the two names not serving the same thing. The public host routes
 #     /socket.io/, /wb-desktop/ and /dav/ to port 3001; a LAN host that only
 #     got `/` looks perfect until someone opens a document or a meeting.
+#   • the proxy-mode alias wildcard (`#@proxy`) either leaking into a box that
+#     is not published, or missing a route / the AUTH_URL swap on one that is.
+#     An alias added on the proxy later must work without touching the box,
+#     so whatever it needs has to be in the render from day one.
 #
 # The substitution pipeline is EXTRACTED from lib/suite.sh rather than copied,
 # so a token added there and forgotten here shows up as an unsubstituted
@@ -54,28 +58,25 @@ export LICENSE_KEY=eyJhbGciOiJFZERTQSJ9.eyJzY29wZSI6Imluc3RhbmNlIn0.c2ln ADMIN_E
 fetch() { cat "$REPO/$1"; }
 export -f fetch
 
-# Pull the two things that decide the outcome straight out of lib/suite.sh:
-# the `#@local` expressions, and the sed pipeline they feed.
+# Pull the three things that decide the outcome straight out of lib/suite.sh:
+# the tag expressions (`#@local`, `#@proxy`, `#@!proxy`, `#@origins`), the
+# origins JSON, and the sed pipeline they feed.
 eval "$(sed -n '/^appliance_origins_json() {/,/^}/p' "$REPO/lib/suite.sh")"
+TAGS="$(awk '/^  local local_lines /,/^  local cert_annotation/' "$REPO/lib/suite.sh" | sed '$d')"
+[[ "$TAGS" == *proxy_lines* ]] || { echo "could not extract the tag expressions from lib/suite.sh"; exit 1; }
 PIPELINE="$(awk '/\| sed -e "\$local_lines"/,/> "\$vals" \)/' "$REPO/lib/suite.sh" \
             | sed -e 's|> "\$vals" )||' -e '$ s|\\[[:space:]]*$||')"
 [[ -n "$PIPELINE" ]] || { echo "could not extract the sed pipeline from lib/suite.sh"; exit 1; }
 
-render() { # render <keep-local:0|1> <outfile>
-  local keep="$1" out="$2"
-  if (( keep )); then
-    local_lines='s|[[:space:]]*#@local$||'
-    LOCAL_APP_HOST=drive.suite366.local
-    origins="$(appliance_origins_json)"
-  else
-    local_lines='/#@local$/d'
-    LOCAL_APP_HOST=""; origins=""
-  fi
+render() { # render <HOST_MODE> <with-LAN-names:0|1> <outfile>
+  local HOST_MODE="$1" lan="$2" out="$3" LOCAL_APP_HOST=""
+  (( lan )) && LOCAL_APP_HOST=drive.suite366.local
+  eval "$TAGS"
   eval "fetch values.yaml $PIPELINE" > "$out"
 }
 
 echo "== a box without LAN names renders exactly what it always did =="
-render 0 "$WORK/plain.yaml"
+render mdns 0 "$WORK/plain.yaml"
 # `@[A-Z_]@`, not a bare `@`: values.yaml legitimately contains an e-mail
 # address, and the comment header names the tokens it documents.
 left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/plain.yaml" | sort -u | tr '\n' ' ')"
@@ -84,7 +85,13 @@ left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/plain.yaml" | sort -u | tr '\n' ' ')"
 sed 's/#.*//' "$WORK/plain.yaml" | grep -q 'suite366[.]local' \
   && ko "no LAN name survives" "$(sed 's/#.*//' "$WORK/plain.yaml" | grep -n 'suite366[.]local' | head -1)" \
   || ok "no LAN name survives"
-grep -q '#@local$' "$WORK/plain.yaml" && ko "no marker survives" || ok "no marker survives"
+grep -Eq '#@(local|!?proxy|origins)$' "$WORK/plain.yaml" && ko "no marker survives" || ok "no marker survives"
+sed 's/#.*//' "$WORK/plain.yaml" | grep -q '[*][.]' \
+  && ko "no alias wildcard outside proxy mode" || ok "no alias wildcard outside proxy mode"
+grep -q '^  AUTH_URL: https://acme.box.diwy.ai$' "$WORK/plain.yaml" \
+  && ok "AUTH_URL is still pinned outside proxy mode" || ko "AUTH_URL is still pinned outside proxy mode"
+grep -q 'AUTH_TRUST_HOST' "$WORK/plain.yaml" \
+  && ko "no AUTH_TRUST_HOST outside proxy mode" || ok "no AUTH_TRUST_HOST outside proxy mode"
 grep -q 'APPLIANCE_ORIGINS' "$WORK/plain.yaml" \
   && ko "APPLIANCE_ORIGINS is absent (the app keeps its single canonical origin)" \
   || ok "APPLIANCE_ORIGINS is absent (the app keeps its single canonical origin)"
@@ -100,7 +107,7 @@ fi
 # An unlicensed box renders an EMPTY value, not a missing key or a broken file:
 # the app's trim() reads "" as "no licence", and the daily converge never has
 # to add the line later.
-( export LICENSE_KEY=""; render 0 "$WORK/unlicensed.yaml" )
+( export LICENSE_KEY=""; render mdns 0 "$WORK/unlicensed.yaml" )
 grep -q '^  LICENSE_KEY: ""$' "$WORK/unlicensed.yaml" \
   && ok "an unlicensed box renders an empty LICENSE_KEY (valid YAML, nothing to add later)" \
   || ko "an unlicensed box renders an empty LICENSE_KEY (valid YAML, nothing to add later)"
@@ -122,13 +129,17 @@ if [[ -f "$GOLDEN" ]]; then
 else
   ko "golden render present" "$GOLDEN missing — generate it with UPDATE_GOLDEN=1"
 fi
+# HOST_MODE=dns takes the same branches as mdns (no LAN names, not proxy).
+render dns 0 "$WORK/plain-dns.yaml"
+cmp -s "$WORK/plain.yaml" "$WORK/plain-dns.yaml" \
+  && ok "HOST_MODE=dns renders the same file" || ko "HOST_MODE=dns renders the same file"
 
 echo "== a published box serves both names =="
-render 1 "$WORK/dual.yaml"
+render proxy 1 "$WORK/dual.yaml"
 left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/dual.yaml" | sort -u | tr '\n' ' ')"
 [[ -z "$left" ]] && ok "every token is substituted" || ko "every token is substituted" "$left"
 # Anchored: the header comment quotes `#@local` when explaining the mechanism.
-grep -q '#@local$' "$WORK/dual.yaml" && ko "no marker survives" || ok "no marker survives"
+grep -Eq '#@(local|!?proxy|origins)$' "$WORK/dual.yaml" && ko "no marker survives" || ok "no marker survives"
 grep -q -- '- host: acme.box.diwy.ai' "$WORK/dual.yaml" \
   && ok "the public name is an app ingress host" || ko "the public name is an app ingress host"
 grep -q -- '- host: drive.suite366.local' "$WORK/dual.yaml" \
@@ -162,32 +173,115 @@ grep -q '^  APP_URL: https://acme.box.diwy.ai$' "$WORK/dual.yaml" \
   && ok "APP_URL stays canonical (public)" || ko "APP_URL stays canonical (public)"
 grep -q '^  ONLYOFFICE_URL: https://acme-office.box.diwy.ai$' "$WORK/dual.yaml" \
   && ok "ONLYOFFICE_URL stays canonical (public)" || ko "ONLYOFFICE_URL stays canonical (public)"
+grep -q '^  LIVEKIT_PUBLIC_URL: wss://acme-livekit.box.diwy.ai$' "$WORK/dual.yaml" \
+  && ok "LIVEKIT_PUBLIC_URL stays the native infra name" || ko "LIVEKIT_PUBLIC_URL stays the native infra name"
+grep -q '^  WS_URL: wss://acme.box.diwy.ai$' "$WORK/dual.yaml" \
+  && ok "WS_URL stays native (server-side DAV base; browsers get theirs from APPLIANCE_ORIGINS)" \
+  || ko "WS_URL stays native (server-side DAV base; browsers get theirs from APPLIANCE_ORIGINS)"
+
+echo "== aliases added on the proxy work without touching the box =="
+grep -q '^ *AUTH_URL:' "$WORK/dual.yaml" \
+  && ko "AUTH_URL is NOT set (Auth.js follows the request host)" "$(grep -n '^ *AUTH_URL:' "$WORK/dual.yaml")" \
+  || ok "AUTH_URL is NOT set (Auth.js follows the request host)"
+grep -q '^  AUTH_TRUST_HOST: "true"$' "$WORK/dual.yaml" \
+  && ok "AUTH_TRUST_HOST is \"true\"" || ko "AUTH_TRUST_HOST is \"true\""
+grep -q -- '- host: "\*.box.diwy.ai"' "$WORK/dual.yaml" \
+  && ok "the alias wildcard is an app ingress host" || ko "the alias wildcard is an app ingress host"
+grep -q '^      hosts: \[acme.box.diwy.ai, "\*.box.diwy.ai"\]$' "$WORK/dual.yaml" \
+  && ok "drive-tls lists the wildcard next to the native name" \
+  || ko "drive-tls lists the wildcard next to the native name"
+grep -q '"host":"\*.box.diwy.ai","appUrl":"https://{host}","wsUrl":"wss://{host}","officeUrl":"https://acme-office.box.diwy.ai","livekitUrl":"wss://acme-livekit.box.diwy.ai"}' <<<"$o" \
+  && ok "APPLIANCE_ORIGINS maps the wildcard to {host} + the native office/livekit" \
+  || ko "APPLIANCE_ORIGINS maps the wildcard to {host} + the native office/livekit" "$o"
+
+echo "== a published box without LAN names =="
+render proxy 0 "$WORK/proxy.yaml"
+left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/proxy.yaml" | sort -u | tr '\n' ' ')"
+[[ -z "$left" ]] && ok "every token is substituted" || ko "every token is substituted" "$left"
+grep -Eq '#@(local|!?proxy|origins)$' "$WORK/proxy.yaml" && ko "no marker survives" || ok "no marker survives"
+sed 's/#.*//' "$WORK/proxy.yaml" | grep -q 'suite366[.]local' \
+  && ko "no LAN name survives" || ok "no LAN name survives"
+op="$(sed -n "s/.*APPLIANCE_ORIGINS: '\(.*\)'.*/\1/p" "$WORK/proxy.yaml")"
+[[ "$op" == '[{"host":"acme.box.diwy.ai",'*'{"host":"*.box.diwy.ai",'*']' ]] \
+  && ok "APPLIANCE_ORIGINS is still rendered (native + wildcard)" \
+  || ko "APPLIANCE_ORIGINS is still rendered (native + wildcard)" "$op"
+grep -q '^ *AUTH_URL:' "$WORK/proxy.yaml" && ko "AUTH_URL is NOT set" || ok "AUTH_URL is NOT set"
+grep -q '^  AUTH_TRUST_HOST: "true"$' "$WORK/proxy.yaml" \
+  && ok "AUTH_TRUST_HOST is \"true\"" || ko "AUTH_TRUST_HOST is \"true\""
+grep -q '^  APP_URL: https://acme.box.diwy.ai$' "$WORK/proxy.yaml" \
+  && ok "APP_URL is the native name" || ko "APP_URL is the native name"
 
 # Structural checks need a YAML parser. Optional, like the real-restic half of
 # tools/test-backup.sh: absent, the greps above already cover the failures that
 # produced a broken box.
 if python3 -c 'import yaml' 2>/dev/null; then
   echo "== structure (PyYAML) =="
-  out="$(python3 - "$WORK/dual.yaml" "$WORK/plain.yaml" <<'PY'
+  out="$(python3 - "$WORK/dual.yaml" "$WORK/plain.yaml" "$WORK/proxy.yaml" <<'PY'
 import sys, json, yaml
 dual = yaml.safe_load(open(sys.argv[1])); plain = yaml.safe_load(open(sys.argv[2]))
+proxy = yaml.safe_load(open(sys.argv[3]))
+WILD = "*.box.diwy.ai"
 def check(label, cond, detail=""):
     print(("PASS " if cond else "FAIL ") + label + ((" — " + str(detail)) if not cond and detail else ""))
 h = dual["ingress"]["hosts"]
-check("two app ingress hosts", len(h) == 2, [x["host"] for x in h])
-check("both serve the same paths", h[0]["paths"] == h[1]["paths"],
+check("three app ingress hosts: native, alias wildcard, LAN",
+      [x["host"] for x in h] == ["acme.box.diwy.ai", WILD, "drive.suite366.local"],
+      [x["host"] for x in h])
+check("all serve the same paths", all(x["paths"] == h[0]["paths"] for x in h),
       [[p["path"] for p in x["paths"]] for x in h])
-check("both route socket.io/dav to port 3001",
+check("all route socket.io/dav to port 3001",
       all(p["port"] == 3001 for x in h for p in x["paths"] if p["path"] != "/"))
 t = dual["ingress"]["tls"]
-check("one TLS entry per host", sorted(x for e in t for x in e["hosts"]) ==
-      sorted(x["host"] for x in h), t)
-check("the two TLS secrets are distinct", t[0]["secretName"] != t[1]["secretName"], t)
+check("every app host is covered by exactly one TLS entry",
+      sorted(x for e in t for x in e["hosts"]) == sorted(x["host"] for x in h), t)
+check("the wildcard rides on the native secret (drive-tls), the LAN name has its own",
+      {e["secretName"]: e["hosts"] for e in t} ==
+      {"drive-tls": ["acme.box.diwy.ai", WILD], "drive-local-tls": ["drive.suite366.local"]}, t)
 o = json.loads(dual["config"]["APPLIANCE_ORIGINS"])
-check("APPLIANCE_ORIGINS is valid JSON with both names",
+check("APPLIANCE_ORIGINS is valid JSON with every app host",
       {e["host"] for e in o} == {x["host"] for x in h}, o)
 check("every origin carries all four URLs",
       all({"appUrl","wsUrl","officeUrl","livekitUrl"} <= set(e) for e in o))
+w = [e for e in o if e["host"] == WILD]
+check("the wildcard origin follows the request host for app/ws, native names for office/livekit",
+      w == [{"host": WILD, "appUrl": "https://{host}", "wsUrl": "wss://{host}",
+             "officeUrl": "https://acme-office.box.diwy.ai",
+             "livekitUrl": "wss://acme-livekit.box.diwy.ai"}], w)
+c = dual["config"]
+check("proxy config: AUTH_TRUST_HOST, no AUTH_URL, APP_URL native",
+      c.get("AUTH_TRUST_HOST") == "true" and "AUTH_URL" not in c
+      and c["APP_URL"] == "https://acme.box.diwy.ai", {k: c.get(k) for k in ("AUTH_URL","AUTH_TRUST_HOST","APP_URL")})
+ph = proxy["ingress"]["hosts"]
+check("proxy without LAN: native + wildcard, same paths",
+      [x["host"] for x in ph] == ["acme.box.diwy.ai", WILD] and ph[0]["paths"] == ph[1]["paths"],
+      [x["host"] for x in ph])
+check("proxy without LAN: one TLS entry, drive-tls with both",
+      proxy["ingress"]["tls"] == [{"secretName": "drive-tls", "hosts": ["acme.box.diwy.ai", WILD]}],
+      proxy["ingress"]["tls"])
+po = json.loads(proxy["config"]["APPLIANCE_ORIGINS"])
+check("proxy without LAN: origins = native + wildcard",
+      [e["host"] for e in po] == ["acme.box.diwy.ai", WILD], po)
+check("proxy without LAN: no extraHosts",
+      proxy["onlyoffice"]["ingress"].get("extraHosts") is None and
+      proxy["livekit"]["ingress"].get("extraHosts") is None)
+# Traefik turns `*.box.diwy.ai` into a HostRegexp whose default priority (rule
+# length) beats `Host(<native>-office...)`: without a pinned priority the app
+# would answer on the OnlyOffice and LiveKit names.
+def longest_wild(paths):
+    rx = "HostRegexp(`^[a-zA-Z0-9-]+\\.box\\.diwy\\.ai$`)"
+    return max(len(rx + " && PathPrefix(`" + p["path"] + "`)") for p in paths)
+for name, doc in (("proxy+LAN", dual), ("proxy", proxy)):
+    lw = longest_wild(doc["ingress"]["hosts"][1]["paths"])
+    for svc in ("onlyoffice", "livekit"):
+        a = (doc[svc]["ingress"].get("annotations") or {})
+        pr = int(a.get("traefik.ingress.kubernetes.io/router.priority", "0"))
+        check(f"{name}: {svc} router.priority ({pr}) outranks the alias wildcard (max {lw})", pr > lw, a)
+for svc in ("onlyoffice", "livekit"):
+    check(f"a plain box: no router.priority on {svc}", not plain[svc]["ingress"].get("annotations"))
+check("a plain box keeps AUTH_URL and has no AUTH_TRUST_HOST",
+      plain["config"].get("AUTH_URL") == "https://acme.box.diwy.ai" and "AUTH_TRUST_HOST" not in plain["config"])
+check("a plain box: TLS hosts == rule hosts",
+      plain["ingress"]["tls"] == [{"secretName": "drive-tls", "hosts": ["acme.box.diwy.ai"]}], plain["ingress"]["tls"])
 check("a plain box has ONE app ingress host", len(plain["ingress"]["hosts"]) == 1)
 check("a plain box has no extraHosts",
       plain["onlyoffice"]["ingress"].get("extraHosts") is None and

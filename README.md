@@ -224,6 +224,39 @@ resolves, goes out to the proxy and comes back through the tunnel. The single
 degraded case is a client **on the LAN, with UDP blocked on that LAN, while
 the WAN is down**.
 
+#### Aliases — renaming a published box
+
+The four names above are the box's **native** names and never change:
+`<native>-office`, `<native>-livekit` and `<native>-turn` are infrastructure,
+no user ever types them. Only the app name can be given **aliases**
+(`acme.box.diwy.ai` for a box natively `f94b52.box.diwy.ai`), and they are
+decided **on the proxy**, not here:
+
+- **Only Scriptor renames.** An alias is added through the approved
+  `publish-name` workflow (suite366-fleet), which edits the proxy registry.
+  Nothing in the app lets a customer pick a name, and nothing on the box can
+  grant itself one.
+- **Nothing to do on the box.** The installer renders, in proxy mode only, an
+  extra app Ingress rule `*.box.diwy.ai` with the same routes as the native
+  name (TLS stays `drive-tls`: the proxy reissues its certificate with the
+  alias as a SAN and Traefik picks it by SAN), and a matching wildcard entry in
+  `APPLIANCE_ORIGINS` (app and socket follow the alias, OnlyOffice and LiveKit
+  stay on the native names). Traefik ranks that wildcard by rule length, above
+  the exact OnlyOffice/LiveKit names it also matches, so their Ingresses get a
+  fixed `traefik.ingress.kubernetes.io/router.priority: "1000"` in proxy mode.
+- **The canonical name follows the proxy.** The box pulls `names.json` with its
+  certificate; `remote.sh` writes `canonical` (first alias, else native) to
+  `state.json`, and the app reads it for e-mail links and OAuth. Auth.js runs
+  with `AUTH_TRUST_HOST=true` and no `AUTH_URL`, so sign-in works on whichever
+  name the browser used; `APP_URL` is the native name, as a fallback only.
+- **Boxes installed before this change are untouched** (no `update.sh`
+  migration): they have neither the wildcard rule nor `AUTH_TRUST_HOST`, and
+  keep their single name.
+
+A rename signs users out once (cookies are bound to the name), and an
+external SAML/OAuth identity provider configured with the old name has to be
+updated by the customer.
+
 ### `TLS_MODE=local-ca` (default)
 
 cert-manager issues everything from a CA generated on the box. Install
