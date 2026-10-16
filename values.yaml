@@ -66,7 +66,15 @@ config:
   PORT: "3000"
   HOSTNAME: "0.0.0.0"
   WS_PORT: "3001"
-  AUTH_URL: https://@APP_HOST@
+  AUTH_URL: https://@APP_HOST@    #@!proxy
+  # Proxy mode answers on more than one public name: the native one above and    #@proxy
+  # any alias Scriptor adds on the proxy later (`*.@DOMAIN@` below), without    #@proxy
+  # touching this box. A fixed AUTH_URL would bounce every sign-in on an alias    #@proxy
+  # back to the native name, so Auth.js takes the origin from the request    #@proxy
+  # instead. Safe here: Traefik only routes the hosts listed in the Ingress.    #@proxy
+  # E-mail links and OAuth use the canonical name the app reads from    #@proxy
+  # state.json (remote.sh); APP_URL is only its fallback until then.    #@proxy
+  AUTH_TRUST_HOST: "true"    #@proxy
   APP_URL: https://@APP_HOST@
   WS_URL: wss://@APP_HOST@
   MINIO_BUCKET: suite-366
@@ -81,7 +89,10 @@ config:
   # LiveKit socket, so the editor and the meeting come from the box beside it    #@local
   # and keep working with the WAN down. Anything else keeps the canonical    #@local
   # origin. Single-quoted so the JSON's own quotes need no escaping.    #@local
-  APPLIANCE_ORIGINS: '@APPLIANCE_ORIGINS@'    #@local
+  # In proxy mode it also carries a `*.@DOMAIN@` entry: a browser on an alias    #@proxy
+  # loads the app and its socket from that alias, OnlyOffice and LiveKit from    #@proxy
+  # the native infrastructure names, which never change.    #@proxy
+  APPLIANCE_ORIGINS: '@APPLIANCE_ORIGINS@'    #@origins
   # --- Local AI (vLLM host) — wired AUTOMATICALLY ---------------------------
   # Suite 366 PR #325 (chooseDefaultModel): when VLLM_BASE_URL is set, the
   # local vLLM is preferred over Anthropic/OpenAI for every role. The base
@@ -159,6 +170,27 @@ ingress:
         - path: /
           pathType: Prefix
           port: 80
+    # Every alias Scriptor gives this box on the proxy (`acme.@DOMAIN@`), with    #@proxy
+    # the very same routes as the native name. One label deep, like the    #@proxy
+    # certificate's SANs. Tagged `#@proxy`: deleted in every other mode.    #@proxy
+    # Traefik ranks this HostRegexp above the exact name (longer rule), which    #@proxy
+    # is harmless here — same routes, same backends, ordered among themselves    #@proxy
+    # by path length — but would capture the OnlyOffice and LiveKit names: see    #@proxy
+    # the router.priority pinned on their Ingresses below.    #@proxy
+    - host: "*.@DOMAIN@"    #@proxy
+      paths:    #@proxy
+        - path: /socket.io/    #@proxy
+          pathType: Prefix    #@proxy
+          port: 3001    #@proxy
+        - path: /wb-desktop/    #@proxy
+          pathType: Prefix    #@proxy
+          port: 3001    #@proxy
+        - path: /dav/    #@proxy
+          pathType: Prefix    #@proxy
+          port: 3001    #@proxy
+        - path: /    #@proxy
+          pathType: Prefix    #@proxy
+          port: 80    #@proxy
     # The LAN name, kept alongside the public one in HOST_MODE=proxy. Every    #@local
     # line below is tagged `#@local` and is DELETED by lib/suite.sh in any    #@local
     # other mode — the template stays valid YAML either way (the tag is a    #@local
@@ -179,7 +211,10 @@ ingress:
           port: 80    #@local
   tls:
     - secretName: @APP_TLS_SECRET@
-      hosts: [@APP_HOST@]
+      hosts: [@APP_HOST@]    #@!proxy
+      # Traefik picks the certificate by SAN; listing the wildcard keeps the    #@proxy
+      # Ingress honest about which Secret serves the aliases.    #@proxy
+      hosts: [@APP_HOST@, "*.@DOMAIN@"]    #@proxy
     # Its own Secret, not a SAN added to the public certificate: the public one    #@local
     # is overwritten wholesale by remote.sh on every pull from the proxy.    #@local
     - secretName: @LOCAL_APP_TLS_SECRET@    #@local
@@ -228,6 +263,13 @@ onlyoffice:
   ingress:
     enabled: true
     className: traefik
+    # Proxy mode: the app Ingress also carries `*.@DOMAIN@` (aliases), which    #@proxy
+    # Traefik turns into a HostRegexp that ALSO matches this host — and, with    #@proxy
+    # the default priority (rule length), outranks it: OnlyOffice would be    #@proxy
+    # served by the app. A fixed priority above any rule length keeps this    #@proxy
+    # name on this service. One path per host here, so nothing else to order.    #@proxy
+    annotations:    #@proxy
+      traefik.ingress.kubernetes.io/router.priority: "1000"    #@proxy
     host: @OFFICE_HOST@
     # Empty in TLS_MODE=provided: the chart drops the cert-manager annotation
     # but still renders the tls block, because tlsSecretName is set explicitly.
@@ -254,6 +296,9 @@ livekit:
   ingress:
     enabled: true
     className: traefik
+    # Same as onlyoffice above: keep the alias wildcard off the LiveKit name.    #@proxy
+    annotations:    #@proxy
+      traefik.ingress.kubernetes.io/router.priority: "1000"    #@proxy
     host: @LIVEKIT_HOST@
     clusterIssuer: "@CLUSTER_ISSUER@"
     tlsSecretName: @LIVEKIT_TLS_SECRET@

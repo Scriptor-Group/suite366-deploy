@@ -139,8 +139,12 @@ trap 'rm -f "$rendered" "$helm_out" "$helm_err"' EXIT
 # with no LAN names; here they must go too, because a bare @ cannot start a
 # YAML scalar and `helm template` then refuses the whole file — which is how
 # this build failed with "the chart did not render" on a tree where nothing
-# was wrong with the chart.
+# was wrong with the chart. Same for the proxy-mode variants: the `#@proxy`
+# lines go (they duplicate keys their `#@!proxy` twins hold), the others keep
+# their value, and APPLIANCE_ORIGINS (`#@origins`) carries a token too.
 sed -e '/#@local$/d' \
+    -e '/#@proxy$/d' \
+    -e '/#@origins$/d' \
     -e "s|@DOMAIN@|suite366.local|g" \
     -e "s|@APP_HOST@|drive.suite366.local|g" \
     -e "s|@OFFICE_HOST@|office.suite366.local|g" \
