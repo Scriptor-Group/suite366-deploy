@@ -371,11 +371,146 @@ vllm_local_env() {
   [[ -n "$VLLM_KEY" && -n "$VLLM_URL" ]]
 }
 
+# --- suite-366 >= 1.19.0: the app keeps NO vLLM row ---------------------------
+# From that release the box's vLLM is an INCLUDED provider, `system-local`: the
+# app reads VLLM_BASE_URL / VLLM_API_KEY from its own env (values.yaml -> the
+# chart's Secret) and the active model from /appliance-llm/state.json, at run
+# time, and migrates the old "vLLM Local" rows away at boot. Copy (5) above is
+# gone, so realigning or verifying it would test a row that no longer exists.
+# Everything DB-side below is skipped on such an app; it goes entirely at the
+# release after every box runs >= 1.19.0.
+#
+# The version is the image tag of the RUNNING drive-app deployment (update.sh
+# read_current_state's rule: the values.yaml pin can be ahead of reality when a
+# helm upgrade failed), the pin only when the cluster is unreadable.
+suite_app_version() {
+  local v=""
+  v="$(kc -n "$NAMESPACE" get deploy \
+         -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null \
+       | sed -n 's|.*/suite-366:||p' | head -1 || true)"
+  if [[ -z "$v" && -f "$DATA_DIR/values.yaml" ]]; then
+    v="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  fi
+  printf '%s' "$v"
+}
+
+# True when the installed app reads the vLLM key from its env (>= 1.19.0).
+# An unknown or unparsable version (a prerelease suffix included) is FALSE: the
+# old path is harmless on a new app, the new path is a silent 401 on an old one.
+app_has_local_provider() {
+  local v="" min="1.19.0"
+  v="$(suite_app_version)"
+  v="${v#v}"
+  if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    return 1
+  fi
+  [[ "$(printf '%s\n%s\n' "$min" "$v" | sort -V | head -1)" == "$min" ]]
+}
+
+# The new path's check: ask vLLM with the key the APP holds — values.yaml, which
+# the chart turns into the app's env — and nothing read out of Postgres. Same
+# probes and the same verdicts as verify_vllm_db_key, recorded in
+# VLLM_APP_KEY_VERIFIED; VLLM_DB_VERIFIED=local says "no row, by design", which
+# every DB-side consumer (summary, gate, apply.json) reads as "not ours".
+verify_vllm_app_key() { # verify_vllm_app_key BASE_URL KEY [DEEP]
+  VLLM_DB_VERIFIED=local
+  VLLM_APP_KEY_VERIFIED=unknown
+  local url="$1" key="$2" deep="${3:-0}" base="" code="" verdict="" tries=2 i=0 bad=0
+  if ! vllm_url_sane "$url"; then
+    warn "app's vLLM key NOT verified: '$url' is not a usable base URL."
+    return 0
+  fi
+  if [[ -z "$key" ]]; then
+    warn "app's vLLM key NOT verified: no VLLM_API_KEY in values.yaml nor llm/.env."
+    return 0
+  fi
+  base="${url%/v1}"
+  if [[ "$deep" == "1" ]]; then
+    tries=6
+  fi
+  verdict=down
+  for (( i = 0; i < tries; i++ )); do
+    code="$(vllm_http_code "$base/v1/models" "$key" 5)"
+    verdict="$(vllm_verdict "$code")"
+    if [[ "$verdict" != "down" ]]; then
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$verdict" == "denied" ]]; then
+    warn "the key the app holds (values.yaml -> its env) is REJECTED by vLLM (HTTP $code on /v1/models)."
+    VLLM_APP_KEY_VERIFIED=stale
+    return 0
+  fi
+  if [[ "$verdict" == "down" ]]; then
+    warn "vLLM did not answer /v1/models (HTTP $code) — the app's key NOT verified."
+    warn "  This is NOT a failure: the models can still be loading."
+    warn "  Watch: docker logs -f suite366-vllm-llm"
+    return 0
+  fi
+  info "  the app's key accepted on /v1/models (HTTP $code)."
+  VLLM_APP_KEY_VERIFIED=ok
+  if [[ "$deep" != "1" ]]; then
+    return 0
+  fi
+  if [[ -n "${LLM_MODEL:-}" ]]; then
+    case "$(vllm_verdict "$(vllm_http_code "$base/v1/chat/completions" "$key" 60 \
+              "{\"model\":\"$LLM_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}")")" in
+      denied) bad=1; warn "  /v1/chat/completions REJECTED the app's key." ;;
+      down)   warn "  /v1/chat/completions did not answer — not verified (models loading?)." ;;
+      *)      info "  the app's key accepted on /v1/chat/completions." ;;
+    esac
+  fi
+  if [[ -n "${EMBED_MODEL:-}" ]] && command -v docker >/dev/null 2>&1 \
+     && ! docker inspect suite366-vllm-embed >/dev/null 2>&1; then
+    info "  /v1/embeddings: no embed container (the active profile serves none) — skipped."
+  elif [[ -n "${EMBED_MODEL:-}" ]]; then
+    case "$(vllm_verdict "$(vllm_http_code "$base/v1/embeddings" "$key" 30 \
+              "{\"model\":\"$EMBED_MODEL\",\"input\":\"ping\"}")")" in
+      denied) bad=1; warn "  /v1/embeddings REJECTED the app's key (the embed container is on another key)." ;;
+      down)   warn "  /v1/embeddings did not answer — not verified (models loading?)." ;;
+      *)      info "  the app's key accepted on /v1/embeddings." ;;
+    esac
+  fi
+  if (( bad )); then
+    VLLM_APP_KEY_VERIFIED=stale
+  fi
+  :
+}
+
+# reconcile_and_check_vllm_db's branch for an app >= 1.19.0: nothing to realign,
+# only the env key to prove. values.yaml FIRST here — the reverse of
+# vllm_local_env's order — because the question is no longer "what will the
+# containers accept" but "does the key the app was given work".
+check_vllm_app_key() { # check_vllm_app_key DEEP(0|1)
+  local deep="${1:-0}" appkey=""
+  VLLM_DB_VERIFIED=local
+  VLLM_APP_KEY_VERIFIED=unknown
+  info "vLLM key: the app (>= 1.19.0, included provider system-local) reads it from its env — no database row to realign."
+  if ! vllm_local_env; then
+    warn "vLLM key: no key in $DATA_DIR/llm/.env nor values.yaml — NOT verified."
+    return 0
+  fi
+  if [[ -f "$DATA_DIR/values.yaml" ]]; then
+    appkey="$(sed -n 's/.*VLLM_API_KEY: *"\(sk-[^"]*\)".*/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  fi
+  verify_vllm_app_key "$VLLM_URL" "${appkey:-$VLLM_KEY}" "$deep"
+  if [[ "${VLLM_APP_KEY_VERIFIED:-unknown}" == "stale" ]]; then
+    warn "The vLLM key the app holds (values.yaml -> its env) is REJECTED by vLLM —"
+    warn "  every LLM call in the app will 401. Re-run: sudo $DATA_DIR/install.sh"
+  fi
+  :
+}
+
 # One line per call site in the standalone scripts. DEEP=1 after something that
 # re-pushed the Secret or reloaded the database; DEEP=0 for the daily check,
 # which must not POST to the LLM every night.
 reconcile_and_check_vllm_db() { # reconcile_and_check_vllm_db DEEP(0|1)
   local deep="${1:-0}"
+  if app_has_local_provider; then
+    check_vllm_app_key "$deep"
+    return 0
+  fi
   if ! vllm_local_env; then
     warn "vLLM provider key: no key in $DATA_DIR/llm/.env nor values.yaml — DB row left alone."
     return 0
@@ -395,6 +530,10 @@ reconcile_and_check_vllm_db() { # reconcile_and_check_vllm_db DEEP(0|1)
 # install.sh already knows the key, the IP and the ports, so it passes them
 # straight in rather than re-deriving them from disk.
 reconcile_vllm_provider_row() {
+  if app_has_local_provider; then
+    info "vLLM key: the app (>= 1.19.0, included provider system-local) reads it from its env — no database row to realign."
+    return 0
+  fi
   log "Realigning the vLLM key the app actually uses (Postgres)"
   reconcile_vllm_db_key "$VLLM_API_KEY" "http://$SUITE_IP:$PROXY_PORT/v1"
 }
@@ -403,6 +542,11 @@ verify_vllm_provider_row() {
   if [[ "${SKIP_VLLM:-0}" == "1" ]]; then
     VLLM_DB_VERIFIED=skipped
     warn "Stored vLLM provider key NOT verified (SKIP_VLLM — there is no proxy to ask)."
+    return 0
+  fi
+  if app_has_local_provider; then
+    log "Verifying the vLLM key the app holds (values.yaml -> its env) by asking vLLM with it"
+    verify_vllm_app_key "http://$SUITE_IP:$PROXY_PORT/v1" "$VLLM_API_KEY" 1
     return 0
   fi
   log "Verifying that key by asking vLLM with it (read back from Postgres)"
@@ -414,6 +558,10 @@ verify_vllm_provider_row() {
 # fingerprint — a real price for a failure that is not urgent to the second. So
 # the verification records a verdict, summary renders it, and THEN we fail.
 vllm_db_gate() {
+  # An app >= 1.19.0 keeps no row (verify_vllm_app_key): nothing to gate on.
+  if [[ "${VLLM_DB_VERIFIED:-unknown}" == "local" ]]; then
+    return 0
+  fi
   if [[ "${VLLM_DB_VERIFIED:-unknown}" == "stale" ]]; then
     die "The vLLM API key STORED IN POSTGRES is not the key vLLM accepts.
     Every LLM call in the app will return 401 while 'docker ps' says

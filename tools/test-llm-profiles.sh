@@ -366,6 +366,32 @@ absent   "dry-run flash-next : avec 500 Go libres, rien à refuser" "$f2" "would
 contains "…et le dry-run le dit"                           "$f2" "has 500 GB"
 rm -rf "$DF"
 
+# suite-366 >= 1.19.0 : plus aucune ligne AIModel pour le vLLM de la box
+# (provider inclus system-local, modèle lu dans state.json) — l'étape 5 (SQL)
+# disparaît ; 1.18, une version inconnue ou illisible gardent l'ancien chemin.
+# Un faux k3s : le cluster est illisible, seule l'épingle de values.yaml compte.
+K3="$(mktemp -d)"; printf '#!/bin/sh\nexit 0\n' > "$K3/k3s"; chmod +x "$K3/k3s"
+VSAVE="$(cat "$BOX/values.yaml")"
+for t in 1.18.0 garbage 1.19.0-rc.1; do
+  { printf 'image:\n  tag: "%s"\n' "$t"; printf '%s\n' "$VSAVE"; } > "$BOX/values.yaml"
+  v_="$(PATH="$K3:$PATH" sw qwen27b --dry-run)"
+  contains "dry-run app $t : le SQL est montré (ancien chemin)" "$v_" "\\set stt '$STT_MODEL'"
+  absent   "dry-run app $t : pas d'annonce « SQL: none »"       "$v_" "SQL: none"
+done
+for t in 1.19.0 1.20.2; do
+  { printf 'image:\n  tag: "%s"\n' "$t"; printf '%s\n' "$VSAVE"; } > "$BOX/values.yaml"
+  v_="$(PATH="$K3:$PATH" sw qwen27b --dry-run)"
+  contains "dry-run app $t : aucun SQL, le modèle vient de state.json" "$v_" "SQL: none — the app ($t) reads the model from state.json"
+  absent   "dry-run app $t : aucune requête construite"              "$v_" "\\set stt"
+  contains "dry-run app $t : values.yaml reste mis à jour (repli env)" "$v_" "VLLM_MAX_CONTEXT_WINDOW -> 200000"
+done
+printf '%s\n' "$VSAVE" > "$BOX/values.yaml"
+rm -rf "$K3"
+# La vraie bascule : l'étape 5 entière est sous la même garde.
+step5="$(sed -n '/^# --- 5\. the rows/,/^# --- 6\./p' "$REPO_ROOT/switch-model.sh")"
+contains "étape 5 : gardée par APP_LOCAL_PROVIDER" "$step5" 'if [[ "$APP_LOCAL_PROVIDER" == 1 ]]; then'
+check    "étape 5 : un seul build_sql, dans la branche else" "$(sed -n '/^if \[\[ "\$APP_LOCAL_PROVIDER" == 1 \]\]; then/,/^fi$/p' <<<"$step5" | sed -n '/^else$/,/^fi$/p' | grep -c 'build_sql |')" "1"
+
 # --- 3b. la transcription suit le profil ---------------------------------------
 head_ "switch-model.sh : transcription"
 contains "dry-run qwen27b : STT_MODEL dans .env"        "$d" "STT_MODEL=$STT_MODEL"

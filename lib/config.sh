@@ -246,6 +246,9 @@ VLLM_MAX_CONTEXT_WINDOW="${VLLM_MAX_CONTEXT_WINDOW:-$LLM_P_CONTEXT_WINDOW}"
 # fifth and only authoritative copy of it (see lib/vllm-db.sh). Defaulted here
 # so lib/summary.sh can render it under `set -u` even if the module never ran.
 VLLM_DB_VERIFIED="${VLLM_DB_VERIFIED:-unknown}"
+# Its counterpart on an app >= 1.19.0, which keeps no row and reads the key
+# from its env: the verdict on THAT key (verify_vllm_app_key, lib/vllm-db.sh).
+VLLM_APP_KEY_VERIFIED="${VLLM_APP_KEY_VERIFIED:-unknown}"
 # Postgres deployment override, mirroring backup.sh — discovery derives the name
 # from the chart's appName and never hardcodes `drive-postgres`.
 PG_DEPLOY="${PG_DEPLOY:-}"

@@ -15,6 +15,13 @@
 # Miss (3) and every call 404s with `docker ps` healthy and every pod Running —
 # the same shape of failure as the API-key drift in lib/vllm-db.sh.
 #
+# Since suite-366 1.19.0 there is no (3): the box's vLLM is the included
+# provider `system-local`, whose model the app reads from state.json (published
+# below) at run time, and whose rows it migrated away at boot. On such an app
+# step 5 (the SQL) is skipped entirely; step 4 (values.yaml + helm upgrade)
+# stays as the env fallback the app uses when state.json is absent. Both the
+# SQL and that pod restart go once every box runs >= 1.19.0.
+#
 # A profile may also carry a TRANSCRIPTION model (llm/profiles.sh
 # LLM_P_STT_MODEL), served by a third container on /v1/audio/*. It follows the
 # same three places: STT_MODEL and COMPOSE_PROFILES in .env, the chart's
@@ -95,6 +102,30 @@ info() { printf "    %s\n" "$*"; }
 warn() { printf "${c_y}!!  %s${c_0}\n" "$*"; }
 die()  { printf "${c_r}xx  %s${c_0}\n" "$*" >&2; exit 1; }
 kc()   { k3s kubectl "$@"; }
+
+# Copied VERBATIM from the shared block of lib/vllm-db.sh (this script cannot
+# source lib/ either); tools/sync-vllm-db-block.sh refreshes them and
+# tools/test-vllm-db.sh fails if they drift.
+suite_app_version() {
+  local v=""
+  v="$(kc -n "$NAMESPACE" get deploy \
+         -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null \
+       | sed -n 's|.*/suite-366:||p' | head -1 || true)"
+  if [[ -z "$v" && -f "$DATA_DIR/values.yaml" ]]; then
+    v="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" | head -1)"
+  fi
+  printf '%s' "$v"
+}
+
+app_has_local_provider() {
+  local v="" min="1.19.0"
+  v="$(suite_app_version)"
+  v="${v#v}"
+  if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    return 1
+  fi
+  [[ "$(printf '%s\n%s\n' "$min" "$v" | sort -V | head -1)" == "$min" ]]
+}
 
 DRY_RUN=0
 TARGET=""
@@ -883,6 +914,11 @@ SELECT 'aimodel=' || (SELECT count(*) FROM m) || ' agent=' || (SELECT count(*) F
 SQL
 }
 
+# Decided once, before anything moves: an app >= 1.19.0 keeps no AIModel row
+# for this box's vLLM, so there is no SQL to build, show or run.
+APP_LOCAL_PROVIDER=0
+if app_has_local_provider; then APP_LOCAL_PROVIDER=1; fi
+
 if [[ "$DRY_RUN" == 1 ]]; then
   log "--dry-run: nothing will be changed"
   echo; info "llm/.env would become:"
@@ -893,7 +929,11 @@ if [[ "$DRY_RUN" == 1 ]]; then
   info "             VLLM_MODEL_TRANSCRIPTION -> ${LLM_P_STT_MODEL:-\"\" (this profile has none)}"
   dry_embed="$(embed_model_for "$LLM_P_EMBED" || true)"
   info "             VLLM_MODEL_EMBEDDING -> ${dry_embed:-\"\" (this profile runs the generative model alone)}"
-  echo; info "SQL:"; build_sql | sed 's/^/      /'
+  if [[ "$APP_LOCAL_PROVIDER" == 1 ]]; then
+    echo; info "SQL: none — the app ($(suite_app_version)) reads the model from state.json (included provider system-local)"
+  else
+    echo; info "SQL:"; build_sql | sed 's/^/      /'
+  fi
   if [[ "$LLM_P_NEEDS_BUILD" == "1" ]]; then
     echo; info "image build: $LLM_P_IMAGE (from $LLM_FLASH_NEXT_BASE_IMAGE + llm/$LLM_P_BUILD_DIR/, unless already built)"
   elif [[ "$ENGINE_IMAGE" != "$BASE_IMAGE" ]]; then
@@ -1088,6 +1128,9 @@ if [[ "$LLM_P_EMBED" == "1" ]]; then
 fi
 
 # --- 4. the chart values the app reads ----------------------------------------
+# On an app >= 1.19.0 these are only the fallback for a missing state.json (the
+# app follows state.json without a restart): this step, and the pod restart its
+# helm upgrade costs, can go once every box runs >= 1.19.0.
 # From here the engine is ALREADY serving the new model. A failure below must be
 # reported with the command that finishes the job, never abort the script: dying
 # here is what leaves the app pointing at a model nothing serves.
@@ -1128,35 +1171,39 @@ else
 fi
 
 # --- 5. the rows every LLM call actually resolves -----------------------------
-pg_deploy() {
-  [[ -n "$PG_DEPLOY" ]] && { printf '%s' "$PG_DEPLOY"; return 0; }
-  kc -n "$NAMESPACE" get deploy -o name 2>/dev/null \
-    | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
-}
-log "Realigning the model ids stored in Postgres"
-SQL_STT_MODEL="$STT_SERVED"
-SQL_EMBED_MODEL="$EMBED_SERVED"
-pg="$(pg_deploy)"
-if [[ -z "$pg" ]]; then
-  warn "No -postgres deployment found in ns $NAMESPACE — database NOT updated."
-  warn "Every LLM call will 404 until AIModel.modelId names $LLM_P_MODEL."
+if [[ "$APP_LOCAL_PROVIDER" == 1 ]]; then
+  info "database: nothing to realign — the app ($(suite_app_version)) resolves the model from state.json."
 else
-  # stdin is redirected explicitly: `kubectl exec -i` reads the caller's stdin
-  # and would swallow the rest of this script if it arrived through a pipe.
-  # stderr is KEPT: a statement that fails (a constraint, a missing column after
-  # a schema change) must be named, not reported as "could not reach Postgres".
-  sql_err="$(mktemp)"
-  out="$(build_sql | kc -n "$NAMESPACE" exec -i "deploy/$pg" -- \
-          sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -tAq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' 2>"$sql_err")" || out=""
-  case "$out" in
-    *no-table*) warn "No AIModel table yet (the app's migrations have not run) — nothing to realign." ;;
-    aimodel=*)  info "database: $out" ;;
-    "")         warn "Postgres realignment FAILED in deploy/$pg — database NOT updated."
-                grep -vE '^command terminated' "$sql_err" | tail -3 | sed 's/^/      /' >&2
-                warn "  Re-run: $0 $TARGET   (idempotent once the cause is fixed)" ;;
-    *)          warn "Unexpected psql output: $out" ;;
-  esac
-  rm -f "$sql_err"
+  pg_deploy() {
+    [[ -n "$PG_DEPLOY" ]] && { printf '%s' "$PG_DEPLOY"; return 0; }
+    kc -n "$NAMESPACE" get deploy -o name 2>/dev/null \
+      | sed -n 's|^deployment.apps/||p' | grep -- '-postgres$' | head -1 || true
+  }
+  log "Realigning the model ids stored in Postgres"
+  SQL_STT_MODEL="$STT_SERVED"
+  SQL_EMBED_MODEL="$EMBED_SERVED"
+  pg="$(pg_deploy)"
+  if [[ -z "$pg" ]]; then
+    warn "No -postgres deployment found in ns $NAMESPACE — database NOT updated."
+    warn "Every LLM call will 404 until AIModel.modelId names $LLM_P_MODEL."
+  else
+    # stdin is redirected explicitly: `kubectl exec -i` reads the caller's stdin
+    # and would swallow the rest of this script if it arrived through a pipe.
+    # stderr is KEPT: a statement that fails (a constraint, a missing column after
+    # a schema change) must be named, not reported as "could not reach Postgres".
+    sql_err="$(mktemp)"
+    out="$(build_sql | kc -n "$NAMESPACE" exec -i "deploy/$pg" -- \
+            sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -tAq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' 2>"$sql_err")" || out=""
+    case "$out" in
+      *no-table*) warn "No AIModel table yet (the app's migrations have not run) — nothing to realign." ;;
+      aimodel=*)  info "database: $out" ;;
+      "")         warn "Postgres realignment FAILED in deploy/$pg — database NOT updated."
+                  grep -vE '^command terminated' "$sql_err" | tail -3 | sed 's/^/      /' >&2
+                  warn "  Re-run: $0 $TARGET   (idempotent once the cause is fixed)" ;;
+      *)          warn "Unexpected psql output: $out" ;;
+    esac
+    rm -f "$sql_err"
+  fi
 fi
 
 # --- 6. warm the JIT so the first user does not pay for it --------------------
