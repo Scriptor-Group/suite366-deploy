@@ -5,7 +5,7 @@
 
 # --- 6. Summary --------------------------------------------------------------
 summary() {
-  local ai db_line
+  local ai db_line db_block
   # The verdict of the only check that exercises the key the app really uses —
   # the one stored in Postgres (lib/vllm-db.sh). `unknown` is not a failure:
   # vLLM may simply not have answered yet.
@@ -17,6 +17,21 @@ summary() {
     skipped) db_line="not verified (SKIP_VLLM)" ;;
     *)       db_line="NOT verified — vLLM did not answer; the models may still be loading" ;;
   esac
+  db_block="   • Key stored in Postgres      : $db_line
+       That row is what an LLM call actually reads; the four other copies of the
+       key are only what fed it. See lib/vllm-db.sh."
+  # suite-366 >= 1.19.0 keeps no row: the app reads the key from its own env
+  # (included provider system-local), so that is the copy the verdict is about.
+  if [[ "${VLLM_DB_VERIFIED:-unknown}" == "local" ]]; then
+    case "${VLLM_APP_KEY_VERIFIED:-unknown}" in
+      ok)    db_line="verified — vLLM accepted it on /v1/models, chat and embeddings" ;;
+      stale) db_line="!! REJECTED by vLLM — every LLM call in the app will return 401" ;;
+      *)     db_line="NOT verified — vLLM did not answer; the models may still be loading" ;;
+    esac
+    db_block="   • Key the app reads (env)     : $db_line
+       Read from values.yaml through the chart's Secret; the app keeps no copy
+       in its database (included provider system-local, app >= 1.19.0)."
+  fi
   if [[ "$SKIP_VLLM" == "1" ]]; then
     ai=" Local AI (vLLM): NOT deployed (test mode)."
   else
@@ -33,9 +48,7 @@ summary() {
    • API key (shared by vLLM + Suite 366): fingerprint $(printf '%s' "$VLLM_API_KEY" | sha256sum | cut -c1-12)
        In clear in $DATA_DIR/llm/.env (root-only) — not reprinted here, for the
        reason given for the backup key below.
-   • Key stored in Postgres      : $db_line
-       That row is what an LLM call actually reads; the four other copies of the
-       key are only what fed it. See lib/vllm-db.sh.
+$db_block
    -> The chart receives VLLM_BASE_URL + VLLM_MODEL_* + VLLM_API_KEY via
       values.yaml; chooseDefaultModel() picks vLLM by default.
    -> Org admins can still register additional "CUSTOM" providers for

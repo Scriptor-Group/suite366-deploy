@@ -15,6 +15,11 @@
 #  • THE VERDICTS. A 401 from the key STORED IN POSTGRES is a broken appliance
 #    and must fail the install. A proxy that has not answered yet is a model
 #    still loading and must NOT. Those two were indistinguishable before.
+#  • suite-366 >= 1.19.0. The app keeps no row any more (included provider
+#    system-local, key read from its env): every DB step must be skipped there
+#    and the env key probed instead — and ONLY there: an older, unknown or
+#    unparsable version keeps the old path, which is harmless on a new app
+#    while the new one is a silent 401 on an old app.
 #  • THE THREE COPIES. update.sh and backup.sh cannot source lib/, so they
 #    carry the block verbatim. If a copy drifts, one of the three paths that
 #    can leave a stale key stops being fixed — silently. Hence the sha256s.
@@ -42,6 +47,9 @@ cat > "$WORK/bin/k3s" <<'EOF'
 shift                       # drop "kubectl"
 args="$*"
 case "$args" in
+  *"get deploy -o jsonpath"*)
+    # The RUNNING app image, when a test says the cluster is readable.
+    cat "$WORK/app-image" 2>/dev/null || true ;;
   *"get deploy -o name"*)
     if [[ -f "$WORK/no-pg" ]]; then printf '%s\n' deployment.apps/drive-app; exit 0; fi
     printf '%s\n' deployment.apps/drive-app deployment.apps/drive-postgres ;;
@@ -93,6 +101,8 @@ kc()   { k3s kubectl "$@"; }
 H
   sed -n '/^# >>> SHARED vllm-db BLOCK/,/^# <<< END SHARED vllm-db BLOCK <<</p' "$REPO/lib/vllm-db.sh"
   sed -n '/^vllm_db_gate() {/,/^}/p' "$REPO/lib/vllm-db.sh"
+  sed -n '/^reconcile_vllm_provider_row() {/,/^}/p' "$REPO/lib/vllm-db.sh"
+  sed -n '/^verify_vllm_provider_row() {/,/^}/p' "$REPO/lib/vllm-db.sh"
 } > "$WORK/prelude.sh"
 
 # Output on stdout, and the exit status of the code under test as our own — a
@@ -108,14 +118,16 @@ run() { # run CODE -> output ; exit status = the code's
            bash -c "set -euo pipefail
                     source '$WORK/prelude.sh'
                     $1
-                    printf 'VERDICT=%s\n' \"\${VLLM_DB_VERIFIED:-unset}\"" 2>&1)"
+                    printf 'VERDICT=%s\n' \"\${VLLM_DB_VERIFIED:-unset}\"
+                    printf 'APPKEY=%s\n' \"\${VLLM_APP_KEY_VERIFIED:-unset}\"" 2>&1)"
   rc=$?
   printf '%s' "$out"
   return "$rc"
 }
 reset() {
   rm -f "$WORK/sql.txt" "$WORK/kargs.txt" "$WORK/pg-out" "$WORK/pg-dead" "$WORK/no-pg" \
-        "$WORK/code-models" "$WORK/code-chat" "$WORK/code-embed" "$CLOG"
+        "$WORK/code-models" "$WORK/code-chat" "$WORK/code-embed" "$CLOG" \
+        "$WORK/app-image" "$WORK/data/values.yaml" "$WORK/data/llm/.env"
 }
 KEY=sk-QWU7gPzIW4k4pZNyoYx9wt07N9y3KBGo
 URL=http://10.99.0.1:8000/v1
@@ -230,9 +242,103 @@ reset; out="$(run "VLLM_DB_VERIFIED=stale; vllm_db_gate")"; RC=$?
 check "the gate fails the install on 'stale'" 1 "$RC"
 contains "$out" "STORED IN POSTGRES" "…naming the copy at fault"
 
+printf '\n== app >= 1.19.0: which path ==\n'
+# values.yaml as install.sh renders it: the app pin, the key, the proxy URL.
+APPKEY_VALS=sk-AppKeyFromValuesYaml0123456789ab
+vals() { # vals TAG
+  printf 'image:\n  tag: "%s"\n\nenv:\n  VLLM_BASE_URL: "%s"\n  VLLM_API_KEY: "%s"\n' "$1" "$URL" "$APPKEY_VALS" > "$WORK/data/values.yaml"
+}
+for t in 1.18.0 1.18.99 0.9.0 1.19.0-rc.1 v1.18.3 garbage ""; do
+  reset; vals "$t"
+  out="$(run "if app_has_local_provider; then echo HAS=1; else echo HAS=0; fi")"
+  contains "$out" "HAS=0" "app '$t' -> the old path (the DB row)"
+done
+for t in 1.19.0 1.19.1 1.20.0 2.0.0 v1.19.0; do
+  reset; vals "$t"
+  out="$(run "if app_has_local_provider; then echo HAS=1; else echo HAS=0; fi")"
+  contains "$out" "HAS=1" "app '$t' -> no DB row (system-local)"
+done
+reset; out="$(run "if app_has_local_provider; then echo HAS=1; else echo HAS=0; fi")"
+contains "$out" "HAS=0" "no values.yaml and no cluster -> the old path"
+# The RUNNING image wins over the pin: a failed helm upgrade leaves the pin
+# ahead of the pod (update.sh read_current_state's rule).
+reset; vals 1.19.0; printf 'ghcr.io/scriptor-group/suite-366-sandbox-api:1.19.0\nghcr.io/scriptor-group/suite-366:1.18.3\n' > "$WORK/app-image"
+out="$(run "if app_has_local_provider; then echo HAS=1; else echo HAS=0; fi")"
+contains "$out" "HAS=0" "running 1.18.3 under a 1.19.0 pin -> the old path (the pod decides)"
+reset; printf 'ghcr.io/scriptor-group/suite-366:1.19.0\n' > "$WORK/app-image"
+out="$(run "if app_has_local_provider; then echo HAS=1; else echo HAS=0; fi")"
+contains "$out" "HAS=1" "running 1.19.0, no values.yaml -> system-local"
+
+printf '\n== reconcile_and_check: 1.18.0 = the DB path, unchanged ==\n'
+reset; vals 1.18.0; printf 'rows\nk=%s\n' "$APPKEY_VALS" > "$WORK/pg-out"
+out="$(run "reconcile_and_check_vllm_db 1")"; RC=$?
+check "exits 0" 0 "$RC"
+check "…both DB round trips happen (realign + read back)" 2 "$(grep -c exec "$WORK/kargs.txt" 2>/dev/null || echo 0)"
+contains "$out" "VERDICT=ok" "…and the verdict is the stored key's"
+contains "$out" "APPKEY=unset" "…the env-key verdict is never set"
+reset; vals garbage; printf 'rows\nk=%s\n' "$APPKEY_VALS" > "$WORK/pg-out"
+out="$(run "reconcile_and_check_vllm_db 0")"; RC=$?
+check "a garbage version also takes the DB path" 2 "$(grep -c exec "$WORK/kargs.txt" 2>/dev/null || echo 0)"
+
+printf '\n== reconcile_and_check: 1.19.0 = no DB, the env key probed ==\n'
+reset; vals 1.19.0
+out="$(run "reconcile_and_check_vllm_db 1")"; RC=$?
+check "exits 0" 0 "$RC"
+check "…NO database round trip at all" "" "$(cat "$WORK/kargs.txt" 2>/dev/null || true)"
+check "…and no SQL" "" "$(cat "$WORK/sql.txt" 2>/dev/null || true)"
+contains "$out" "VERDICT=local" "…VLLM_DB_VERIFIED=local (no row, by design)"
+contains "$out" "APPKEY=ok" "…the app's key accepted"
+contains "$out" "no database row to realign" "…and says why nothing was realigned"
+contains "$(cat "$CLOG")" "/v1/chat/completions" "…a deep check still POSTs chat"
+contains "$(cat "$CLOG")" "/v1/embeddings" "…and embeddings"
+absent "$(cat "$CLOG")" "$APPKEY_VALS" "…the key never on curl's argv"
+absent "$out" "database is rejected" "…no 'database key' wording"
+reset; vals 1.19.0; printf 401 > "$WORK/code-models"
+out="$(run "reconcile_and_check_vllm_db 0")"; RC=$?
+check "a rejected env key exits 0 (reported, not fatal)" 0 "$RC"
+contains "$out" "APPKEY=stale" "…recorded as stale"
+contains "$out" "the app holds (values.yaml -> its env) is REJECTED" "…naming the env copy, not Postgres"
+absent "$out" "STORED IN POSTGRES" "…and never Postgres"
+reset; vals 1.19.0; printf 000 > "$WORK/code-models"
+out="$(run "reconcile_and_check_vllm_db 0")"; RC=$?
+contains "$out" "APPKEY=unknown" "a proxy that never answered -> unknown, NOT a failure"
+check "…2 attempts on a shallow check" 2 "$(grep -c '/v1/models' "$CLOG")"
+reset; vals 1.19.0
+out="$(run "reconcile_and_check_vllm_db 0")"; RC=$?
+check "a shallow check POSTs nothing" 0 "$(grep -c 'data-binary' "$CLOG")"
+# values.yaml is the app's copy: when llm/.env (the containers') differs, the
+# probe must use values.yaml's — the env copy is the one under test.
+reset; vals 1.19.0; mkdir -p "$WORK/data/llm"
+printf 'VLLM_API_KEY=%s\nBIND_IP=10.99.0.1\nPROXY_PORT=8000\n' "$KEY" > "$WORK/data/llm/.env"
+out="$(run "vllm_auth_header_file() { printf 'Authorization: Bearer %s\n' \"\$1\" >> \"$WORK/keys-used\"; mktemp; }; reconcile_and_check_vllm_db 0")"; RC=$?
+contains "$(cat "$WORK/keys-used")" "$APPKEY_VALS" "the probe uses values.yaml's key (what the app was given)"
+absent "$(cat "$WORK/keys-used")" "$KEY" "…not llm/.env's"
+contains "$out" "DIFFERENT vLLM keys" "…and the divergence is still reported"
+rm -f "$WORK/keys-used"
+
+printf '\n== install wrappers ==\n'
+IENV="SUITE_IP=10.99.0.1; PROXY_PORT=8000; VLLM_API_KEY=$KEY; SKIP_VLLM=0"
+reset; vals 1.18.0; printf 'realigned=1\n' > "$WORK/pg-out"
+out="$(run "$IENV; reconcile_vllm_provider_row")"; RC=$?
+contains "$(cat "$WORK/sql.txt" 2>/dev/null || true)" "UPDATE \"public\".\"AIProvider\"" "1.18.0: install realigns the row"
+reset; vals 1.19.0
+out="$(run "$IENV; reconcile_vllm_provider_row; verify_vllm_provider_row; vllm_db_gate")"; RC=$?
+check "1.19.0: install exits 0" 0 "$RC"
+check "…no SQL at all" "" "$(cat "$WORK/sql.txt" 2>/dev/null || true)"
+contains "$out" "VERDICT=local" "…VLLM_DB_VERIFIED=local"
+contains "$out" "APPKEY=ok" "…the key install wrote probed"
+reset; vals 1.19.0; printf 401 > "$WORK/code-models"
+out="$(run "$IENV; verify_vllm_provider_row; vllm_db_gate")"; RC=$?
+check "1.19.0: the gate is skipped even on a rejected env key" 0 "$RC"
+contains "$out" "APPKEY=stale" "…which is still recorded for the summary"
+reset; vals 1.18.0; printf 'rows\nk=sk-other\n' > "$WORK/pg-out"; printf 401 > "$WORK/code-models"
+out="$(run "$IENV; verify_vllm_provider_row; vllm_db_gate")"; RC=$?
+check "1.18.0: the gate still fails a stale stored key" 1 "$RC"
+
 printf '\n== the three copies cannot drift ==\n'
 for f in vllm_key_sane vllm_url_sane vllm_row_scope vllm_pg_deploy vllm_auth_header_file vllm_http_code \
-         vllm_verdict reconcile_vllm_db_key verify_vllm_db_key vllm_local_env reconcile_and_check_vllm_db; do
+         vllm_verdict reconcile_vllm_db_key verify_vllm_db_key vllm_local_env reconcile_and_check_vllm_db \
+         suite_app_version app_has_local_provider verify_vllm_app_key check_vllm_app_key; do
   body="$(sed -n "/^$f() {/,/^}/p" "$REPO/lib/vllm-db.sh")"
   # Not padding: without this, a renamed function extracts to three empty
   # strings that compare equal, and the test would pass while guarding nothing
@@ -244,6 +350,12 @@ for f in vllm_key_sane vllm_url_sane vllm_row_scope vllm_pg_deploy vllm_auth_hea
     b="$(sed -n "/^$f() {/,/^}/p" "$REPO/$g" | sha256sum)"
     check "$f is byte-identical in $g" "$a" "$b"
   done
+done
+# switch-model.sh carries the two app-version functions only.
+for f in suite_app_version app_has_local_provider; do
+  a="$(sed -n "/^$f() {/,/^}/p" "$REPO/lib/vllm-db.sh" | sha256sum)"
+  b="$(sed -n "/^$f() {/,/^}/p" "$REPO/switch-model.sh" | sha256sum)"
+  check "$f is byte-identical in switch-model.sh" "$a" "$b"
 done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
