@@ -1,15 +1,15 @@
 {
   "channel": "stable",
   "chart_version": "0.10.3",
-  "app_version": "1.20.1",
+  "app_version": "1.21.0",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "b04aaa00e1d4b92f4da560de04b7da747bcd950dc2f351cd3c864ba6e413f2e6",
   "backup_sha256": "9004066456b4deea8a95303c16af6ff13bfcc055d0674eabf5c8ca2710b985ac",
   "host_layer_sha256": "14c5463daf5d95772c021b142901fe2e74b4e872edd8247118c1d251977287ac",
-  "serial": "1792435294",
-  "expires": "2027-10-19T18:41:34Z",
+  "serial": "1792491913",
+  "expires": "2027-10-20T10:25:13Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Suite 366 1.20.1: mailboxes removed by a Microsoft 365 resync are no longer counted, and admins now see why a mailbox fails to sync (badge in the domain mailbox list, full reason on manual sync). Includes 1.20.0: Outlook calendars of a Microsoft 365 domain synced by the domain app, steadier Outlook sync."
+  "notes": "Suite 366 1.21.0: Microsoft 365 mailboxes now sync, send and file mail through Microsoft Graph, with no Exchange PowerShell step (admins grant Mail.ReadWrite and Mail.Send to the domain app in Azure; IMAP/SMTP stays available as an advanced option), with an Azure setup guide when adding a Microsoft 365 domain. Admins can retry all failed mailboxes from the Mailboxes tab. CRM calendar view with drag and drop and click-to-create; co-organizers for meetings created by an agent."
 }
