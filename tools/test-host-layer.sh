@@ -274,6 +274,7 @@ vals_run() { # vals_run BOX -> rc ; output in $VOUT
     info() { printf "    %s\n" "$*"; }; warn() { printf "!!  %s\n" "$*"; }
     have() { command -v "$1" >/dev/null 2>&1; }
     DATA_DIR="$1"; APP_GID=1001; cur_app=1.11.8; want_app=""
+    ONLYOFFICE_IMAGE="$(sed -n "s/^ONLYOFFICE_IMAGE=\"\(.*\)\"$/\1/p" "$2")"
     for f in detect_stt_model ensure_appliance_values; do eval "$(sed -n "/^$f() {/,/^}/p" "$2")"; done
     ensure_appliance_values ${3:-}
   ' _ "$1" "$REPO_ROOT/update.sh" "${2:-}" 2>&1)"
@@ -413,6 +414,37 @@ check "délais réglés : idleTimeoutMs conservé" "$(grep -c 'idleTimeoutMs: 90
 check "délais réglés : idleStopMs conservé"    "$(grep -c 'idleStopMs: 3600000' "$TUNED/values.yaml")" "1"
 check "délais réglés : pas de doublon"          "$(grep -c 'idleStopMs' "$TUNED/values.yaml")" "1"
 
+# L'image OnlyOffice : l'amont (tout tag) ou un ancien tag à nous passe sur
+# ONLYOFFICE_IMAGE (l'amont réinstalle son plugin IA à chaque démarrage) ; une
+# image posée par un opérateur ne bouge pas. Une seule image, trois sources.
+OOI="$(sed -n 's/^ONLYOFFICE_IMAGE="\(.*\)"$/\1/p' "$REPO_ROOT/update.sh")"
+oo_base="$(sed -n 's/^ARG BASE_IMAGE=//p' "$REPO_ROOT/onlyoffice/Dockerfile")"; oo_rev="$(sed -n 's/^ARG SUITE366_REV=//p' "$REPO_ROOT/onlyoffice/Dockerfile")"
+check "ONLYOFFICE_IMAGE = le tag que publie onlyoffice/Dockerfile" "$OOI" "ghcr.io/scriptor-group/suite-366-onlyoffice:${oo_base##*:}-s${oo_rev}"
+check "values.yaml épingle ONLYOFFICE_IMAGE" "$(sed -n 's/^  image: \([^ ]*suite-366-onlyoffice[^ ]*\).*/\1/p' "$REPO_ROOT/values.yaml")" "$OOI"
+oo_img() { sed -n '/^onlyoffice:/,/^$/p' "$1/values.yaml" | grep '^  image:'; }
+oo_box() { # oo_box DIR IMAGE_LINE
+  mkdir -p "$1/llm"; cp "$BOX/llm/.env" "$1/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$1/llm/profiles.sh"
+  printf 'config:\n  VLLM_MODEL_EMBEDDING: "e"\n  VLLM_MODEL_TRANSCRIPTION: ""\n\nonlyoffice:\n  enabled: true\n%s\n  persistence:\n    enabled: true\n  ingress:\n    host: office.example\n\nlivekit:\n  image: livekit/livekit-server:v1.13.2\n' "$2" > "$1/values.yaml"
+}
+OO="$WORK/oo-upstream"; oo_box "$OO" "  image: onlyoffice/documentserver:9.4.0   # pinned (chart default is :latest)"
+o0="$(cat "$OO/values.yaml")"; vals_run "$OO" --check; rc=$?
+check "OnlyOffice amont --check : annonce un changement (rc 0)" "$rc" "0"
+check "OnlyOffice amont --check : n'écrit rien"                 "$(cat "$OO/values.yaml")" "$o0"
+vals_run "$OO"; rc=$?
+check "OnlyOffice amont : signale un changement (rc 0)" "$rc" "0"
+check "OnlyOffice amont : passe sur ONLYOFFICE_IMAGE, commentaire gardé" "$(oo_img "$OO")" "  image: $OOI   # pinned (chart default is :latest)"
+check "OnlyOffice amont : livekit intact" "$(grep -c 'image: livekit/livekit-server:v1.13.2' "$OO/values.yaml")" "1"
+o1="$(cat "$OO/values.yaml")"; vals_run "$OO"; rc=$?
+check "OnlyOffice : seconde passe sans changement (rc 1)" "$rc" "1"
+check "OnlyOffice : seconde passe, fichier identique"     "$(cat "$OO/values.yaml")" "$o1"
+OO="$WORK/oo-old"; oo_box "$OO" '  image: "docker.io/onlyoffice/documentserver:9.2.1"'
+vals_run "$OO"; check "OnlyOffice 9.2.1 cité (docker.io) : passe sur ONLYOFFICE_IMAGE" "$(oo_img "$OO")" "  image: $OOI"
+OO="$WORK/oo-ours"; oo_box "$OO" "  image: ghcr.io/scriptor-group/suite-366-onlyoffice:9.3.0-s1"
+vals_run "$OO"; check "ancien tag à nous : passe sur ONLYOFFICE_IMAGE" "$(oo_img "$OO")" "  image: $OOI"
+OO="$WORK/oo-custom"; oo_box "$OO" "  image: registry.example/acme/documentserver-ee:9.4.0"
+vals_run "$OO"; check "image d'opérateur : intacte" "$(oo_img "$OO")" "  image: registry.example/acme/documentserver-ee:9.4.0"
+vals_run "$OO"; check "image d'opérateur : seconde passe sans changement (rc 1)" "$?" "1"
+
 CUR="$WORK/current"; mkdir -p "$CUR/llm"; cp "$BOX2/llm/.env" "$CUR/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$CUR/llm/profiles.sh"
 sed "s#@DATA_DIR@#$CUR#g" "$REPO_ROOT/tools/testdata/values-plain.rendered.yaml" > "$CUR/values.yaml"
 c0="$(cat "$CUR/values.yaml")"; vals_run "$CUR"; rc=$?
@@ -461,7 +493,7 @@ vdiff() { # vdiff RC — the stubbed `ensure_appliance_values --check` returns R
 out="$(vdiff 1)"; check "values.yaml à jour : pas une mise à jour"  "${out%% *}" "0"
 contains "…et la box est à jour" "$out" "up-to-date"
 out="$(vdiff 0)"; check "values.yaml en retard : mise à jour"      "${out%% *}" "1"
-contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench)"
+contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench, OnlyOffice image)"
 
 # --- 5. sandbox-api suit la ConfigMap convergée ------------------------------------------
 head_ "update.sh restart_sandbox_api"

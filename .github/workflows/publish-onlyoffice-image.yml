@@ -1,0 +1,132 @@
+name: Publish OnlyOffice image
+
+# Builds onlyoffice/Dockerfile — the upstream Document Server minus its AI
+# plugin — and publishes it to
+# ghcr.io/scriptor-group/suite-366-onlyoffice:<base tag>-s<SUITE366_REV>
+# for both architectures the appliance ships on.
+#
+# Runs on every push to main that touches the Dockerfile, and by hand. The tag
+# is IMMUTABLE (same rule as publish-vllm-image.yml): a tag that already exists
+# is left alone — bump SUITE366_REV to publish a change. Boxes move to a new
+# tag through values.yaml (fresh installs) and update.sh ONLYOFFICE_IMAGE
+# (existing boxes), not through this workflow.
+#
+# The boxes pull anonymously: the first publish creates the package PRIVATE
+# (GitHub's default) — flip it to public once in the package settings, and
+# remove the inherited access, like suite-366-vllm.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'onlyoffice/**'
+      - '.github/workflows/publish-onlyoffice-image.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild and overwrite an existing tag (only for a tag no box has pulled yet)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-onlyoffice-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + push (linux/amd64, linux/arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write   # push the image to GHCR
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Resolve the tag from the Dockerfile
+        id: tag
+        run: |
+          set -euo pipefail
+          base="$(sed -n 's/^ARG BASE_IMAGE=//p' onlyoffice/Dockerfile | head -1)"
+          rev="$(sed -n 's/^ARG SUITE366_REV=//p' onlyoffice/Dockerfile | head -1)"
+          [[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9._-]+$ ]] || { echo "::error::base image must be repo:tag, got '$base'"; exit 1; }
+          [[ "$rev" =~ ^[0-9]+$ ]] || { echo "::error::SUITE366_REV must be a number, got '$rev'"; exit 1; }
+          image="ghcr.io/scriptor-group/suite-366-onlyoffice:${base##*:}-s${rev}"
+          # The pin a box converges to must be the image this publishes.
+          grep -q "^ONLYOFFICE_IMAGE=\"$image\"" update.sh || { echo "::error::update.sh ONLYOFFICE_IMAGE is not $image"; exit 1; }
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "rev=$rev"     >> "$GITHUB_OUTPUT"
+          echo "::notice::$image (base $base, revision $rev)"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip when the tag already exists
+        id: exists
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            if [[ "$FORCE" == "true" ]]; then
+              echo "::warning::$IMAGE exists — overwriting on request (force)."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::$IMAGE already published — nothing to do (bump SUITE366_REV to publish a change)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The arm64 layer is one python3 RUN: emulated, it takes seconds.
+      - name: Set up QEMU
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up buildx
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ./onlyoffice
+          file: ./onlyoffice/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          no-cache: true
+          provenance: false
+
+      - name: Verify what was published
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+          REV: ${{ steps.tag.outputs.rev }}
+        run: |
+          set -euo pipefail
+          archs="$(docker manifest inspect "$IMAGE" | python3 -c 'import json,sys; print(" ".join(sorted(m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"])))')"
+          [[ "$archs" == "amd64 arm64" ]] || { echo "::error::architectures '$archs', expected 'amd64 arm64'"; exit 1; }
+          for p in linux/amd64 linux/arm64; do
+            docker pull -q --platform "$p" "$IMAGE" >/dev/null
+            got="$(docker image inspect -f '{{index .Config.Labels "suite366.onlyoffice"}}' "$IMAGE")"
+            [[ "$got" == "$REV" ]] || { echo "::error::$p: label suite366.onlyoffice=$got, expected $REV"; exit 1; }
+            docker run --rm --platform "$p" --entrypoint python3 "$IMAGE" -c '
+          import json
+          l = json.load(open("/var/www/onlyoffice/documentserver/sdkjs-plugins/plugin-list-default.json"))
+          assert "ai" not in l and l, l
+          print(l)'
+          done
+          echo "::notice::published $IMAGE"
