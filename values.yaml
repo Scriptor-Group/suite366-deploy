@@ -255,7 +255,7 @@ minio:
 
 onlyoffice:
   enabled: true
-  image: onlyoffice/documentserver:9.4.0   # pinned (chart default is :latest)
+  image: ghcr.io/scriptor-group/suite-366-onlyoffice:9.4.0-s1   # onlyoffice/Dockerfile: 9.4.0 without its AI plugin; = update.sh ONLYOFFICE_IMAGE
   persistence:
     enabled: true
     size: 10Gi

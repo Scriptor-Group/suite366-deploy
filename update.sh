@@ -116,6 +116,11 @@ MANIFEST_SIG_URL="${MANIFEST_SIG_URL:-$MANIFEST_URL.sig}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/scriptor-group/chart/drive}"
 NAMESPACE="${NAMESPACE:-suite366}"
 RELEASE="${RELEASE:-drive}"
+# The OnlyOffice image every box runs (onlyoffice/Dockerfile: upstream minus
+# its AI plugin), converged into values.yaml by ensure_appliance_values. The
+# same tag as the values.yaml pin; publish-onlyoffice-image.yml refuses to
+# publish a tag this line does not name.
+ONLYOFFICE_IMAGE="ghcr.io/scriptor-group/suite-366-onlyoffice:9.4.0-s1"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
 UPDATE_WEBHOOK="${UPDATE_WEBHOOK:-}"
 SELF_UPDATE="${SELF_UPDATE:-1}"
@@ -855,7 +860,7 @@ compute_diffs() {
   # up-to-date box could only get it from a root shell. Guarded so the diffs
   # self-test, which extracts this function alone, is unaffected.
   if declare -F ensure_appliance_values >/dev/null && ensure_appliance_values --check; then values_diff=1; fi
-  if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench) — converged on apply"; fi
+  if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench / OnlyOffice image) — converged on apply"; fi
 
   # A channel BEHIND the box is not an update, but it is worth saying out loud:
   # it usually means the channel has not been rolled since this box was built,
@@ -877,7 +882,7 @@ compute_diffs() {
   [[ "$app_diff"   == 1 ]] && parts+=("app ${cur_app:-?} -> $want_app")
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
   [[ "$host_diff"  == 1 ]] && parts+=("host layer (model switch, transcription) -> ${want_host:0:12}")
-  [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench)")
+  [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench, OnlyOffice image)")
   [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
 }
@@ -1165,12 +1170,13 @@ ensure_appliance_values() { # ensure_appliance_values [--check] -> 0 changed/wou
     return 1
   fi
   stt="$(detect_stt_model)"
-  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" CHECK_ONLY="$check" python3 - "$vals" <<'PY'
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" ONLYOFFICE_IMAGE="${ONLYOFFICE_IMAGE:-}" CHECK_ONLY="$check" python3 - "$vals" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 data_dir = os.environ["DATA_DIR"]
 stt = os.environ.get("STT_MODEL", "")
 app_version = os.environ.get("APP_VERSION", "")
+onlyoffice_image = os.environ.get("ONLYOFFICE_IMAGE", "")
 check_only = os.environ.get("CHECK_ONLY", "0") == "1"
 text = open(path, encoding="utf-8").read()
 lines = text.split("\n")
@@ -1295,6 +1301,18 @@ if ci is not None:
                 at = k + 1
         lines[at:at] = ['  VLLM_MODEL_TRANSCRIPTION: "' + stt + '"']
         added += 1
+# onlyoffice.image: the upstream image (any tag) or an older tag of ours moves
+# to ONLYOFFICE_IMAGE -- upstream reinstalls its AI plugin at every pod start.
+# Any other image is an operator's choice and is left alone.
+oi, oj = region("onlyoffice")
+if onlyoffice_image and oi is not None:
+    for k in range(oi + 1, oj):
+        m = re.match(r'^(  image:\s*)"?((?:docker\.io/)?onlyoffice/documentserver|ghcr\.io/scriptor-group/suite-366-onlyoffice)(:[^"\s#]*)?"?(.*)$', lines[k])
+        if m:
+            if m.group(2) + (m.group(3) or "") != onlyoffice_image:
+                lines[k] = m.group(1) + onlyoffice_image + m.group(4)
+                added += 1
+            break
 new = "\n".join(lines) + "\n"
 if new != text:
     if not check_only:
