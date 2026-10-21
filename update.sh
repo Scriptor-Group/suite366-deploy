@@ -101,6 +101,8 @@
 #                       when absent (every box is strict since 2026-10-13).
 #   PACKAGE_PUBLIC_KEY_NEXT  a second key accepted during a rotation.
 #                   Absent file => every offline package is refused.
+#   HOOKS_DIR       extension hooks, run at the end of `check` and `apply`
+#                   (default $DATA_DIR/hooks.d) — see run_update_hooks.
 # =============================================================================
 set -euo pipefail
 
@@ -131,6 +133,10 @@ UPDATE_WEBHOOK="${UPDATE_WEBHOOK:-}"
 SELF_UPDATE="${SELF_UPDATE:-1}"
 SELF_URL="${SELF_URL:-${MANIFEST_URL%/*}/update.sh}"
 MARKER="$DATA_DIR/update-available"
+# Layers installed ON TOP of this product (suite366-fleet on a rented box) put
+# an executable here to be converged by the same check/apply — see
+# run_update_hooks. Empty or absent on a customer-run appliance.
+HOOKS_DIR="${HOOKS_DIR:-$DATA_DIR/hooks.d}"
 
 # --- Backup agent ---------------------------------------------------------------
 # The updater refreshes itself on every apply. If the backup agent did not move
@@ -1515,6 +1521,7 @@ do_apply() {
     converge_backup
     reconcile_and_check_vllm_db 0
     converge_public_ingress_env
+    run_update_hooks apply
     return 0
   fi
 
@@ -1615,6 +1622,8 @@ do_apply() {
   # refresh this script for the next run. Ordered BEFORE write_state_json so the
   # retired offline source is reflected in the state the app reads.
   install_units
+  # Before the staged package is retired: a hook may carry its own layer in it.
+  run_update_hooks apply
   if [[ "$UPDATE_SOURCE" == "usb" ]]; then
     self_update_from_package
     # BEFORE retire_staged_package: retiring deletes the staged content, and the
@@ -2873,6 +2882,50 @@ converge_public_ingress_env() {
   fi
 }
 
+# --- Extension hooks ------------------------------------------------------------
+# A layer installed on top of this product — suite366-fleet's support access,
+# console, hardening and remote publication on a rented box — is root code this
+# updater knows nothing about. Without a way in, it stayed as it was installed:
+# the channel rolled the app, the chart and the host layer forward and left the
+# fleet layer behind, security fixes included, on boxes nobody can SSH into
+# outside a support window. So the layer puts an executable in $HOOKS_DIR and is
+# called with the same verb as this run (`check` daily, `apply` from the UI);
+# what it fetches, verifies and converges is its own business.
+#
+# Trust: root runs these, so only what root alone could have written is run — a
+# directory and regular files (no symlinks) owned by the user running this
+# script (root; the self-test runs unprivileged), writable by nobody else.
+# Anything else is skipped and said. A hook never fails the update: its exit
+# code is logged, nothing more.
+run_update_hooks() { # run_update_hooks check|apply
+  local mode="$1" hook own perm rc me
+  [[ -d "$HOOKS_DIR" ]] || return 0
+  if [[ -L "$HOOKS_DIR" ]]; then warn "hooks: $HOOKS_DIR is a symlink — no hook run."; return 0; fi
+  me="$(id -u)"
+  read -r own perm < <(stat -c '%u %a' "$HOOKS_DIR")
+  if [[ "$own" != "$me" ]] || (( 8#$perm & 8#022 )); then
+    warn "hooks: $HOOKS_DIR is not root-owned or is writable by others — no hook run."; return 0
+  fi
+  shopt -s nullglob
+  for hook in "$HOOKS_DIR"/*; do
+    [[ -L "$hook" || ! -f "$hook" || ! -x "$hook" ]] && { warn "hooks: skipping $hook (not a regular executable file)."; continue; }
+    read -r own perm < <(stat -c '%u %a' "$hook")
+    if [[ "$own" != "$me" ]] || (( 8#$perm & 8#022 )); then
+      warn "hooks: skipping $hook (not root-owned, or writable by others)."; continue
+    fi
+    log "Hook $(basename "$hook") $mode"
+    rc=0
+    DATA_DIR="$DATA_DIR" UPDATE_SOURCE="${UPDATE_SOURCE:-none}" OFFLINE_PKG="$OFFLINE_PKG" \
+      PACKAGE_PUBLIC_KEY="$PACKAGE_PUBLIC_KEY" PACKAGE_PUBLIC_KEY_NEXT="$PACKAGE_PUBLIC_KEY_NEXT" \
+      timeout "${HOOK_TIMEOUT:-1800}" "$hook" "$mode" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+      warn "hook $(basename "$hook") $mode exited $rc (non-blocking)."
+      logger -t suite366-update "hook $(basename "$hook") $mode exited $rc" 2>/dev/null || true
+    fi
+  done
+  shopt -u nullglob
+}
+
 require_cluster_tools() {
   have helm || die "helm not found."
   have k3s  || die "k3s not found."
@@ -2899,6 +2952,8 @@ case "$MODE" in
     # what turns "undetected until a customer complains" into "self-healed
     # within 24 hours". DEEP=0 — no nightly POST to the LLM.
     reconcile_and_check_vllm_db 0
+    # Same argument once more, for the layers installed on top of this one.
+    run_update_hooks check
     ;;
   apply)
     require_cluster_tools

@@ -988,6 +988,15 @@ itself rolls forward with regular updates. That refresh is signature-verified on
 any appliance holding the package public key (see *Signed channels* below);
 disable it entirely with `SELF_UPDATE=0` in `update.env`.
 
+**Extension hooks**: a layer installed on top of this product (the
+`suite366-fleet` layer on a rented box) puts an executable in
+`/opt/suite366/hooks.d/`, and `update.sh` calls it at the end of every `check`
+(the daily timer) and every `apply` with that verb, plus `DATA_DIR`,
+`UPDATE_SOURCE`, `OFFLINE_PKG` and the package keys in its environment. Only a
+root-owned directory and root-owned regular files writable by nobody else are
+run; a hook's failure is logged and never fails the update. Without it the
+fleet layer stayed as it was installed while the channel moved everything else.
+
 **App version pinning**: the appliance pins the app + sandbox image tags in
 `values.yaml` (offline safety), so a bare `helm upgrade` never moves the app.
 `channel.json`'s `app_version` is what rolls the app forward: on apply,
