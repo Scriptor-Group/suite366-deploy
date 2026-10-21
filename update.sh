@@ -61,6 +61,10 @@
 #                 192.168.1.72"). Run at boot, by NetworkManager on every
 #                 address change, by `check` and by install-units; cheap,
 #                 offline-safe, no cluster needed.
+#   public-ingress  converge the tunnel's Traefik entrypoint (suite366-public,
+#                 :8443, sets X-Suite366-Ingress: public) and publish
+#                 PUBLIC_INGRESS_PORT in update.env once it is live. `check`
+#                 and `apply` do it too; this is for suite366-fleet.
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
@@ -1288,10 +1292,11 @@ if si is not None:
         if re.match(r"^  workbench:\s*$", lines[k]):
             added += ensure_quoted_limit(k, sub_block(k, sj, 2), 4, "idleStopMs", "7200000")
             break
-# Deliberately NOT converged here: `config.APPLIANCE_ADMIN_EMAIL` (it only
-# gates the FIRST organisation of a virgin box — every box that runs this has
-# one already, and adding it would misdescribe the box) and `secrets:` (the
-# instance licence is provisioned by `update.sh license set`, never guessed).
+# Deliberately NOT converged here: `config.APPLIANCE_ADMIN_EMAIL` and
+# `config.APPLIANCE_CLAIM_LAN_ONLY` (both only gate the FIRST organisation of a
+# virgin box — every box that runs this has one already, and adding either
+# would misdescribe the box) and `secrets:` (the instance licence is
+# provisioned by `update.sh license set`, never guessed).
 ci, cj = region("config")
 if ci is not None:
     if not any(re.match(r"^\s+VLLM_MODEL_TRANSCRIPTION:", l) for l in lines[ci:cj]):
@@ -1503,6 +1508,7 @@ do_apply() {
     self_update
     converge_backup
     reconcile_and_check_vllm_db 0
+    converge_public_ingress_env
     return 0
   fi
 
@@ -1614,6 +1620,7 @@ do_apply() {
     self_update
     converge_backup
   fi
+  converge_public_ingress_env
 
   UPDATE_SOURCE=none
   write_state_json 0
@@ -2658,6 +2665,185 @@ do_license() { # do_license set TOKEN|- | show
   log "Licence installed — the appliance administrators can now create organisations from the app (Appliance → Organisations)."
 }
 
+# --- the public Traefik entrypoint (lib/ingress.sh) ---------------------------------
+# The tunnel's own door: Traefik entrypoint suite366-public on :8443, which
+# sets X-Suite366-Ingress: public, while web/websecure strip it. Converged on
+# `check` too -- the boxes installed before it existed are the ones nobody runs
+# `apply` on -- and published in update.env (PUBLIC_INGRESS_PORT) for
+# suite366-fleet's frpc once live. Idempotent: an unchanged HelmChartConfig
+# does not roll Traefik.
+# >>> SHARED public-ingress BLOCK >>> (lib/ingress.sh, copied verbatim into update.sh — tools/test-public-ingress.sh fails on drift)
+# The contract with suite366-fleet (frpc's localPort) and the app (the header):
+# constants, not settings.
+PUBLIC_INGRESS_PORT=8443
+PUBLIC_INGRESS_HEADER="X-Suite366-Ingress"
+PUBLIC_INGRESS_WAIT="${PUBLIC_INGRESS_WAIT:-60}"   # x5 s for helm-controller to roll Traefik
+
+# The two header middlewares. Applied BEFORE the HelmChartConfig, and checked:
+# an entrypoint that names a middleware Traefik cannot find fails EVERY router
+# on it — websecure included, i.e. the whole LAN.
+public_ingress_middlewares() {
+  cat <<EOF
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: suite366-ingress-public
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: suite366-deploy
+spec:
+  headers:
+    customRequestHeaders:
+      $PUBLIC_INGRESS_HEADER: "public"
+---
+# An empty value DELETES the header (Traefik headers middleware).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: suite366-ingress-strip
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: suite366-deploy
+spec:
+  headers:
+    customRequestHeaders:
+      $PUBLIC_INGRESS_HEADER: ""
+EOF
+}
+
+# Merged by k3s's helm-controller over its own traefik valuesContent (maps
+# merge, lists replace — web/websecure have no middlewares of their own).
+# Entrypoint-level references use the provider-qualified form
+# <namespace>-<name>@kubernetescrd.
+public_ingress_helmchartconfig() {
+  cat <<EOF
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: suite366-deploy
+spec:
+  valuesContent: |-
+    providers:
+      kubernetesCRD:
+        enabled: true
+    ports:
+      web:
+        http:
+          middlewares:
+            - kube-system-suite366-ingress-strip@kubernetescrd
+      websecure:
+        http:
+          middlewares:
+            - kube-system-suite366-ingress-strip@kubernetescrd
+      suite366-public:
+        port: 9443
+        expose:
+          default: true
+        exposedPort: $PUBLIC_INGRESS_PORT
+        protocol: TCP
+        http:
+          tls:
+            enabled: true
+          middlewares:
+            - kube-system-suite366-ingress-public@kubernetescrd
+EOF
+}
+
+public_ingress_svc_ports() { # -> the Traefik Service's ports, one per line (fails when the API does not answer)
+  kc -n kube-system get svc traefik -o jsonpath='{range .spec.ports[*]}{.port}{"\n"}{end}' 2>/dev/null
+}
+
+public_ingress_live() { # -> 0 when the Service exposes the port AND both middlewares exist
+  public_ingress_svc_ports | grep -qx "$PUBLIC_INGRESS_PORT" || return 1
+  kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1
+}
+
+converge_public_ingress() { # -> 0 live, 1 not (nothing is published then)
+  local i owner out
+  # A fresh cluster may still be running k3s's traefik-crd install job.
+  for i in $(seq 1 36); do
+    kc get crd middlewares.traefik.io >/dev/null 2>&1 && break
+    sleep 5
+  done
+  if ! kc wait --for=condition=Established crd/middlewares.traefik.io --timeout=60s >/dev/null 2>&1; then
+    warn "public entrypoint: Traefik's Middleware CRD is not there (k3s Traefik disabled?) — not configured."
+    return 1
+  fi
+  # One HelmChartConfig per chart: an operator's own would be clobbered.
+  if kc -n kube-system get helmchartconfig traefik >/dev/null 2>&1; then
+    owner="$(kc -n kube-system get helmchartconfig traefik -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+    if [[ "$owner" != "suite366-deploy" ]]; then
+      warn "public entrypoint: kube-system/traefik HelmChartConfig was not written by suite366-deploy — left alone, entrypoint NOT configured."
+      warn "  Merge public_ingress_helmchartconfig (lib/ingress.sh) into it by hand, then re-run."
+      return 1
+    fi
+  fi
+  if ! out="$(public_ingress_middlewares | kc apply -f - 2>&1)"; then
+    warn "public entrypoint: middlewares not applied: $out"; return 1
+  fi
+  if ! kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1; then
+    warn "public entrypoint: middlewares not readable after apply — HelmChartConfig NOT applied."; return 1
+  fi
+  if ! out="$(public_ingress_helmchartconfig | kc apply -f - 2>&1)"; then
+    warn "public entrypoint: HelmChartConfig not applied: $out"; return 1
+  fi
+  case "$out" in
+    *unchanged*) ;;
+    *) info "public entrypoint: HelmChartConfig applied — k3s rolls Traefik (a few seconds without ingress)." ;;
+  esac
+  for i in $(seq 1 "$PUBLIC_INGRESS_WAIT"); do
+    public_ingress_live && break
+    sleep 5
+  done
+  if ! public_ingress_live; then
+    warn "public entrypoint: Traefik does not expose :$PUBLIC_INGRESS_PORT yet — check: sudo k3s kubectl -n kube-system get job,pod | grep traefik"
+    return 1
+  fi
+  if ! kc -n kube-system rollout status deploy/traefik --timeout=180s >/dev/null 2>&1; then
+    warn "public entrypoint: Traefik rollout incomplete — check: sudo k3s kubectl -n kube-system get pods"
+    return 1
+  fi
+  info "public entrypoint: suite366-public live on :$PUBLIC_INGRESS_PORT (sets $PUBLIC_INGRESS_HEADER; web/websecure strip it)."
+  return 0
+}
+
+# PUBLIC_INGRESS_PORT=… in update.env: present iff the entrypoint is live.
+# Removed only on a POSITIVE observation (the API answers, the port is not
+# there): a transient API failure must not swing the tunnel back and forth.
+record_public_ingress_port() { # record_public_ingress_port FILE LIVE(0|1)
+  local f="$1" live="$2" cur new
+  [[ -f "$f" ]] || return 0
+  cur="$(cat "$f")"
+  if [[ "$live" != 1 ]]; then
+    local ports
+    ports="$(public_ingress_svc_ports)" || return 0
+    if grep -qx "$PUBLIC_INGRESS_PORT" <<<"$ports"; then return 0; fi
+  fi
+  new="$(grep -v '^PUBLIC_INGRESS_PORT=' <<<"$cur" || true)"
+  if [[ "$live" == 1 ]]; then
+    new="${new:+$new
+}PUBLIC_INGRESS_PORT=$PUBLIC_INGRESS_PORT"
+  fi
+  [[ "$new" == "$cur" ]] && return 0
+  if ! { ( umask 077; printf '%s\n' "$new" > "$f.tmp" ) && mv -f "$f.tmp" "$f"; }; then
+    warn "could not rewrite $f (PUBLIC_INGRESS_PORT)."; rm -f "$f.tmp"; return 0
+  fi
+  if [[ "$live" == 1 ]]; then info "update.env: PUBLIC_INGRESS_PORT=$PUBLIC_INGRESS_PORT published."
+  else warn "update.env: PUBLIC_INGRESS_PORT withdrawn (Traefik does not expose it)."; fi
+}
+# <<< END SHARED public-ingress BLOCK <<<
+
+converge_public_ingress_env() {
+  if converge_public_ingress; then
+    record_public_ingress_port "$DATA_DIR/update.env" 1
+  else
+    record_public_ingress_port "$DATA_DIR/update.env" 0
+  fi
+}
+
 require_cluster_tools() {
   have helm || die "helm not found."
   have k3s  || die "k3s not found."
@@ -2684,6 +2870,7 @@ case "$MODE" in
     # what turns "undetected until a customer complains" into "self-healed
     # within 24 hours". DEEP=0 — no nightly POST to the LLM.
     reconcile_and_check_vllm_db 0
+    converge_public_ingress_env
     ;;
   apply)
     require_cluster_tools
@@ -2711,7 +2898,13 @@ case "$MODE" in
   host-facts)
     do_host_facts
     ;;
+  public-ingress)
+    # What check/apply already do, on its own: for suite366-fleet, which wants
+    # the entrypoint (and PUBLIC_INGRESS_PORT) before it re-points frpc.
+    have k3s || die "k3s not found."
+    converge_public_ingress_env
+    ;;
   *)
-    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot | host-facts)"
+    die "Unknown mode '$MODE' (use: check | apply | scan-usb DIR | install-units | license set <token|-> | license show | power shutdown|reboot | host-facts | public-ingress)"
     ;;
 esac

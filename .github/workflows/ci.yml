@@ -59,6 +59,10 @@ jobs:
       # what it got before.
       - name: values.yaml dual-name rendering self-test
         run: ./tools/test-dual-names.sh
+      # The tunnel's own Traefik entrypoint: the header the app trusts to tell
+      # the internet from the LAN, and the port frpc is pointed at.
+      - name: Public Traefik entrypoint self-test
+        run: ./tools/test-public-ingress.sh
       # Both of these were found by running the installer against a published
       # box, not by reading it: an empty issuerRef, and four working
       # certificates replaced by a self-signed placeholder.

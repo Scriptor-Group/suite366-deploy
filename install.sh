@@ -51,6 +51,11 @@
 #                              admin@<DOMAIN>): the ONLY account allowed to
 #                              register the first organisation; only appliance
 #                              administrators create organisations after that.
+#   APPLIANCE_CLAIM_LAN_ONLY=1 set by suite366-fleet for an UNCLAIMED box: no
+#                              admin@<DOMAIN> default and no prompt — ADMIN_EMAIL
+#                              may be empty — and the app lets the first
+#                              administrator be created from the LAN only
+#                              (never through the public tunnel).
 #   LICENSE_KEY                optional instance licence (EdDSA JWT, scope
 #                              "instance", issued off-box by the owner). Lets
 #                              the box host several organisations, seats
@@ -182,7 +187,7 @@ load_module() { # load_module NAME  (=> sources lib/NAME.sh)
 
 # Load order matters: config (defaults) and common (helpers) first, then each
 # deploy step in the order main() calls it.
-MODULES=(config common preflight network k3s vllm cert-manager suite vllm-db mdns updater backup summary)
+MODULES=(config common preflight network k3s vllm cert-manager suite ingress vllm-db mdns updater backup summary)
 for _m in "${MODULES[@]}"; do load_module "$_m"; done
 
 main() {
@@ -193,6 +198,9 @@ main() {
   if [[ "$SKIP_VLLM" == "1" ]]; then warn "vLLM stack not deployed (SKIP_VLLM)."; else deploy_vllm; fi
   install_cert_manager
   deploy_suite
+  # The tunnel's own Traefik entrypoint (lib/ingress.sh). Before
+  # setup_update_timer, which publishes PUBLIC_INGRESS_PORT only if it is live.
+  setup_public_ingress
   # The chart has just re-pushed the key into the app's Secret; realign the copy
   # in Postgres, which is the only one an LLM call reads (see lib/vllm-db.sh).
   reconcile_vllm_provider_row

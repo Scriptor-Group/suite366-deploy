@@ -137,6 +137,11 @@ config:
   # update.sh does NOT add this to older boxes: their first organisation
   # already exists.
   APPLIANCE_ADMIN_EMAIL: "@ADMIN_EMAIL@"
+  # Unclaimed fleet box (APPLIANCE_CLAIM_LAN_ONLY=1): APPLIANCE_ADMIN_EMAIL is    #@claim
+  # empty and the first administrator may only be created from the LAN —    #@claim
+  # the app refuses requests the public Traefik entrypoint marks with    #@claim
+  # `X-Suite366-Ingress: public`. Tagged `#@claim`: deleted on every other box.    #@claim
+  APPLIANCE_CLAIM_LAN_ONLY: "true"    #@claim
   # SMTP (optional) — fill in if you need outgoing email:
   # SMTP_HOST: smtp.example.com
   # SMTP_PORT: "587"

@@ -60,6 +60,9 @@ UPDATE_WEBHOOK=$UPDATE_WEBHOOK
 PACKAGE_PUBLIC_KEY=$PACKAGE_PUBLIC_KEY
 EOF
   )
+  # The tunnel's entrypoint, for suite366-fleet's frpc — only when
+  # setup_public_ingress saw it live (update.sh keeps it converged after that).
+  record_public_ingress_port "$DATA_DIR/update.env" "${PUBLIC_INGRESS_LIVE:-0}"
 
   # Units generated inline (not fetched) so the $DATA_DIR path is baked in,
   # matching how suite366-vllm.service is created.

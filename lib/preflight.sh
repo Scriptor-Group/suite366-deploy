@@ -483,14 +483,27 @@ license_key_from_values() { # license_key_from_values FILE -> token or nothing
 }
 
 # --- Gather parameters -------------------------------------------------------
+# The ONLY account allowed to register the FIRST organisation of the box (the
+# app reads it as APPLIANCE_ADMIN_EMAIL); it becomes the appliance
+# administrator, and only appliance administrators create organisations after
+# that. Without it, the first person to reach /register on the LAN is — which
+# is exactly what an UNCLAIMED fleet box wants (APPLIANCE_CLAIM_LAN_ONLY=1):
+# no prompt, no admin@<DOMAIN> default (`ask` would turn an empty value into
+# it), the address only if the fleet layer passed one. Extracted by
+# tools/test-dual-names.sh.
+gather_admin_email() {
+  if [[ "${APPLIANCE_CLAIM_LAN_ONLY:-}" == "1" ]]; then
+    ADMIN_EMAIL="${ADMIN_EMAIL:-}"
+    info "Unclaimed box: the first administrator is created from the LAN${ADMIN_EMAIL:+ (restricted to $ADMIN_EMAIL)}."
+    return 0
+  fi
+  ask ADMIN_EMAIL  "Appliance administrator e-mail (the only account allowed to create the first organisation)"  "admin@$DOMAIN"
+}
+
 gather_inputs() {
   log "Configuration"
   gather_hosts
-  # The ONLY account allowed to register the FIRST organisation of the box
-  # (the app reads it as APPLIANCE_ADMIN_EMAIL); it becomes the appliance
-  # administrator, and only appliance administrators create organisations
-  # after that. Without it, the first person to reach /register on the LAN is.
-  ask ADMIN_EMAIL  "Appliance administrator e-mail (the only account allowed to create the first organisation)"  "admin@$DOMAIN"
+  gather_admin_email
   echo
   # Model ids are still written into values.yaml (the app advertises them, even
   # when the local vLLM backend isn't deployed), so we ask for them regardless.

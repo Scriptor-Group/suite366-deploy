@@ -66,6 +66,17 @@ deploy_suite() {
   else
     origins_lines='/#@origins$/d'
   fi
+  # And `#@claim`: an unclaimed fleet box (APPLIANCE_CLAIM_LAN_ONLY=1) carries
+  # APPLIANCE_CLAIM_LAN_ONLY, every other box renders exactly as before. The
+  # administrator address goes through the same escaping as the public key: an
+  # `&` or `|` in it is syntax in a sed replacement.
+  local claim_lines admin_esc
+  if [[ "${APPLIANCE_CLAIM_LAN_ONLY:-}" == "1" ]]; then
+    claim_lines='s|[[:space:]]*#@claim$||'
+  else
+    claim_lines='/#@claim$/d'
+  fi
+  admin_esc="$(printf '%s' "${ADMIN_EMAIL:-}" | sed -e 's/[&|\\]/\\&/g')"
   local cert_annotation turn_cert_manager
   if [[ "$TLS_MODE" == "provided" || "$TLS_MODE" == "pushed" ]]; then
     cert_annotation="suite366.ai/tls-mode: \"$TLS_MODE\""
@@ -84,6 +95,7 @@ deploy_suite() {
             -e "$proxy_lines" \
             -e "$notproxy_lines" \
             -e "$origins_lines" \
+            -e "$claim_lines" \
             -e "s|@DOMAIN@|$DOMAIN|g" \
             -e "s|@APP_HOST@|$APP_HOST|g" \
             -e "s|@OFFICE_HOST@|$OFFICE_HOST|g" \
@@ -114,7 +126,7 @@ deploy_suite() {
             -e "s|@VLLM_MAX_CONTEXT_WINDOW@|$VLLM_MAX_CONTEXT_WINDOW|g" \
             -e "s|@LICENSE_PUBLIC_KEY@|$lpk_esc|g" \
             -e "s|@LICENSE_KEY@|$LICENSE_KEY|g" \
-            -e "s|@ADMIN_EMAIL@|$ADMIN_EMAIL|g" \
+            -e "s|@ADMIN_EMAIL@|$admin_esc|g" \
             -e "s|@SANDBOX_NAMESPACE@|$SANDBOX_NAMESPACE|g" \
             -e "s|@DATA_DIR@|$DATA_DIR|g" \
         > "$vals" )
