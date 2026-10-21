@@ -591,6 +591,12 @@ case "$TARGET" in
       set_env LLM_GPU_MEM_UTIL "$LLM_P_GPU_MEM_UTIL"
     fi
     set_env_default LLM_MAX_MODEL_LEN "$LLM_P_MAX_MODEL_LEN"
+    # qwen27b shipped with 2 slots until 2026-10-21 (llm/profiles.sh says why it
+    # is 6 now): a box still on that default moves up; any other value is the
+    # operator's and stays.
+    if [[ "$prof" == qwen27b && "$(env_get LLM_MAX_NUM_SEQS)" == 2 ]]; then
+      set_env LLM_MAX_NUM_SEQS "$LLM_P_MAX_NUM_SEQS"
+    fi
     set_env_default LLM_MAX_NUM_SEQS  "$LLM_P_MAX_NUM_SEQS"
     set_env         LLM_MTP_TOKENS    "$LLM_P_MTP_TOKENS"
     set_env_default EMBED_MODEL       "$LLM_EMBED_MODEL_DEFAULT"

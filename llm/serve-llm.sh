@@ -35,10 +35,13 @@ case "$LLM_PROFILE" in
     # No --quantization: the ModelOpt mixed NVFP4/FP8 recipe is read from
     # hf_quant_config.json. No --trust-remote-code: config.json carries no
     # auto_map, vLLM's own handler loads this architecture.
+    # --enable-prompt-tokens-details: usage.prompt_tokens_details.cached_tokens
+    # in every response, i.e. how much of the prompt the prefix cache served.
     exec vllm serve "$LLM_MODEL" "${common[@]}" \
       --kv-cache-dtype fp8 \
       --max-num-batched-tokens 8192 \
       --async-scheduling \
+      --enable-prompt-tokens-details \
       --load-format fastsafetensors \
       --reasoning-parser qwen3 \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml \

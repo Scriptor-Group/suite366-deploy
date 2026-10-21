@@ -113,7 +113,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
 | `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
 | `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
-| `LLM_MAX_NUM_SEQS` | `2` | max concurrent streams on the generative (cf. § GB10 realities) |
+| `LLM_MAX_NUM_SEQS` | *from the profile* | max concurrent streams on the generative: 6 for `qwen27b`, 8 for `orcasaq-batch`, 2 for the others (cf. § GB10 realities) |
 | `LLM_MAX_MODEL_LEN` | *from the profile* | max context length (262144 / 131072 / 262144) |
 | `EMBED_MAX_MODEL_LEN` | `8192` | max length for embeddings (enough for RAG chunks) |
 | `VLLM_EMBEDDING_DIMENSIONS` | `4096` | embedding vector dimension (Qwen3-VL-Embedding-8B) |
@@ -587,10 +587,17 @@ FlashInfer autotune sweep, Triton kernels): a restart on an unchanged config is
 96-106 s instead of 257. Change a flag that alters the compiled graph and the
 next start is cold again.
 
-**Concurrency.** `max_num_seqs=2` on every profile. Above that, chunked prefill
-collapses generation throughput on the 27B (the bottleneck is the GB10's prefill
-compute, not memory), and on Flash-Next more slots only grow the CUDA graphs —
-measured, 4 slots cost 3 GiB of KV cache the model does not have.
+**Concurrency.** `max_num_seqs=6` on `qwen27b`, 8 on `orcasaq-batch`, 2 on the
+others. With 2 slots, a third message waits for a whole answer to finish before
+its prompt is even read: replaying 5 users' Suite 366 conversations on the test
+Spark (2026-10-21), the first token came after 39 s median, 47 s p90. At 6 slots
+it is 3.4 s / 8.6 s, each user writing at 17.5 t/s instead of 23, and the total
+throughput goes up (5 cold 8k prompts at once: 29 -> 44 t/s), with 0
+preemptions — the KV cache is one pool, a conversation only takes what it
+holds. On Flash-Next more slots only grow the CUDA graphs — measured, 4 slots
+cost 3 GiB of KV cache the model does not have. 8 slots with a 32k prefill
+budget next to the embed and transcription engines hung the test Spark: do not
+raise both.
 
 ## Wiring the AI (automatic)
 

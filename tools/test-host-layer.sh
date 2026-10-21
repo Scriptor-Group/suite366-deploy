@@ -213,6 +213,14 @@ check "orcasaq-batch : state — embed absent"          "$(python3 -c "import js
 check "orcasaq-batch : state — la carte du profil le dit" "$(python3 -c "import json;print([p for p in json.load(open('$SB'))['profiles'] if p['key']=='orcasaq-batch'][0]['embed'])")" "False"
 check "qwen27b : state — embed servi"                 "$(python3 -c "import json;print(json.load(open('$BOX2/llm-state/state.json'))['embed']['model'])")" "Qwen/Qwen3-VL-Embedding-8B"
 check "qwen27b : tête MTP à 3"              "$(envv "$BOX2" LLM_MTP_TOKENS)" "3"
+# La fixture est à 2 places, l'ancien défaut de qwen27b : converge la remonte à 6.
+check "qwen27b : 2 places (ancien défaut) -> 6" "$(envv "$BOX2" LLM_MAX_NUM_SEQS)" "6"
+# Une autre valeur est un choix d'opérateur : conservée.
+Q3="$WORK/qwen-3slots"; mkbox "$Q3" nvidia/Qwen3.8-27B-NVFP4; mkdir -p "$Q3/systemd"
+sed -i 's/^LLM_MAX_NUM_SEQS=.*/LLM_MAX_NUM_SEQS=3/' "$Q3/llm/.env"; conv "$Q3" >/dev/null
+check "qwen27b : 3 places réglées par l'opérateur conservées" "$(envv "$Q3" LLM_MAX_NUM_SEQS)" "3"
+# Les autres profils gardent leurs 2 places.
+check "gemma : 2 places conservées"         "$(envv "$BOX" LLM_MAX_NUM_SEQS)" "2"
 absent "qwen27b : le conteneur STT n'est pas retiré" "$(cat "$BOX2/docker.log")" "rm -sf vllm-stt"
 
 # --- 2b. une image à construire : les moteurs en place s'arrêtent AVANT ----------
