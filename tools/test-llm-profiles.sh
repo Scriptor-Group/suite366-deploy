@@ -52,6 +52,8 @@ check "qwen27b : modèle"        "$LLM_P_MODEL"          "nvidia/Qwen3.8-27B-NVF
 check "qwen27b : image = l'image moteur (unifiée)" "$LLM_P_IMAGE" "$UNIFIED"
 check "qwen27b : fraction"      "$LLM_P_GPU_MEM_UTIL"   "0.45"
 check "qwen27b : contexte app"  "$LLM_P_CONTEXT_WINDOW" "200000"
+# 6 places : 5 utilisateurs rejoués le 21/10/2026, 1er token 39 s -> 3,4 s.
+check "qwen27b : 6 slots"       "$LLM_P_MAX_NUM_SEQS"   "6"
 check "qwen27b : pas de build"  "$LLM_P_NEEDS_BUILD"    "0"
 check "qwen27b : swappiness hôte" "$LLM_P_SWAPPINESS"   ""
 check "qwen27b : transcription Qwen3-ASR" "$LLM_P_STT_MODEL" "$STT_MODEL"
@@ -147,6 +149,7 @@ contains "qwen27b : parseur d'outils qwen3_xml"    "$q" "--tool-call-parser qwen
 contains "qwen27b : KV en fp8"                     "$q" "--kv-cache-dtype fp8"
 contains "qwen27b : chargement fastsafetensors"    "$q" "--load-format fastsafetensors"
 contains "qwen27b : tête MTP à 3"                  "$q" -- '"num_speculative_tokens":3'
+contains "qwen27b : cached_tokens dans l'usage"    "$q" "--enable-prompt-tokens-details"
 absent   "qwen27b : pas le gabarit Gemma"          "$q" "tool_chat_template_gemma4"
 # orcasaq-batch suit la recette orcasaq : seuls les budgets changent, et ils arrivent par l'env.
 b="$(serve orcasaq-batch)"

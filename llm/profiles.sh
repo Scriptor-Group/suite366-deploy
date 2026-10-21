@@ -150,9 +150,19 @@ llm_profile_apply() {
       # with a fixed-size state. Measured: 0 swap in use at idle.
       LLM_P_GPU_MEM_UTIL="0.45"
       LLM_P_MAX_MODEL_LEN="262144"
-      LLM_P_MAX_NUM_SEQS="2"
+      # 6 slots, not 2: a box serves a team, and the app fires side requests
+      # (title, memory extraction) next to every answer. Measured 2026-10-21 on
+      # the test Spark, 5 users replaying Suite 366 conversations (shared
+      # system prompt, 6 turns each, pre-RAG documents on 2 of them): time to
+      # first token median 39 s / p90 47 s at 2 slots — every message waited for
+      # whole answers to finish — against 3.4 s / 8.6 s at 6, writing 17.5 t/s
+      # per user instead of 23. 0 preemptions: the KV cache is shared and a
+      # conversation only takes what it holds, so 6 x 262k is never reserved.
+      LLM_P_MAX_NUM_SEQS="6"
       LLM_P_CONTEXT_WINDOW="200000"
-      # 3 and 5 measured identical on prose; 3 leaves more KV.
+      # 3 and 5 measured identical on prose; 3 leaves more KV. Kept at 6 slots:
+      # off, the median first token drops to 2.2 s in the replay but writing
+      # halves (9.9 t/s), and 5 cold 8k prompts at once wait 16.6 s against 6.9.
       LLM_P_MTP_TOKENS="3"
       LLM_P_NEEDS_BUILD="0"
       LLM_P_BUILD_DIR=""
