@@ -15,7 +15,10 @@
 #     idempotent (second pass: nothing rewritten), an operator's own
 #     HelmChartConfig left alone, a failed apply publishing nothing, a stale
 #     line withdrawn only on positive evidence;
-#   • the wiring: install.sh, lib/updater.sh and update.sh call it.
+#   • `check` only READS (public_ingress_missing -> ingress_diff, so the UI
+#     offers Apply) and never converges: converging restarts Traefik;
+#   • the wiring: install.sh, lib/updater.sh and update.sh (apply + its own
+#     mode) call it.
 #
 # What it CANNOT show (needs a real box): Traefik actually setting/stripping
 # the header, ServiceLB answering on 127.0.0.1:8443, the certificate served
@@ -97,8 +100,9 @@ head_ "convergence (stubbed kubectl)"
 #   ports      the Traefik Service's ports         fail-hcc  apply of the HCC fails
 #   no-roll    helm-controller never rolls        api-down  the API does not answer
 #   apply.log  one line per applied kind, in order
-run() { # run STATE_DIR ENV_FILE -> rc ; output in $OUT
-  OUT="$(S="$1" bash -c '
+# A cluster-WRITING call during a read-only probe shows up in apply.log.
+run() { # run STATE_DIR ENV_FILE [FN] -> rc ; output in $OUT (FN: what to call, default converge_public_ingress_env)
+  OUT="$(S="$1" FN="${3:-converge_public_ingress_env}" bash -c '
     set -euo pipefail
     info() { printf "    %s\n" "$*"; }; warn() { printf "!!  %s\n" "$*"; }
     sleep() { :; }
@@ -131,7 +135,7 @@ run() { # run STATE_DIR ENV_FILE -> rc ; output in $OUT
     }
     eval "$(sed -n "/^# >>> SHARED public-ingress BLOCK/,/^# <<< END SHARED public-ingress BLOCK/p" "$1")"
     eval "$(sed -n "/^converge_public_ingress_env() {/,/^}/p" "$1")"
-    PUBLIC_INGRESS_WAIT=3 DATA_DIR="$2" converge_public_ingress_env
+    PUBLIC_INGRESS_WAIT=3 DATA_DIR="$2" "$FN"
   ' _ "$REPO/update.sh" "$2" 2>&1)"
 }
 newbox() { # newbox NAME -> a state dir with CRDs + stock Service, and a data dir with update.env
@@ -191,6 +195,41 @@ run "$B/state" "$B/data"; rc=$?
 check "API down: rc 0" "$rc" "0"
 contains "API down: the published line is kept" "$(cat "$B/data/update.env")" "PUBLIC_INGRESS_PORT=8443"
 
+# --- 3b. `check` only READS: public_ingress_missing ------------------------------
+head_ "check: read-only probe (public_ingress_missing)"
+B="$(newbox probe)"
+run "$B/state" "$B/data" public_ingress_missing; rc=$?
+check "stock box: reported missing (rc 0)" "$rc" "0"
+check "stock box: the probe applied NOTHING" "$(cat "$B/state/apply.log" 2>/dev/null)" ""
+check "stock box: the probe published nothing" "$(grep -c PUBLIC_INGRESS_PORT "$B/data/update.env")" "0"
+run "$B/state" "$B/data"
+run "$B/state" "$B/data" public_ingress_missing; rc=$?
+check "after apply's converge: no longer missing (rc 1)" "$rc" "1"
+B="$(newbox probe-foreign)"; touch "$B/state/hcc"; echo someone-else > "$B/state/owner"
+run "$B/state" "$B/data" public_ingress_missing; rc=$?
+check "foreign HelmChartConfig: not offered (apply would refuse) (rc 1)" "$rc" "1"
+B="$(newbox probe-down)"; touch "$B/state/api-down"
+run "$B/state" "$B/data" public_ingress_missing; rc=$?
+check "API down: not reported missing (rc 1)" "$rc" "1"
+B="$(newbox probe-nosvc)"; rm -f "$B/state/ports"
+run "$B/state" "$B/data" public_ingress_missing; rc=$?
+check "no Traefik Service: not reported missing (rc 1)" "$rc" "1"
+B="$(newbox probe-diffs)"
+# compute_diffs, as `check` runs it: an otherwise current box shows an update.
+OUT="$(S="$B/state" bash -c '
+  set -uo pipefail
+  info() { printf "    %s\n" "$*"; }; warn() { :; }
+  kc() { case "$*" in "-n kube-system get svc traefik -o jsonpath="*) cat "$S/ports" ;; *) return 1 ;; esac; }
+  eval "$(sed -n "/^# >>> SHARED public-ingress BLOCK/,/^# <<< END SHARED public-ingress BLOCK/p" "$1")"
+  for f in ver_gt compute_diffs up_to_date; do eval "$(sed -n "/^$f() {/,/^}/p" "$1")"; done
+  UPDATE_SOURCE=online cur_chart=0.10.3 want_chart=0.10.3 cur_app=1.23.0 want_app=1.23.0 cur_vllm=v want_vllm=v
+  compute_diffs >/dev/null
+  if up_to_date; then u=up-to-date; else u=update; fi
+  printf "%s|%s|%s" "$ingress_diff" "$u" "$summary_line"
+' _ "$REPO/update.sh" 2>&1)"
+check "compute_diffs: ingress_diff=1, not up to date, said in the summary" "$OUT" "1|update|public ingress entrypoint (:8443)"
+check "compute_diffs: still applied nothing" "$(cat "$B/state/apply.log" 2>/dev/null)" ""
+
 # --- 4. wiring ------------------------------------------------------------------------
 head_ "wiring"
 contains "install.sh loads lib/ingress.sh"            "$(grep '^MODULES=' "$REPO/install.sh")" " ingress "
@@ -199,8 +238,12 @@ check "install.sh: setup_public_ingress right after deploy_suite, before the upd
   "deploy_suite setup_public_ingress setup_update_timer "
 contains "lib/updater.sh records the port after writing update.env" \
   "$(sed -n '/^setup_update_timer() {/,/^}/p' "$REPO/lib/updater.sh")" 'record_public_ingress_port "$DATA_DIR/update.env" "${PUBLIC_INGRESS_LIVE:-0}"'
-check "update.sh converges it on check, both apply paths, and its own mode" \
-  "$(grep -c '^ *converge_public_ingress_env$' "$REPO/update.sh")" "4"
+check "update.sh converges it on both apply paths and its own mode — 3 calls" \
+  "$(grep -c '^ *converge_public_ingress_env$' "$REPO/update.sh")" "3"
+absent "update.sh: the notify-only check NEVER converges it (it restarts Traefik)" \
+  "$(sed -n '/^case "\$MODE" in/,/^esac/p' "$REPO/update.sh" | sed -n '/^  check)/,/^    ;;/p')" "converge_public_ingress"
+contains "update.sh: up_to_date counts the missing entrypoint" \
+  "$(sed -n '/^up_to_date() {/p' "$REPO/update.sh")" 'ingress_diff'
 contains "update.sh: public-ingress mode" "$(sed -n '/^case "\$MODE" in/,/^esac/p' "$REPO/update.sh")" "public-ingress)"
 
 printf '\n%d ok, %d KO\n' "$PASS" "$FAIL"

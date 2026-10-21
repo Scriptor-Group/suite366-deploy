@@ -63,8 +63,9 @@
 #                 offline-safe, no cluster needed.
 #   public-ingress  converge the tunnel's Traefik entrypoint (suite366-public,
 #                 :8443, sets X-Suite366-Ingress: public) and publish
-#                 PUBLIC_INGRESS_PORT in update.env once it is live. `check`
-#                 and `apply` do it too; this is for suite366-fleet.
+#                 PUBLIC_INGRESS_PORT in update.env once it is live. `apply`
+#                 does it too; `check` only reports it missing (it restarts
+#                 Traefik). This mode is for suite366-fleet.
 #
 # App <-> host bridge ($DATA_DIR/updates, hostPath-mounted into drive-app at
 # /appliance-update — see values.yaml `extraVolumes`):
@@ -823,7 +824,7 @@ resolve_target() {
 }
 
 compute_diffs() {
-  chart_diff=0; vllm_diff=0; app_diff=0; host_diff=0; values_diff=0; summary_line=""
+  chart_diff=0; vllm_diff=0; app_diff=0; host_diff=0; values_diff=0; ingress_diff=0; summary_line=""
   if [[ "${UPDATE_SOURCE:-none}" == "none" ]]; then
     warn "No usable update source (network unreachable, no verified offline package)."
     return 0
@@ -865,6 +866,10 @@ compute_diffs() {
   # self-test, which extracts this function alone, is unaffected.
   if declare -F ensure_appliance_values >/dev/null && ensure_appliance_values --check; then values_diff=1; fi
   if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench / OnlyOffice image) — converged on apply"; fi
+  # The tunnel's Traefik entrypoint (lib/ingress.sh), same idea: READ here,
+  # converged by `apply` only (it restarts Traefik). Guarded like the line above.
+  if declare -F public_ingress_missing >/dev/null && public_ingress_missing; then ingress_diff=1; fi
+  if [[ "$ingress_diff" == 1 ]]; then info "ingress        : public entrypoint :${PUBLIC_INGRESS_PORT:-8443} missing — added on apply (Traefik restarts once)"; fi
 
   # A channel BEHIND the box is not an update, but it is worth saying out loud:
   # it usually means the channel has not been rolled since this box was built,
@@ -887,6 +892,7 @@ compute_diffs() {
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
   [[ "$host_diff"  == 1 ]] && parts+=("host layer (model switch, transcription) -> ${want_host:0:12}")
   [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench, OnlyOffice image)")
+  [[ "${ingress_diff:-0}" == 1 ]] && parts+=("public ingress entrypoint (:${PUBLIC_INGRESS_PORT:-8443})")
   [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
 }
@@ -900,7 +906,7 @@ survey() {
   compute_diffs
 }
 
-up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 && "${host_diff:-0}" == 0 && "${values_diff:-0}" == 0 ]]; }
+up_to_date() { [[ "$chart_diff" == 0 && "$vllm_diff" == 0 && "$app_diff" == 0 && "${host_diff:-0}" == 0 && "${values_diff:-0}" == 0 && "${ingress_diff:-0}" == 0 ]]; }
 
 # --- Offline package: verification + staging -----------------------------------
 # Layout produced by tools/build-offline-package.sh:
@@ -1603,7 +1609,7 @@ do_apply() {
   [[ "$vllm_diff" == 1 ]] && cur_vllm="$want_vllm"
   # host_diff stays 1 when the layer could not be laid down or converged: the
   # state the app reads keeps offering it, and the next apply retries.
-  chart_diff=0; vllm_diff=0; app_diff=0; values_diff=0; summary_line=""
+  chart_diff=0; vllm_diff=0; app_diff=0; values_diff=0; ingress_diff=0; summary_line=""
 
   # Fleet convergence: make sure the app-trigger units exist / are current, and
   # refresh this script for the next run. Ordered BEFORE write_state_json so the
@@ -2668,10 +2674,11 @@ do_license() { # do_license set TOKEN|- | show
 # --- the public Traefik entrypoint (lib/ingress.sh) ---------------------------------
 # The tunnel's own door: Traefik entrypoint suite366-public on :8443, which
 # sets X-Suite366-Ingress: public, while web/websecure strip it. Converged on
-# `check` too -- the boxes installed before it existed are the ones nobody runs
-# `apply` on -- and published in update.env (PUBLIC_INGRESS_PORT) for
-# suite366-fleet's frpc once live. Idempotent: an unchanged HelmChartConfig
-# does not roll Traefik.
+# `apply` (both paths) and `update.sh public-ingress` ONLY: converging restarts
+# Traefik, and `check` is notify-only -- it reports the entrypoint missing
+# (ingress_diff, in compute_diffs) so the UI offers Apply. Published in
+# update.env (PUBLIC_INGRESS_PORT) for suite366-fleet's frpc once live.
+# Idempotent: an unchanged HelmChartConfig does not roll Traefik.
 # >>> SHARED public-ingress BLOCK >>> (lib/ingress.sh, copied verbatim into update.sh — tools/test-public-ingress.sh fails on drift)
 # The contract with suite366-fleet (frpc's localPort) and the app (the header):
 # constants, not settings.
@@ -2759,6 +2766,26 @@ public_ingress_svc_ports() { # -> the Traefik Service's ports, one per line (fai
 public_ingress_live() { # -> 0 when the Service exposes the port AND both middlewares exist
   public_ingress_svc_ports | grep -qx "$PUBLIC_INGRESS_PORT" || return 1
   kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1
+}
+
+# Read-only, for `update.sh check` (which must never restart Traefik): 0 only
+# when `apply` would actually add the entrypoint — the API answers, Traefik's
+# Service is there without the port, and no foreign HelmChartConfig would make
+# apply refuse anyway (an Apply button that can never succeed is worse than
+# none). Any doubt answers "not missing".
+public_ingress_missing() {
+  local ports owner
+  ports="$(public_ingress_svc_ports)" || return 1
+  [[ -n "$ports" ]] || return 1
+  if grep -qx "$PUBLIC_INGRESS_PORT" <<<"$ports" \
+     && kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1; then
+    return 1
+  fi
+  if kc -n kube-system get helmchartconfig traefik >/dev/null 2>&1; then
+    owner="$(kc -n kube-system get helmchartconfig traefik -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+    [[ "$owner" == "suite366-deploy" ]] || return 1
+  fi
+  return 0
 }
 
 converge_public_ingress() { # -> 0 live, 1 not (nothing is published then)
@@ -2870,7 +2897,6 @@ case "$MODE" in
     # what turns "undetected until a customer complains" into "self-healed
     # within 24 hours". DEEP=0 — no nightly POST to the LLM.
     reconcile_and_check_vllm_db 0
-    converge_public_ingress_env
     ;;
   apply)
     require_cluster_tools

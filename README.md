@@ -276,8 +276,9 @@ on k3s's own Traefik:
 Once the entrypoint is live the box writes `PUBLIC_INGRESS_PORT=8443` to
 `update.env`; suite366-fleet points frpc at that port (and keeps 8443 closed
 to the LAN — a LAN client reaching it would only mark itself public).
-`update.sh check`/`apply` converge it on older boxes, and
-`update.sh public-ingress` does it on demand. A `traefik` HelmChartConfig the
+`update.sh apply` converges it on older boxes and `update.sh public-ingress`
+does it on demand; the notify-only `check` never touches Traefik, it only
+reports the entrypoint missing so the app offers Apply. A `traefik` HelmChartConfig the
 operator wrote themselves is left alone (and nothing is published).
 
 An **unclaimed** box (`APPLIANCE_CLAIM_LAN_ONLY=1`) renders

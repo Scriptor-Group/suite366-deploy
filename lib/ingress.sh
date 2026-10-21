@@ -24,7 +24,8 @@
 #
 # Created on every box, used or not: an idle entrypoint costs nothing, and a
 # box published later needs no cluster change. update.sh converges the same
-# objects (check + apply), from the shared block below.
+# objects on `apply` and `update.sh public-ingress` (never on the notify-only
+# `check`, which only reports it missing), from the shared block below.
 #
 # Verified against k3s v1.36.2+k3s1 (lib/config.sh K3S_VERSION): its
 # manifests/traefik.yaml installs chart traefik 40.1.0 (Traefik 3.7.4), whose
@@ -121,6 +122,26 @@ public_ingress_svc_ports() { # -> the Traefik Service's ports, one per line (fai
 public_ingress_live() { # -> 0 when the Service exposes the port AND both middlewares exist
   public_ingress_svc_ports | grep -qx "$PUBLIC_INGRESS_PORT" || return 1
   kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1
+}
+
+# Read-only, for `update.sh check` (which must never restart Traefik): 0 only
+# when `apply` would actually add the entrypoint — the API answers, Traefik's
+# Service is there without the port, and no foreign HelmChartConfig would make
+# apply refuse anyway (an Apply button that can never succeed is worse than
+# none). Any doubt answers "not missing".
+public_ingress_missing() {
+  local ports owner
+  ports="$(public_ingress_svc_ports)" || return 1
+  [[ -n "$ports" ]] || return 1
+  if grep -qx "$PUBLIC_INGRESS_PORT" <<<"$ports" \
+     && kc -n kube-system get middlewares.traefik.io suite366-ingress-public suite366-ingress-strip >/dev/null 2>&1; then
+    return 1
+  fi
+  if kc -n kube-system get helmchartconfig traefik >/dev/null 2>&1; then
+    owner="$(kc -n kube-system get helmchartconfig traefik -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+    [[ "$owner" == "suite366-deploy" ]] || return 1
+  fi
+  return 0
 }
 
 converge_public_ingress() { # -> 0 live, 1 not (nothing is published then)
