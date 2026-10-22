@@ -183,7 +183,7 @@ preflight_run() { # preflight_run TEMPLATE_TAG [LICENSE_KEY_ENV]
   PATH="$WORK/bin:$ORIG_PATH" WORK="$WORK" REPO="$REPO" LICENSE_KEY="$key" TAG="$tag" bash -c '
     set -euo pipefail
     log() { :; }; info() { :; }; warn() { printf "WARN %s\n" "$*"; }; die() { printf "DIE %s\n" "$*"; exit 1; }
-    ask() { :; }; ask_secret() { :; }; gather_hosts() { :; }
+    ask() { :; }; ask_secret() { :; }; gather_hosts() { :; }; gather_admin_email() { :; }
     fetch() { printf "image:\n  tag: \"%s\"\n" "$TAG"; }
     DATA_DIR="$WORK/data"; DOMAIN=x; SKIP_VLLM=1; VLLM_IMAGE=v; LLM_MODEL=m; EMBED_MODEL=e
     LICENSE_MIN_APP=1.12.0

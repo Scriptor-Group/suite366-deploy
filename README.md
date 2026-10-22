@@ -105,6 +105,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | empty | `provided`: PEM pair covering all four names |
 | `TLS_CA_FILE` | empty | `provided`: the issuing CA, mounted into drive-app |
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | the appliance administrator: the only account allowed to register the first organisation (cf. § Licensing and several organisations) |
+| `APPLIANCE_CLAIM_LAN_ONLY` | empty | `1` (set by suite366-fleet): an **unclaimed** box — no `admin@<DOMAIN>` default, `ADMIN_EMAIL` may be empty, and the first administrator can only be created from the LAN (cf. § The public entrypoint) |
 | `LICENSE_KEY` | empty | optional instance licence (EdDSA JWT, scope `instance`): several organisations, seats pooled. A secret, kept across re-runs |
 | `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
@@ -256,6 +257,35 @@ decided **on the proxy**, not here:
 A rename signs users out once (cookies are bound to the name), and an
 external SAML/OAuth identity provider configured with the old name has to be
 updated by the customer.
+
+#### The public entrypoint — telling the tunnel from the LAN
+
+The proxy's tunnel (frpc, SNI passthrough) delivers raw TLS to the box, so on
+`websecure` (443) an internet request and a LAN request look the same, and the
+`Host` header proves nothing. Every box therefore gets a second Traefik
+entrypoint, `suite366-public` (lib/ingress.sh), through a `HelmChartConfig`
+on k3s's own Traefik:
+
+- **Service port 8443** (ServiceLB, so `127.0.0.1:8443` on the host; container
+  port 9443, since 8443 is websecure's inside the pod), TLS with the same
+  certificates as 443;
+- an entrypoint middleware that **sets** `X-Suite366-Ingress: public`,
+  overwriting whatever the client sent; `web` and `websecure` get one that
+  **removes** the header. The app treats a request carrying it as public.
+
+Once the entrypoint is live the box writes `PUBLIC_INGRESS_PORT=8443` to
+`update.env`; suite366-fleet points frpc at that port (and keeps 8443 closed
+to the LAN — a LAN client reaching it would only mark itself public).
+`update.sh apply` converges it on older boxes and `update.sh public-ingress`
+does it on demand; the notify-only `check` never touches Traefik, it only
+reports the entrypoint missing so the app offers Apply. A `traefik` HelmChartConfig the
+operator wrote themselves is left alone (and nothing is published).
+
+An **unclaimed** box (`APPLIANCE_CLAIM_LAN_ONLY=1`) renders
+`APPLIANCE_CLAIM_LAN_ONLY: "true"` and an empty `APPLIANCE_ADMIN_EMAIL`: the
+first administrator is whoever creates it from the LAN, never through the
+tunnel. Neither key is added to an existing box by `update.sh` (their first
+organisation already exists).
 
 ### `TLS_MODE=local-ca` (default)
 

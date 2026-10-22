@@ -85,7 +85,7 @@ left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/plain.yaml" | sort -u | tr '\n' ' ')"
 sed 's/#.*//' "$WORK/plain.yaml" | grep -q 'suite366[.]local' \
   && ko "no LAN name survives" "$(sed 's/#.*//' "$WORK/plain.yaml" | grep -n 'suite366[.]local' | head -1)" \
   || ok "no LAN name survives"
-grep -Eq '#@(local|!?proxy|origins)$' "$WORK/plain.yaml" && ko "no marker survives" || ok "no marker survives"
+grep -Eq '#@(local|!?proxy|origins|claim)$' "$WORK/plain.yaml" && ko "no marker survives" || ok "no marker survives"
 sed 's/#.*//' "$WORK/plain.yaml" | grep -q '[*][.]' \
   && ko "no alias wildcard outside proxy mode" || ok "no alias wildcard outside proxy mode"
 grep -q '^  AUTH_URL: https://acme.box.diwy.ai$' "$WORK/plain.yaml" \
@@ -133,6 +133,63 @@ fi
 render dns 0 "$WORK/plain-dns.yaml"
 cmp -s "$WORK/plain.yaml" "$WORK/plain-dns.yaml" \
   && ok "HOST_MODE=dns renders the same file" || ko "HOST_MODE=dns renders the same file"
+
+echo "== an unclaimed fleet box (APPLIANCE_CLAIM_LAN_ONLY=1) =="
+# The default box above is byte-identical to the golden, which already proves
+# `#@claim` lines vanish when the mode is off. Here: the published box the
+# fleet layer installs, with ADMIN_EMAIL explicitly empty.
+( export APPLIANCE_CLAIM_LAN_ONLY=1 ADMIN_EMAIL=""; render proxy 1 "$WORK/claim.yaml" )
+left="$(grep -o '@[A-Z_][A-Z_]*@' "$WORK/claim.yaml" | sort -u | tr '\n' ' ')"
+[[ -z "$left" ]] && ok "claim: every token is substituted" || ko "claim: every token is substituted" "$left"
+grep -q '#@claim$' "$WORK/claim.yaml" && ko "claim: no #@claim marker survives" || ok "claim: no #@claim marker survives"
+grep -q '^  APPLIANCE_ADMIN_EMAIL: ""$' "$WORK/claim.yaml" \
+  && ok "claim: APPLIANCE_ADMIN_EMAIL rendered empty" || ko "claim: APPLIANCE_ADMIN_EMAIL rendered empty"
+grep -q '^  APPLIANCE_CLAIM_LAN_ONLY: "true"$' "$WORK/claim.yaml" \
+  && ok "claim: APPLIANCE_CLAIM_LAN_ONLY under config:" || ko "claim: APPLIANCE_CLAIM_LAN_ONLY under config:"
+if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert d['config']['APPLIANCE_ADMIN_EMAIL']=='' and d['config']['APPLIANCE_CLAIM_LAN_ONLY']=='true'" "$WORK/claim.yaml" 2>/dev/null; then
+  ok "claim: YAML has both, as strings"
+else
+  ko "claim: YAML has both, as strings"
+fi
+# Nothing else moves: against the same box without the switch (same empty
+# address), the diff is exactly the `#@claim` lines of the template, added.
+( export ADMIN_EMAIL=""; render proxy 1 "$WORK/claim-off.yaml" )
+grep -q 'APPLIANCE_CLAIM_LAN_ONLY' "$WORK/claim-off.yaml" \
+  && ko "no claim key without the switch" || ok "no claim key without the switch"
+want="$(grep -c '#@claim$' "$REPO/values.yaml")"
+got="$(diff "$WORK/claim-off.yaml" "$WORK/claim.yaml" | grep -c '^>')"
+other="$(diff "$WORK/claim-off.yaml" "$WORK/claim.yaml" | grep -c '^<')"
+[[ "$got" == "$want" && "$other" == 0 && "$want" -gt 0 ]] \
+  && ok "claim: only the $want #@claim lines are added, nothing else differs" \
+  || ko "claim: only the #@claim lines are added" "added $got (want $want), removed $other"
+# sed-replacement syntax in the address lands literally.
+( export ADMIN_EMAIL='o&p|s\x@acme.example'; render mdns 0 "$WORK/esc.yaml" )
+grep -qF '  APPLIANCE_ADMIN_EMAIL: "o&p|s\x@acme.example"' "$WORK/esc.yaml" \
+  && ok "& | and \\ in ADMIN_EMAIL land verbatim" || ko "& | and \\ in ADMIN_EMAIL land verbatim" "$(grep APPLIANCE_ADMIN_EMAIL "$WORK/esc.yaml")"
+
+# The prompt side (lib/preflight.sh gather_admin_email, with lib/common.sh's ask).
+admin_of() { # admin_of CLAIM ADMIN_EMAIL(set|unset:<v>) -> the resulting ADMIN_EMAIL, or <unset>
+  bash -c '
+    set -euo pipefail
+    info() { :; }; ASSUME_YES=1; DOMAIN=acme.example
+    eval "$(sed -n "/^tty_usable() /p; /^ask() {/,/^}/p" "$1/lib/common.sh")"
+    eval "$(sed -n "/^gather_admin_email() {/,/^}/p" "$1/lib/preflight.sh")"
+    APPLIANCE_CLAIM_LAN_ONLY="$2"
+    case "$3" in unset) unset ADMIN_EMAIL ;; *) ADMIN_EMAIL="${3#set:}" ;; esac
+    gather_admin_email
+    printf "%s" "${ADMIN_EMAIL-<unset>}"
+  ' _ "$REPO" "$1" "$2"
+}
+[[ "$(admin_of "" unset)" == "admin@acme.example" ]] \
+  && ok "normal box: no ADMIN_EMAIL -> admin@<DOMAIN> (as before)" || ko "normal box: no ADMIN_EMAIL -> admin@<DOMAIN> (as before)" "$(admin_of "" unset)"
+[[ "$(admin_of "" set:)" == "admin@acme.example" ]] \
+  && ok "normal box: ADMIN_EMAIL=\"\" -> admin@<DOMAIN> (as before)" || ko "normal box: ADMIN_EMAIL=\"\" -> admin@<DOMAIN> (as before)"
+[[ "$(admin_of 1 set:)" == "" ]] \
+  && ok "unclaimed box: ADMIN_EMAIL=\"\" stays empty" || ko "unclaimed box: ADMIN_EMAIL=\"\" stays empty" "$(admin_of 1 set:)"
+[[ "$(admin_of 1 unset)" == "" ]] \
+  && ok "unclaimed box: no ADMIN_EMAIL -> empty, no default" || ko "unclaimed box: no ADMIN_EMAIL -> empty, no default" "$(admin_of 1 unset)"
+[[ "$(admin_of 1 set:ops@acme.example)" == "ops@acme.example" ]] \
+  && ok "unclaimed box: an explicit address is kept" || ko "unclaimed box: an explicit address is kept"
 
 echo "== a published box serves both names =="
 render proxy 1 "$WORK/dual.yaml"

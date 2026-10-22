@@ -269,6 +269,12 @@ LICENSE_PUBLIC_KEY="${LICENSE_PUBLIC_KEY:-$_DEFAULT_LICENSE_PUBLIC_KEY}"
 # Kept across re-runs (lib/preflight.sh reads it back); `update.sh license set`
 # installs or rotates it on a running box.
 LICENSE_KEY="${LICENSE_KEY:-}"
+# Unclaimed fleet box (set by suite366-fleet, "1" or nothing): the first
+# administrator is created by whoever reaches the app FROM THE LAN, so
+# ADMIN_EMAIL gets no admin@<DOMAIN> default and may stay empty. Rendered as
+# config.APPLIANCE_CLAIM_LAN_ONLY; the app tells LAN from tunnel by the header
+# the public Traefik entrypoint sets (lib/ingress.sh).
+APPLIANCE_CLAIM_LAN_ONLY="${APPLIANCE_CLAIM_LAN_ONLY:-}"
 # First app release whose org-creation gate honours the licence: below it a
 # LICENSE_KEY means "unlimited organisations with OPEN sign-up on the LAN", so
 # both entry points refuse a token on an older app. Duplicated in update.sh.

@@ -333,11 +333,13 @@ contains "juillet : VLLM_MODEL_TRANSCRIPTION = celle du profil (Gemma en a une d
 # Insérée dans le bloc config, juste après l'embedding, pas en fin de fichier.
 check "juillet : la clé suit VLLM_MODEL_EMBEDDING" "$(grep -A1 'VLLM_MODEL_EMBEDDING' "$JULY/values.yaml" | tail -1 | sed 's/ *$//')" '  VLLM_MODEL_TRANSCRIPTION: "Qwen/Qwen3-ASR-1.7B"'
 # La licence d'instance et la clé vLLM sont sous secrets: et n'y bougent pas ;
-# APPLIANCE_ADMIN_EMAIL n'est JAMAIS ajouté à une box qui a déjà sa première
-# organisation (il ne gate que l'amorçage d'une box vierge).
+# APPLIANCE_ADMIN_EMAIL et APPLIANCE_CLAIM_LAN_ONLY ne sont JAMAIS ajoutés à une
+# box qui a déjà sa première organisation (ils ne gatent que l'amorçage d'une
+# box vierge).
 contains "juillet : LICENSE_KEY conservé sous secrets"       "$V" 'LICENSE_KEY: "eyJa.eyJb.c"'
 contains "juillet : VLLM_API_KEY conservé sous secrets"      "$V" 'VLLM_API_KEY: "sk-x"'
 absent   "juillet : APPLIANCE_ADMIN_EMAIL non ajouté (la première organisation existe)" "$V" "APPLIANCE_ADMIN_EMAIL"
+absent   "juillet : APPLIANCE_CLAIM_LAN_ONLY non ajouté (même raison : box déjà réclamée)" "$V" "APPLIANCE_CLAIM_LAN_ONLY"
 contains "juillet : workbench borné par organisation (gabarit)" "$V" '      maxPerOrg: "8"'
 for d in updates support backup remote llm-state; do [[ -d "$JULY/$d" ]] || ko "répertoire de pont $d créé"; done; ok "répertoires de pont créés"
 # Le workbench : le bloc entier, épinglé sur la version d'app installée, sous sandbox.

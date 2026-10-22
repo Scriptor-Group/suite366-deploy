@@ -191,10 +191,18 @@ AI
                    To license it: sudo $DATA_DIR/update.sh license set -
                    (token from the owner, README \"Licensing and several organisations\")"
   fi
-  first_block=" First sign-in   : only $ADMIN_EMAIL may register the first organisation
+  if [[ "${APPLIANCE_CLAIM_LAN_ONLY:-}" == "1" ]]; then
+    first_block=" First sign-in   : first administrator: created from the LAN (unclaimed box).
+                   Not through the public tunnel (APPLIANCE_CLAIM_LAN_ONLY)${ADMIN_EMAIL:+;
+                   only $ADMIN_EMAIL may claim it}. Update, model, backups,
+                   publication and support windows are box-wide and reserved to
+                   that role."
+  else
+    first_block=" First sign-in   : only $ADMIN_EMAIL may register the first organisation
                    (APPLIANCE_ADMIN_EMAIL); that account becomes the appliance
                    administrator. Update, model, backups, publication and support
                    windows are box-wide and reserved to that role."
+  fi
 
   cat <<EOF
 
