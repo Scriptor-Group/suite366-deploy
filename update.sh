@@ -1990,7 +1990,9 @@ arm_backup_agent() { # arm_backup_agent FRESH(0|1)
     DATA_DIR="$DATA_DIR" "$BACKUP_AGENT" run >/dev/null 2>&1 || true
     # The run above migrated a legacy key into the private directory if there
     # was one; the shared path is still checked for a box whose agent could not run.
-    if [[ ! -s "$BACKUP_PRIVATE_DIR/repo.pass" && ! -s "$BACKUP_DIR/repo.pass" ]]; then
+    # Not during install.sh: its setup_backup comes next and provisions the key.
+    if [[ "${SUITE366_INSTALLING:-0}" != 1 \
+          && ! -s "$BACKUP_PRIVATE_DIR/repo.pass" && ! -s "$BACKUP_DIR/repo.pass" ]]; then
       warn "backups are NOT configured on this appliance (no repository key)."
       warn "  Run: sudo $DATA_DIR/install.sh   (or set one up per docs/restore.md)"
     fi

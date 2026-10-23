@@ -159,7 +159,9 @@ $(printf "${c_y}─────────────────────�
 
 $(printf "${c_y}────────────────────────────────────────────────────────────────────${c_0}")
 EOF
-  if [[ "$ASSUME_YES" == "1" ]] || ! tty_usable; then
+  if [[ "${BACKUP_KEY_ESCROW:-}" == "external" ]]; then
+    info "Key escrow is done by the caller (BACKUP_KEY_ESCROW=external), which asks for the vault reference."
+  elif [[ "$ASSUME_YES" == "1" ]] || ! tty_usable; then
     warn "ASSUME_YES / no TTY — the key was NOT confirmed as stored."
     warn "  Copy it out of $pass_file before this box leaves your hands."
   else
