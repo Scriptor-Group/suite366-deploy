@@ -337,6 +337,11 @@ BACKUP_S3_REGION="${BACKUP_S3_REGION:-}"
 # reason a rented box escrows it (suite366-fleet) and a sold one ships it on a
 # card inside the crate.
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
+# Who confirms the key was stored. Empty: this installer asks (Type STORED).
+# "external": the caller escrows it and asks for the vault reference itself —
+# suite366-fleet does, right after this installer — so the unattended-run
+# warning would only contradict the prompt that follows.
+BACKUP_KEY_ESCROW="${BACKUP_KEY_ESCROW:-}"
 BACKUP_KEEP_DAILY="${BACKUP_KEEP_DAILY:-7}"
 BACKUP_KEEP_WEEKLY="${BACKUP_KEEP_WEEKLY:-4}"
 BACKUP_KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-6}"

@@ -793,6 +793,10 @@ newkey="$(cat "$PW/backup-private/repo.pass" 2>/dev/null)"
 absent   "the key itself is NOT printed" "$newkey" "$o"
 contains "its fingerprint is" "fingerprint : $(sha256sum "$PW/backup-private/repo.pass" | cut -c1-12)" "$o"
 contains "and so is where to read it" "sudo cat $PW/backup-private/repo.pass" "$o"
+command rm -f "$PW/backup-private/repo.pass"
+o="$(prov BACKUP_DIR="$PW/backup" BACKUP_PRIVATE_DIR="$PW/backup-private" BACKUP_PASSWORD="" ASSUME_YES=1 BACKUP_KEY_ESCROW=external)"
+absent   "escrowed by the caller: no 'NOT confirmed as stored' warning" "NOT confirmed" "$o"
+contains "and it says who escrows it" "BACKUP_KEY_ESCROW=external" "$o"
 
 echo "== uninstall refuses to delete the key unattended =="
 # `curl … | sudo ASSUME_YES=1 bash` is the documented form, and it deleted the
@@ -910,6 +914,12 @@ contains "it arms the timer on first install" "arming its timer" "$o"
 [[ ! -e "$CDATA/backup/repo.pass" && ! -e "$CDATA/backup-private/repo.pass" ]] && ok "convergence does NOT invent a repository key" \
   || ko "convergence does NOT invent a repository key" "a key appeared"
 contains "it says backups are not configured" "NOT configured" "$o"
+# During install.sh the same first check runs BEFORE setup_backup provisions
+# the key: saying "NOT configured" there contradicted the next screen.
+rm -f "$CDATA/backup.sh"
+o="$(converge converge_backup "${CENV[@]}" SUITE366_INSTALLING=1 \
+      PACKAGE_PUBLIC_KEY="$WORK/good.pub" online_signed=1 online_backup_sha="$SERVED_SHA")"
+absent "but not while install.sh is running (its setup_backup comes next)" "NOT configured" "$o"
 check "the installed agent is byte-identical to the served one" \
   "$(sha256sum "$CDATA/backup.sh" | awk '{print $1}')" "$SERVED_SHA"
 

@@ -106,6 +106,8 @@ EOF
   DATA_DIR="$DATA_DIR" "$DATA_DIR/update.sh" install-units
   # First state.json so the app UI has something to show before the first
   # daily tick (non-blocking — the box may be offline right after install).
+  # SUITE366_INSTALLING: setup_backup runs right after this and provisions the
+  # key, so the check must not announce "backups are NOT configured" here.
   # shellcheck disable=SC2097,SC2098  # DATA_DIR is already set; the prefix only re-exports it into the child
-  DATA_DIR="$DATA_DIR" "$DATA_DIR/update.sh" check || warn "initial update check failed (non-blocking)."
+  DATA_DIR="$DATA_DIR" SUITE366_INSTALLING=1 "$DATA_DIR/update.sh" check || warn "initial update check failed (non-blocking)."
 }
