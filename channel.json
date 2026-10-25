@@ -1,15 +1,15 @@
 {
   "channel": "stable",
   "chart_version": "0.10.4",
-  "app_version": "1.25.1",
+  "app_version": "1.25.2",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "83393f84497f9efb4b484315566627d25eee7d2020b5dc186b32d0b997e43b4d",
   "backup_sha256": "9004066456b4deea8a95303c16af6ff13bfcc055d0674eabf5c8ca2710b985ac",
   "host_layer_sha256": "273509b2373e103d7d7a4187561b9a8284ea2f15285850178c02f8e2cfbbced5",
-  "serial": "1792756686",
-  "expires": "2027-10-23T11:58:06Z",
+  "serial": "1792921291",
+  "expires": "2027-10-25T09:41:31Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Suite 366 1.25.1, chart 0.10.4: after a reboot the app now waits for its database instead of crash-looping for a few minutes until Postgres is up."
+  "notes": "Suite 366 1.25.2, chart 0.10.4: PersonIA replies show a live typing line with the tool in use, agent chats get a clean waiting state with readable tool arguments and results, and /chat stays pinned to the latest message."
 }
