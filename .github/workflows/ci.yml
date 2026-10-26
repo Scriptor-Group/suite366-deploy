@@ -52,6 +52,9 @@ jobs:
       # update: the admin UI button would silently roll the box backwards.
       - name: Update decision self-test
         run: ./tools/test-update-diffs.sh
+      # Root runs the hooks: only what root alone could have written may run.
+      - name: Update hooks self-test
+        run: ./tools/test-update-hooks.sh
       - name: Host layer bundle + converge + values bridges self-test
         run: ./tools/test-host-layer.sh
       # Renders values.yaml both ways and diffs the no-LAN-names render against
