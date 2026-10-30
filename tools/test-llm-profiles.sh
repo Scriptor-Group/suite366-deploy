@@ -259,6 +259,8 @@ contains "compose : rotation json-file déclarée"     "$C" "driver: json-file"
 contains "compose : 50 Mo par fichier"               "$C" 'max-size: "50m"'
 contains "compose : 5 fichiers"                      "$C" 'max-file: "5"'
 check    "compose : les quatre services tournent leurs journaux" "$(grep -c 'logging: \*default-logging' "$REPO_ROOT/llm/docker-compose.yml")" "4"
+check    "compose : les quatre services retirent NET_RAW (CVE-2026-98432)" "$(grep -c '^    cap_drop: \[NET_RAW\]$' "$REPO_ROOT/llm/docker-compose.yml")" "4"
+absent   "compose : aucune capacité ajoutée" "$C" "cap_add"
 
 contains "Dockerfile : soundfile épinglé"             "$X" "soundfile=="
 contains "Dockerfile : PyAV épinglé"                  "$X" "av=="
