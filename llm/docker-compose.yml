@@ -41,6 +41,16 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "5"
 
+# Capabilities. Docker hands every container NET_RAW by default, i.e. raw
+# sockets: forging any packet on the container's own loopback. None of these
+# four needs it (they serve HTTP and nothing else), and it is exactly what a
+# compromised engine would need to reach a kernel bug in the TCP/IP stack
+# from inside its container — CVE-2026-98432 (2026-10) is one, and DGX OS's
+# linux-nvidia kernels had no fix when it was published. The k3s pods of the
+# chart already drop it. Like the logging block, a capability is part of a
+# container's definition: the first `compose up -d` after this change
+# recreates the four containers, i.e. one model reload.
+
 services:
   vllm-llm:
     # The engine image for qwen27b/orcasaq/gemma (the unified image, see
@@ -50,6 +60,7 @@ services:
     container_name: suite366-vllm-llm
     restart: unless-stopped
     logging: *default-logging
+    cap_drop: [NET_RAW]
     # `gpus: all` (compose v2.3+): the modern equivalent of `--gpus all`. More
     # portable than `runtime: nvidia`, which requires `nvidia-ctk runtime
     # configure` (the installer runs it, but this path also works without).
@@ -116,6 +127,7 @@ services:
     container_name: suite366-vllm-embed
     restart: unless-stopped
     logging: *default-logging
+    cap_drop: [NET_RAW]
     gpus: all
     ipc: host
     environment:
@@ -194,6 +206,7 @@ services:
     container_name: suite366-vllm-stt
     restart: unless-stopped
     logging: *default-logging
+    cap_drop: [NET_RAW]
     gpus: all
     ipc: host
     environment:
@@ -247,6 +260,7 @@ services:
     container_name: suite366-vllm-proxy
     restart: unless-stopped
     logging: *default-logging
+    cap_drop: [NET_RAW]
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
