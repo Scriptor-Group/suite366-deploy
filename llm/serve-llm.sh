@@ -154,7 +154,9 @@ PY
     # hitting the cache (0.4 s), text-only or not. Off, the layout is the one
     # the 0.19 nightly used (every layer full-attention in the cache, ~313k
     # tokens of KV at 0.45 instead of ~3M) and the hit is back. Measured
-    # 2026-10-06; re-test before removing on a newer base.
+    # 2026-10-06; still true of v0.33.0 (2026-11-07): manager on, re-reading a
+    # cached 40k prefix costs the whole prefill again (8 s); off, 0.2 s at 32k
+    # and 0.9 s at 200k. Re-test before removing on a newer base.
     exec vllm serve "$LLM_MODEL" "${common[@]}" \
       --trust-remote-code \
       --dtype auto \

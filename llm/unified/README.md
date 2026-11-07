@@ -3,7 +3,7 @@
 One image for everything the appliance serves except Flash-Next: the
 `qwen27b`, `orcasaq` and `gemma` profiles, the transcription engine and the
 embeddings. `Dockerfile` lays three things over the official `vllm/vllm-openai`
-release (v0.30.0 by default):
+release (v0.33.0 by default):
 
 | layer | what | for |
 |---|---|---|
@@ -25,6 +25,18 @@ on all three generative models (21 / 30 / 30 t/s), prefill 20-35 % faster
 JSON, vision and streaming passing everywhere. The orcasaq2 plugin is loaded by
 every vLLM process and acts only on an EXL3 checkpoint: inert under the others.
 
+**Base v0.33.0 since 2026-11-07**, measured on the test Spark against v0.30.0,
+same model, same flags, the engine alone. Qwen3.8-27B-NVFP4 decodes at the
+same 21 t/s, but re-reads a cached prefix 2-3x faster (32k: 0.5 s against 1.4;
+200k: 3.2 s against 6.4): the model is a hybrid, and an agent loop re-reads its
+whole conversation every round. Over 16 agent scenarios run with the app's 147
+real tool schemas, 3 at a time: 34 s median instead of 50, first visible output
+at 1.2 s instead of 3.4, and under a mixed load (4 agents, 8 graph extractions,
+2 OCR) the worst first token of an agent at 16 s instead of 76. OrcaSAQ (exl3
+plugin), gemma (its flags as they stand, cache hits included), the
+transcription engine and the embed pass on it unchanged. The
+arm64 image still ships without the audio extras, so layer 2 stays.
+
 ## Where the image comes from
 
 - **CI** — `.github/workflows/publish-vllm-image.yml` builds this Dockerfile on
@@ -45,8 +57,8 @@ every vLLM process and acts only on an EXL3 checkpoint: inert under the others.
 Build context is `llm/` (the template lives there), Dockerfile this one:
 
 ```bash
-docker build -f llm/unified/Dockerfile --build-arg BASE_IMAGE=vllm/vllm-openai:v0.30.0 \
-  -t suite366/vllm-unified:v0.30.0-u1 llm
+docker build -f llm/unified/Dockerfile --build-arg BASE_IMAGE=vllm/vllm-openai:v0.33.0 \
+  -t suite366/vllm-unified:v0.33.0-u1 llm
 ```
 
 ## Flash-Next is not in it

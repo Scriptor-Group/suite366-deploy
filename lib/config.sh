@@ -162,7 +162,7 @@ LLM_PROFILE="${LLM_PROFILE:-qwen27b}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # vLLM image: MUST be arm64 + validated for Blackwell GB10/sm_121. Default is
 # the UNIFIED image CI publishes from llm/unified/Dockerfile — the official
-# Docker Hub release vllm/vllm-openai:v0.30.0 (CUDA 13.0, multi-arch, no
+# Docker Hub release vllm/vllm-openai:v0.33.0 (CUDA 13.0, multi-arch, no
 # `docker login`) plus the EXL3 kernels, the audio extras and Gemma's template
 # — the image the embed, the transcription engine and three of the four
 # generative profiles run. The box recognises it by its label; given a PLAIN
@@ -171,7 +171,7 @@ EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # release rather than a nightly: the old `cu130-nightly` tag silently stopped
 # moving on 2026-04-23 (vLLM 0.19). Resolved after the profile table is loaded:
 # the tag is derived from it.
-VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-vllm/vllm-openai:v0.30.0}"
+VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-vllm/vllm-openai:v0.33.0}"
 # Flash-Next runs its OWN base (llm/profiles.sh LLM_FLASH_NEXT_BASE_IMAGE,
 # v0.29.0) plus the patch set in llm/flash-next/ (vendored from
 # blazux/qwen3.8-Flash-DGX at the commit below). lib/vllm.sh builds it on the
@@ -199,7 +199,7 @@ load_llm_profiles() {
 load_llm_profiles
 llm_profile_known "$LLM_PROFILE" \
   || die "Unknown LLM_PROFILE '$LLM_PROFILE'. Known profiles: $LLM_PROFILES."
-VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/scriptor-group/suite-366-vllm:v0.33.0-u1}"
 FLASH_NEXT_IMAGE="$(llm_flash_next_image "$FLASH_NEXT_PATCHES_COMMIT")"
 # Provisional: the engine image is VLLM_IMAGE when it is the unified one, the
 # locally built tag otherwise — a question for docker, answered in deploy_vllm

@@ -27,7 +27,18 @@
 # same decode speed, and a 20-35 % faster prefill. Flash-Next stays on
 # llm/flash-next/ (a vLLM patch set on v0.29.0): on this base its resident
 # footprint no longer leaves room for the embed beside it.
-ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0
+#
+# Base v0.33.0 since 2026-11-07, measured on the test Spark against v0.30.0,
+# same model, same flags, engine alone: Qwen3.8-27B-NVFP4 decodes at the same
+# 21 t/s, but re-reads a cached prefix 2-3x faster (32k: 0.5 s against 1.4;
+# 200k: 3.2 s against 6.4) — that model is a hybrid, and the agent loop
+# re-reads its whole conversation every round. 16 agent scenarios with the
+# app's 147 real tool schemas, 3 at a time: 34 s median instead of 50, first
+# visible output at 1.2 s instead of 3.4, the worst first token of an agent
+# under a mixed load 16 s instead of 76. OrcaSAQ (exl3 plugin), gemma (its
+# flags as they stand, cache hits included), the transcription engine and the
+# embed pass on it unchanged.
+ARG BASE_IMAGE=vllm/vllm-openai:v0.33.0
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 ARG UNIFIED_REV=1
@@ -39,8 +50,8 @@ LABEL suite366.unified="${UNIFIED_REV}" \
 # --- 1a. exllamav3 v1.5.1 (MIT), compiled for the GB10 -----------------------
 # Upstream publishes x86_64 wheels only and the extension is ABI-linked to torch
 # and the CUDA major, so it is compiled HERE, for sm_121, against the image's
-# own torch (2.13.0+cu130 on v0.29.0, v0.30.0 and v0.31.0 alike) and nvcc
-# (13.0). arm64-build.sh + aarch64_stubs.cpp drop its x86-only CPU paths first
+# own torch (2.13.0+cu130 on v0.29.0, v0.30.0 and v0.31.0 alike, 2.14.0+cu130
+# on v0.33.0) and nvcc (13.0). arm64-build.sh + aarch64_stubs.cpp drop its x86-only CPU paths first
 # (the reasons are in those files). CPATH: torch's cusparse header lives in the
 # pip `nvidia` tree, not under /usr/local/cuda, and cpp_extension does not add
 # that directory itself. MAX_JOBS: 12 on the Spark; a hosted arm64 runner has 4
@@ -86,7 +97,8 @@ RUN python3 -m pip install --no-cache-dir --no-deps /opt/orcasaq2 && rm -rf /opt
 # vllm/vllm-openai (arm64) has neither soundfile nor PyAV, and AudioMediaIO
 # .load_bytes — what the transcription route decodes the upload with — fails
 # on EVERY format with "Please install vllm[audio] for audio support"; verified
-# on v0.29.0 (2026-09-22) and still true of v0.30.0 and v0.31.0 (2026-10-05).
+# on v0.29.0 (2026-09-22) and still true of v0.30.0, v0.31.0 (2026-10-05) and
+# v0.33.0 (2026-11-07).
 # Pinned to the versions that resolved that day; ~100 MB. Not
 # `pip install "vllm[audio]"`: on arm64 that would re-resolve vllm itself
 # from PyPI. The three packages ARE that extra.
