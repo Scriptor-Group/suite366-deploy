@@ -501,7 +501,10 @@ is `qwen27b`, `orcasaq` and `gemma` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights,
 automatically, 4.75 % WER on FLEURS French against 6.31 for Whisper-large-v3,
 and it takes the vocabulary hint the app sends with every window. Audio longer
 than 30 s is split by vLLM at the quietest point of each window, so a 5 min
-dictation is ten requests, not one. Measured on the test Spark: weights loaded
+dictation is ten requests, not one. What vLLM accepts in one upload is capped
+by `VLLM_MAX_AUDIO_DECODE_DURATION_S`, 600 s by default: the compose raises it
+to 1800 because the app sends up to 15 min of dictation and 13.6 min of WAV,
+and at the default every upload over 10 min came back 400. Measured on the test Spark: weights loaded
 in 43 s, about 10 GiB resident in all (the box goes from 86 to 97 GiB used),
 35 s of read French transcribed in 2.9 s through the proxy — WAV or webm/opus
 alike — and 5 s in 0.5 s.
