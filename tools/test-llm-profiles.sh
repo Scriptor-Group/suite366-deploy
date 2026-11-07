@@ -226,6 +226,12 @@ contains "compose : image de transcription interpolée" "$C" 'image: ${VLLM_STT_
 contains "compose : budget KV explicite"              "$C" -- '--kv-cache-memory-bytes=${STT_KV_CACHE_BYTES:-'
 contains "compose : max_model_len borné"              "$C" -- '--max-model-len=${STT_MAX_MODEL_LEN:-'
 contains "compose : port dédié"                       "$C" '${BIND_IP}:${STT_PORT:-8003}:8000'
+# 07/11/2026 : vLLM refuse tout envoi de plus de 600 s (HTTP 400) avant de le
+# découper ; l'app envoie jusqu'à 15 min de dictée. Le plafond est relevé sur
+# vllm-stt, et sur lui seul.
+stt_block="$(sed -n '/^  vllm-stt:/,/^  vllm-proxy:/p' "$REPO_ROOT/llm/docker-compose.yml")"
+contains "compose : vllm-stt accepte 30 min d'audio par envoi" "$stt_block" 'VLLM_MAX_AUDIO_DECODE_DURATION_S: "1800"'
+check    "compose : plafond audio déclaré une seule fois" "$(grep -c 'VLLM_MAX_AUDIO_DECODE_DURATION_S:' "$REPO_ROOT/llm/docker-compose.yml")" "1"
 # Le proxy ne doit PAS dépendre du service : un depends_on activerait le profil
 # de force et le conteneur tournerait pour tous les modèles.
 proxy_block="$(sed -n '/^  vllm-proxy:/,$p' "$REPO_ROOT/llm/docker-compose.yml")"

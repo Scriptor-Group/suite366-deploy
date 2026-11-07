@@ -215,6 +215,15 @@ services:
       VLLM_NO_USAGE_STATS: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
       DO_NOT_TRACK: "1"
+      # vLLM refuses any upload longer than 600 s (HTTP 400, "Audio exceeds
+      # maximum allowed duration") before it splits it into 30 s windows — on
+      # v0.30.0 as on later releases. The app sends up to 15 min of webm
+      # (dictation) and up to 13.6 min of WAV (a file, capped at 25 MB once
+      # converted), so every dictation or file over 10 min failed. 30 min
+      # covers both with room and still bounds what one request can decode.
+      # Measured 2026-11-06 on vLLM 0.33: 780 s of WAV and 900 s of webm
+      # transcribed with it, refused without.
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "1800"
     volumes:
       - ${MODELS_DIR}:/root/.cache/huggingface
       - ${CACHE_DIR}/vllm:/root/.cache/vllm
