@@ -3,7 +3,7 @@
 One image for everything the appliance serves except Flash-Next: the
 `qwen27b`, `orcasaq` and `gemma` profiles, the transcription engine and the
 embeddings. `Dockerfile` lays three things over the official `vllm/vllm-openai`
-release (v0.30.0 by default):
+release (v0.33.0 by default):
 
 | layer | what | for |
 |---|---|---|
@@ -25,6 +25,18 @@ on all three generative models (21 / 30 / 30 t/s), prefill 20-35 % faster
 JSON, vision and streaming passing everywhere. The orcasaq2 plugin is loaded by
 every vLLM process and acts only on an EXL3 checkpoint: inert under the others.
 
+**Base v0.33.0 since 2026-11-07**, measured on the test Spark against v0.30.0,
+same model, same flags, the engine alone. Qwen3.8-27B-NVFP4 decodes at the
+same 21 t/s, but re-reads a cached prefix 2-3x faster (32k: 0.5 s against 1.4;
+200k: 3.2 s against 6.4): the model is a hybrid, and an agent loop re-reads its
+whole conversation every round. Over 16 agent scenarios run with the app's 147
+real tool schemas, 3 at a time: 34 s median instead of 50, first visible output
+at 1.2 s instead of 3.4, and under a mixed load (4 agents, 8 graph extractions,
+2 OCR) the worst first token of an agent at 16 s instead of 76. OrcaSAQ (exl3
+plugin), gemma (its flags as they stand, cache hits included), the
+transcription engine and the embed pass on it unchanged. The
+arm64 image still ships without the audio extras, so layer 2 stays.
+
 ## Where the image comes from
 
 - **CI** — `.github/workflows/publish-vllm-image.yml` builds this Dockerfile on
@@ -45,8 +57,8 @@ every vLLM process and acts only on an EXL3 checkpoint: inert under the others.
 Build context is `llm/` (the template lives there), Dockerfile this one:
 
 ```bash
-docker build -f llm/unified/Dockerfile --build-arg BASE_IMAGE=vllm/vllm-openai:v0.30.0 \
-  -t suite366/vllm-unified:v0.30.0-u1 llm
+docker build -f llm/unified/Dockerfile --build-arg BASE_IMAGE=vllm/vllm-openai:v0.33.0 \
+  -t suite366/vllm-unified:v0.33.0-u1 llm
 ```
 
 ## Flash-Next is not in it
@@ -67,7 +79,8 @@ the library whose CUDA extension holds the trellis kernels (`exl3_gemm`,
 `reconstruct`, `had_r_128`, `hgemm_recon`). Upstream publishes x86_64 wheels only
 and the extension is ABI-linked to torch and the CUDA major, so it is compiled
 in the image, for sm_121, against the image's own torch and nvcc (2.13.0+cu130
-and 13.0 on v0.29.0, v0.30.0 and v0.31.0 alike). Its CPU side assumes x86: five
+and 13.0 on v0.29.0, v0.30.0 and v0.31.0 alike, torch 2.14.0+cu130 on v0.33.0).
+Its CPU side assumes x86: five
 translation units are AVX2/AVX-512 intrinsics through and through (the CPU MoE
 experts of its offload mode, the CPU all-reduce of its tensor-parallel runtime,
 the ISA probes) and two spin waits call the x86 `pause` builtin. None of that is
@@ -113,5 +126,7 @@ still missing from it, torch and Python are unchanged. Two things to know before
 moving: FlashInfer 0.7's autotune takes ~6 min on the first boot of each new
 version (cached afterwards, per model shapes), and on v0.31.0 `/health` was
 seen answering 200 during that autotune while the first request was reset —
-on v0.30.0 it answers only once the engine serves, measured. Re-check the
-compose healthchecks against the new base before rolling it.
+on v0.30.0 and v0.33.0 it answers only once the engine serves, measured (v0.33.0,
+2026-11-07: 6 min 45 s of autotune on the 27B's first boot, first 200 one
+second after the startup completed). Re-check the compose healthchecks against
+the new base before rolling it.

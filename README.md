@@ -110,7 +110,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
-| `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next and OrcaSAQ are built on it (the `gemma` profile pins its own) |
+| `VLLM_IMAGE` | `ghcr.io/scriptor-group/suite-366-vllm:v0.33.0-u1` | the unified vLLM image (`llm/unified/`): the embed, the transcription engine and every profile but Flash-Next run it. A plain upstream image here is built into it on the box for the transcription engine and the profiles; the embed serves the plain image as is |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
 | `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
 | `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
@@ -397,7 +397,7 @@ changes it afterwards without a reinstall.
 | Decode, code | ~30 t/s | 45.0 t/s | 42 t/s | 34.9 t/s | not measured |
 | Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 35k in 34 s; 242k in 410 s | 69k in 33 s | 62k in 65 s |
 | Swap in use, idle | 0 | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
-| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
+| vLLM | the unified image (v0.33.0 + `llm/unified/`) | the unified image | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
 | Vision | yes | no (text-only checkpoint) | no | yes | yes |
 | Embeddings | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B | **none** (its memory is the KV cache) | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B |
 | Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | **none** | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
@@ -472,6 +472,9 @@ is specific to it, `--disable-hybrid-kv-cache-manager`: vLLM 0.30's hybrid KV
 cache manager never gets a prefix-cache hit on Gemma 4's sliding-window layout
 (a second turn on a 36k-token conversation re-prefilled everything, 15 s instead
 of 0.4), and turning it off restores the 0.19 layout, ~313k tokens of KV at 0.45.
+Still true of v0.33.0: re-measured on 2026-11-07, the profile's flags as they
+stand give a cache hit up to 200k tokens (0.9 s), find the 3 planted facts up
+to 200k, and pass the app's JSON tasks.
 It decodes faster than the dense 27B while being a weaker model: 4B active
 parameters against 27B.
 
@@ -590,7 +593,7 @@ single biggest reason the profiles run a release rather than a nightly.
 
 **The images.** Four of the five profiles, the transcription engine and the
 embed run ONE image, the **unified image** (`llm/unified/Dockerfile`): the
-official `vllm/vllm-openai:v0.30.0` plus exllamav3 and the EXL3 plugin, the
+official `vllm/vllm-openai:v0.33.0` plus exllamav3 and the EXL3 plugin, the
 audio extras and Gemma's chat template. CI publishes it on every change to
 `llm/unified/` on `main` (`.github/workflows/publish-vllm-image.yml`) as
 `ghcr.io/scriptor-group/suite-366-vllm:<base tag>-u<rev>`, the channel names it
@@ -600,10 +603,13 @@ PLAIN upstream image instead (an offline package built with one, an operator's
 same Dockerfile over it, once per tag, engines down. Measured side by side with
 the previous four images on 2026-10-05/06: identical answers (OrcaSAQ greedy
 5/5, a 72 s transcription word for word, image embeddings at 0.9989 cosine),
-same decode, prefill 20-35 % faster. Flash-Next is the exception: its patch set
-is written against v0.29.0 and on the v0.30.0 base its resident footprint no
-longer leaves room for the embed beside it, so it keeps its own image, built on
-the box over v0.29.0 (`llm/flash-next/`), unchanged.
+same decode, prefill 20-35 % faster. Moved to v0.33.0 on 2026-11-07: the
+27B's agent scenarios take 34 s in median there instead of 50, its cached
+prefix being re-read 2-3x faster (`llm/unified/README.md` has the numbers).
+Flash-Next is the exception: its patch set is written against v0.29.0 and on
+the v0.30.0 base its resident footprint no longer leaves room for the embed
+beside it, so it keeps its own image, built on the box over v0.29.0
+(`llm/flash-next/`), unchanged.
 Superseded images are not removed on their own: a switch and a `converge`
 prune the **dangling** ones (`docker image prune -f`), and an image a tag still
 names — the previous unified revision, an older nginx — stays until someone
@@ -769,7 +775,7 @@ switch-model.sh                       switch the generative model on a running b
 host-layer.sh                         GENERATED (tools/bundle-host-layer.sh): switch-model.sh + llm/ in one file, pinned in channel.json as host_layer_sha256, laid down by install.sh and update.sh
 llm/docker-compose.yml                vllm-llm + vllm-embed + vllm-proxy (host Docker) — profile-agnostic
 llm/profiles.sh                       the five profiles and their measured budgets, the side engines (embed, transcription) each allows, and the image tags; the ONE table install.sh and switch-model.sh share
-llm/unified/                          the UNIFIED vLLM image (official v0.30.0 + exllamav3/EXL3 + audio extras + Gemma template): published by CI, pulled by the boxes, built on a box only over a plain upstream image
+llm/unified/                          the UNIFIED vLLM image (official v0.33.0 + exllamav3/EXL3 + audio extras + Gemma template): published by CI, pulled by the boxes, built on a box only over a plain upstream image
 .github/workflows/publish-vllm-image.yml  builds llm/unified/ on a hosted arm64 runner and publishes ghcr.io/scriptor-group/suite-366-vllm:<base>-u<rev> (immutable tags)
 tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs

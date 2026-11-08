@@ -194,7 +194,7 @@ rm -rf "$STUB"
 head_ "llm/unified/"
 X="$(cat "$REPO_ROOT/llm/unified/Dockerfile")"
 contains "Dockerfile : porte le label que la box reconnaît" "$X" 'LABEL suite366.unified="${UNIFIED_REV}"'
-contains "Dockerfile : base v0.30.0 par défaut"     "$X" 'ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0'
+contains "Dockerfile : base v0.33.0 par défaut"     "$X" 'ARG BASE_IMAGE=vllm/vllm-openai:v0.33.0'
 contains "Dockerfile : gabarit Gemma embarqué"      "$X" 'COPY tool_chat_template_gemma4.jinja /app/tool_chat_template_gemma4.jinja'
 contains "Dockerfile : base paramétrée"             "$X" 'FROM ${BASE_IMAGE}'
 contains "Dockerfile : exllamav3 épinglé par sha256" "$X" 'ADD --checksum=sha256:${EXL3_SHA256}'
