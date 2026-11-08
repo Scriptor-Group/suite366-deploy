@@ -51,11 +51,11 @@ LABEL suite366.unified="${UNIFIED_REV}" \
 # Upstream publishes x86_64 wheels only and the extension is ABI-linked to torch
 # and the CUDA major, so it is compiled HERE, for sm_121, against the image's
 # own torch (2.13.0+cu130 on v0.29.0, v0.30.0 and v0.31.0 alike, 2.14.0+cu130
-# on v0.33.0) and nvcc (13.0). arm64-build.sh + aarch64_stubs.cpp drop its x86-only CPU paths first
-# (the reasons are in those files). CPATH: torch's cusparse header lives in the
-# pip `nvidia` tree, not under /usr/local/cuda, and cpp_extension does not add
-# that directory itself. MAX_JOBS: 12 on the Spark; a hosted arm64 runner has 4
-# cores and the workflow passes what it has.
+# on v0.33.0) and nvcc (13.0). arm64-build.sh + aarch64_stubs.cpp drop its
+# x86-only CPU paths first (the reasons are in those files). CPATH: torch's
+# cusparse header lives in the pip `nvidia` tree, not under /usr/local/cuda,
+# and cpp_extension does not add that directory itself. MAX_JOBS: 12 on the
+# Spark; a hosted arm64 runner has 4 cores and the workflow passes what it has.
 ARG EXL3_VERSION=1.5.1
 ARG EXL3_SHA256=97d61c9f32b5363a90b465d6387c16d89f9e43f6f068032a4e61434d493c2a29
 ARG CUDA_ARCH=12.1

@@ -79,7 +79,8 @@ the library whose CUDA extension holds the trellis kernels (`exl3_gemm`,
 `reconstruct`, `had_r_128`, `hgemm_recon`). Upstream publishes x86_64 wheels only
 and the extension is ABI-linked to torch and the CUDA major, so it is compiled
 in the image, for sm_121, against the image's own torch and nvcc (2.13.0+cu130
-and 13.0 on v0.29.0, v0.30.0 and v0.31.0 alike). Its CPU side assumes x86: five
+and 13.0 on v0.29.0, v0.30.0 and v0.31.0 alike, torch 2.14.0+cu130 on v0.33.0).
+Its CPU side assumes x86: five
 translation units are AVX2/AVX-512 intrinsics through and through (the CPU MoE
 experts of its offload mode, the CPU all-reduce of its tensor-parallel runtime,
 the ISA probes) and two spin waits call the x86 `pause` builtin. None of that is
@@ -125,5 +126,7 @@ still missing from it, torch and Python are unchanged. Two things to know before
 moving: FlashInfer 0.7's autotune takes ~6 min on the first boot of each new
 version (cached afterwards, per model shapes), and on v0.31.0 `/health` was
 seen answering 200 during that autotune while the first request was reset —
-on v0.30.0 it answers only once the engine serves, measured. Re-check the
-compose healthchecks against the new base before rolling it.
+on v0.30.0 and v0.33.0 it answers only once the engine serves, measured (v0.33.0,
+2026-11-07: 6 min 45 s of autotune on the 27B's first boot, first 200 one
+second after the startup completed). Re-check the compose healthchecks against
+the new base before rolling it.

@@ -110,7 +110,7 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
-| `VLLM_IMAGE` | `ghcr.io/scriptor-group/suite-366-vllm:v0.33.0-u1` | the unified vLLM image (`llm/unified/`): the embed, the transcription engine and every profile but Flash-Next run it. A plain upstream image here is built into it on the box |
+| `VLLM_IMAGE` | `ghcr.io/scriptor-group/suite-366-vllm:v0.33.0-u1` | the unified vLLM image (`llm/unified/`): the embed, the transcription engine and every profile but Flash-Next run it. A plain upstream image here is built into it on the box for the transcription engine and the profiles; the embed serves the plain image as is |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
 | `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
 | `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
