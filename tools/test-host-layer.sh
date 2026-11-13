@@ -48,6 +48,8 @@ contains "le bundle embarque le contexte unifié"     "$(bash "$REPO_ROOT/host-l
 contains "…avec son correctif arm64"                 "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/unified/arm64-build.sh"
 contains "…et ses stubs"                             "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/unified/aarch64_stubs.cpp"
 contains "…et le .dockerignore du contexte llm/"     "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/.dockerignore"
+# Monté dans les trois moteurs : absent du bundle, docker créerait un RÉPERTOIRE à sa place.
+contains "le bundle embarque hf-offline.sh"          "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/hf-offline.sh"
 absent   "plus de contexte STT ni EXL3 à part"       "$(bash "$REPO_ROOT/host-layer.sh" list)" "llm/stt/"
 absent   "le bundle ne transporte pas de doc"        "$(bash "$REPO_ROOT/host-layer.sh" list)" "README"
 

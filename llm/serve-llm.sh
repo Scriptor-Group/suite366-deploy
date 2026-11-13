@@ -14,6 +14,17 @@
 set -euo pipefail
 : "${LLM_PROFILE:?}" "${LLM_MODEL:?}" "${LLM_MAX_MODEL_LEN:?}" "${LLM_MAX_NUM_SEQS:?}" "${LLM_GPU_MEM_UTIL:?}"
 
+# A checkpoint that is on disk must not wait for the Hugging Face Hub: when the
+# Hub does not answer, serve what the disk holds (hf-offline.sh says why, and
+# what a boot without it cost). Guarded: a container created before the compose
+# mounted that file has this script and not the other — it starts as it used to.
+hf_offline_lib="$(dirname "${BASH_SOURCE[0]}")/hf-offline.sh"
+if [[ -f "$hf_offline_lib" ]]; then
+  # shellcheck source=llm/hf-offline.sh
+  source "$hf_offline_lib"
+  hf_offline_unless_hub "$LLM_MODEL"
+fi
+
 # Shared by the four: bind, budgets, and the fact that the app never sends
 # video (not reserving encoder budget for it). The video limit is a no-op on a
 # text-only model (orcasaq), vLLM ignores it there.

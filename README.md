@@ -773,6 +773,7 @@ llm/unified/                          the UNIFIED vLLM image (official v0.30.0 +
 .github/workflows/publish-vllm-image.yml  builds llm/unified/ on a hosted arm64 runner and publishes ghcr.io/scriptor-group/suite-366-vllm:<base>-u<rev> (immutable tags)
 tools/bundle-host-layer.sh            regenerates host-layer.sh (deterministic; tools/test-host-layer.sh fails on a stale copy)
 llm/serve-llm.sh                      container entrypoint: the vLLM flags each profile needs
+llm/hf-offline.sh                     sourced by serve-llm.sh, entrypoint of the embed and the transcription: checkpoint on disk and no answer from the Hugging Face Hub => HF_HUB_OFFLINE=1
 llm/tool_chat_template_gemma4.jinja   chat template required by the gemma profile's --tool-call-parser
 llm/flash-next/                       the vLLM patch set that makes Qwen3.8-Flash-Next fit on one Spark (built on the box over vLLM v0.29.0)
 llm/nginx.conf                        URL-path router unifying the vLLM engines behind a single endpoint (every backend resolved per request)
@@ -1218,6 +1219,41 @@ sudo systemctl restart suite366-vllm
 The k3s service, mDNS unit, and the chart workload (Postgres/MinIO/etc. PVCs
 on `local-path`) all survive reboots without manual intervention once CDI is
 persistent.
+
+### Booting before the network
+
+`vllm serve <repo id>` asks the Hugging Face Hub for the repository's file list
+at **every** start, checkpoint on disk or not, and that call has no fallback to
+the cache: with no answer the engine exits in a few seconds. A box whose WiFi
+associates a minute after `suite366-vllm.service` starts (the unit is ordered
+after `network-online.target`, which the box's own interfaces satisfy at once)
+used to lose its AI for the day: `vllm-llm` crash-looped on `Temporary failure
+in name resolution`, Compose read the restarting container as unhealthy and
+never started `vllm-proxy`, `vllm-embed` or `vllm-stt`, and the unit failed —
+while the generative engine came up by itself seconds after the WiFi did, with
+nothing in front of it.
+
+Each engine now decides before it starts (`llm/hf-offline.sh`):
+
+| On disk | The Hub answers | Start |
+| --- | --- | --- |
+| no  | — | as before: the checkpoint has to be downloaded |
+| yes | yes | as before |
+| yes | no | `HF_HUB_OFFLINE=1`: vLLM resolves the id to the snapshot directory and reads everything from the disk |
+
+The decision is the first line of each engine's log:
+
+```bash
+docker logs suite366-vllm-llm 2>&1 | grep '^>>'
+# >> nvidia/Qwen3.8-27B-NVFP4: the Hugging Face Hub does not answer — serving the checkpoint on disk (revision 482ca0f3…, HF_HUB_OFFLINE=1)
+```
+
+`HF_HUB_OFFLINE` is never set in the compose: a constant `1` would make the
+first boot, which has to download, impossible. Setting it by hand on a service
+(either value) is honoured as is.
+
+A stack left half-started by an older host layer is repaired with
+`sudo systemctl restart suite366-vllm` once the network is up.
 
 ## Licensing and several organisations
 
