@@ -51,6 +51,18 @@ x-logging: &default-logging
 # container's definition: the first `compose up -d` after this change
 # recreates the four containers, i.e. one model reload.
 
+# The Hugging Face Hub at start. `vllm serve <repo id>` asks the Hub for the
+# repository's file list at every start, with no fallback to the cache: a box
+# that boots before its network (a WiFi that associates a minute after the
+# unit starts — 2026-11-12/13) had its generative engine exit in a loop, and
+# compose, reading the restart as unhealthy, never started the proxy, the
+# embed or the transcription. Each engine therefore decides before it starts
+# (./hf-offline.sh): checkpoint on disk and no answer from the Hub =>
+# HF_HUB_OFFLINE=1, served from the disk. The Hub answers => nothing changes.
+# HF_HUB_OFFLINE is NOT set here: a constant "1" would make the first boot,
+# which has to download, impossible. The mount and the entrypoint are part of
+# a container's definition too: one more recreation, i.e. one model reload.
+
 services:
   vllm-llm:
     # The engine image for qwen27b/orcasaq/gemma (the unified image, see
@@ -91,6 +103,8 @@ services:
       - ${CACHE_DIR}/flashinfer:/root/.cache/flashinfer
       - ${CACHE_DIR}/triton:/root/.triton
       - ./serve-llm.sh:/app/serve-llm.sh:ro
+      # Sourced by serve-llm.sh: serve from the disk when the Hub is silent.
+      - ./hf-offline.sh:/app/hf-offline.sh:ro
       # Mounted for every profile, used by one: --tool-call-parser=gemma4 needs
       # it and crashes at boot without. A file is cheaper than a conditional.
       - ./tool_chat_template_gemma4.jinja:/app/tool_chat_template_gemma4.jinja:ro
@@ -144,8 +158,12 @@ services:
       - ${CACHE_DIR}/vllm:/root/.cache/vllm
       - ${CACHE_DIR}/flashinfer:/root/.cache/flashinfer
       - ${CACHE_DIR}/triton:/root/.triton
+      - ./hf-offline.sh:/app/hf-offline.sh:ro
     ports:
       - "${BIND_IP}:${EMBED_PORT}:8000"
+    # The image's own entrypoint (`vllm serve`), behind the Hub decision: the
+    # script execs `vllm serve` with the command below, untouched.
+    entrypoint: ["/bin/bash", "/app/hf-offline.sh", "serve"]
     command:
       - ${EMBED_MODEL}
       - --served-model-name=${EMBED_MODEL}
@@ -220,8 +238,11 @@ services:
       - ${CACHE_DIR}/vllm:/root/.cache/vllm
       - ${CACHE_DIR}/flashinfer:/root/.cache/flashinfer
       - ${CACHE_DIR}/triton:/root/.triton
+      - ./hf-offline.sh:/app/hf-offline.sh:ro
     ports:
       - "${BIND_IP}:${STT_PORT:-8003}:8000"
+    # Same as the embed: `vllm serve`, once the Hub decision is taken.
+    entrypoint: ["/bin/bash", "/app/hf-offline.sh", "serve"]
     command:
       - ${STT_MODEL:-Qwen/Qwen3-ASR-1.7B}
       - --served-model-name=${STT_MODEL:-Qwen/Qwen3-ASR-1.7B}

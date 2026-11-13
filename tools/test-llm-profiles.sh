@@ -190,6 +190,121 @@ check "un profil inconnu sort en 64" "$rc" "64"
 contains "…en le nommant" "$out" "unknown LLM_PROFILE: bogus"
 rm -rf "$STUB"
 
+# --- 2-bis. démarrer sans le Hub Hugging Face ------------------------------------
+# 12 et 13/11/2026, box cliente : l'unité vLLM part 7 s après le noyau, le WiFi
+# s'associe 90 s à 3 min plus tard. `vllm serve <id>` liste le dépôt sur le Hub
+# à chaque démarrage, sans repli sur le cache : le LLM sortait en boucle, compose
+# lisait « unhealthy » et ne lançait ni proxy, ni embed, ni transcription.
+head_ "llm/hf-offline.sh"
+HF="$(mktemp -d)"; HSTUB="$HF/bin"; mkdir -p "$HSTUB"
+# vllm : dit s'il a été lancé hors-ligne, puis sa ligne de commande.
+printf '#!/bin/sh\necho "offline=${HF_HUB_OFFLINE:-unset} $*"\n' > "$HSTUB/vllm"
+# curl : le Hub répond (CURL_RC=0) ou non ; son argv et son stdin sont gardés.
+cat > "$HSTUB/curl" <<'STUBEOF'
+#!/bin/sh
+echo "$*" >> "$CURL_LOG"
+case " $* " in *" -K - "*) cat >> "$CURL_STDIN" ;; esac
+exit "${CURL_RC:-0}"
+STUBEOF
+chmod +x "$HSTUB/vllm" "$HSTUB/curl"
+export CURL_LOG="$HF/curl.log" CURL_STDIN="$HF/curl.stdin"
+REV=482ca0f3832238542f8f5295dde86b5f22711d80
+seed() { # seed MODEL [sans-config] -> un cache HF où refs/main nomme un snapshot
+  local d="$HF/home/hub/models--${1//\//--}"
+  mkdir -p "$d/refs" "$d/snapshots/$REV"; printf '%s' "$REV" > "$d/refs/main"
+  [[ "${2:-}" == sans-config ]] || : > "$d/snapshots/$REV/config.json"
+}
+engine() { # engine CURL_RC ARGS… -> hf-offline.sh ARGS, Hub joignable ou non
+  local rc="$1"; shift
+  : > "$CURL_LOG"; : > "$CURL_STDIN"
+  env -u HF_HUB_OFFLINE -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HF_ENDPOINT \
+    PATH="$HSTUB:$PATH" HF_HOME="$HF/home" CURL_RC="$rc" "${ENGINE_ENV[@]}" \
+    bash "$REPO_ROOT/llm/hf-offline.sh" "$@" 2>&1
+}
+ENGINE_ENV=(HF_PROBE_TIMEOUT=5)
+
+# Premier démarrage : rien sur disque, il FAUT le Hub — jamais hors-ligne.
+e="$(engine 6 serve org/absent --port=8000)"
+contains "rien sur disque, Hub muet : démarrage en ligne (téléchargement)" "$e" "offline=unset serve org/absent --port=8000"
+check    "rien sur disque : le Hub n'est même pas sondé" "$(wc -l < "$CURL_LOG")" "0"
+
+seed org/model
+e="$(engine 0 serve org/model --runner=pooling --port=8000)"
+contains "sur disque, le Hub répond : rien ne change"  "$e" "offline=unset serve org/model --runner=pooling --port=8000"
+contains "…la sonde vise le dépôt du modèle"           "$(cat "$CURL_LOG")" "https://huggingface.co/api/models/org/model"
+contains "…bornée dans le temps"                        "$(cat "$CURL_LOG")" "-m 5"
+contains "…un 5xx ou un portail captif n'est pas une réponse (-f)" "$(cat "$CURL_LOG")" "-fsS"
+
+e="$(engine 6 serve org/model --runner=pooling --port=8000)"
+contains "sur disque, Hub muet : servi depuis le disque" "$e" "offline=1 serve org/model --runner=pooling --port=8000"
+contains "…et le journal dit pourquoi, avec la révision" "$e" "does not answer — serving the checkpoint on disk (revision $REV"
+
+# Un téléchargement interrompu laisse refs/main sans config.json : pas un checkpoint.
+seed org/partiel sans-config
+e="$(engine 6 serve org/partiel)"
+contains "refs/main sans config.json : pas hors-ligne"  "$e" "offline=unset serve org/partiel"
+
+# Un HF_HUB_OFFLINE posé par l'opérateur est une décision, dans les deux sens.
+ENGINE_ENV=(HF_HUB_OFFLINE=0);  e="$(engine 6 serve org/model)"
+contains "HF_HUB_OFFLINE=0 posé à la main est gardé"    "$e" "offline=0 serve org/model"
+check    "…sans sonde"                                   "$(wc -l < "$CURL_LOG")" "0"
+ENGINE_ENV=(HF_HUB_OFFLINE=1);  e="$(engine 0 serve org/absent)"
+contains "HF_HUB_OFFLINE=1 posé à la main est gardé"    "$e" "offline=1 serve org/absent"
+
+# Modèle à accès restreint : le jeton part dans la config de curl, jamais dans son argv.
+ENGINE_ENV=(HUGGING_FACE_HUB_TOKEN=hf_SECRET); e="$(engine 0 serve org/model)"
+absent   "le jeton n'est pas sur la ligne de commande de curl" "$(cat "$CURL_LOG")" "hf_SECRET"
+contains "…il passe par stdin (-K -)"                   "$(cat "$CURL_STDIN")" 'header = "Authorization: Bearer hf_SECRET"'
+ENGINE_ENV=(HF_ENDPOINT=https://hub.example); e="$(engine 0 serve org/model)"
+contains "HF_ENDPOINT est respecté par la sonde"        "$(cat "$CURL_LOG")" "https://hub.example/api/models/org/model"
+ENGINE_ENV=(HF_PROBE_TIMEOUT=5)
+
+# Une image sans curl ne peut pas sonder : elle démarre comme avant, pas hors-ligne.
+NOCURL="$HF/nocurl"; mkdir -p "$NOCURL"
+for b in bash cat env dirname; do ln -s "$(command -v "$b")" "$NOCURL/$b"; done
+cp "$HSTUB/vllm" "$NOCURL/vllm"
+e="$(env -u HF_HUB_OFFLINE PATH="$NOCURL" HF_HOME="$HF/home" bash "$REPO_ROOT/llm/hf-offline.sh" serve org/model 2>&1)"
+contains "sans curl dans l'image : démarrage inchangé"  "$e" "offline=unset serve org/model"
+
+e="$(engine 0 2>&1)"; rc=$?
+check    "sans sous-commande : sort en 64"               "$rc" "64"
+e="$(engine 0 serve 2>&1)"; rc=$?
+check    "serve sans modèle : sort en 64"                "$rc" "64"
+
+# Le LLM passe par serve-llm.sh, qui prend la même décision avant son `case`.
+llm() { # llm CURL_RC -> la ligne vllm de serve-llm.sh pour un modèle sur disque
+  : > "$CURL_LOG"
+  env -u HF_HUB_OFFLINE PATH="$HSTUB:$PATH" HF_HOME="$HF/home" CURL_RC="$1" \
+    LLM_PROFILE=qwen27b LLM_MODEL=org/model LLM_MAX_MODEL_LEN=262144 LLM_MAX_NUM_SEQS=6 \
+    LLM_GPU_MEM_UTIL=0.45 LLM_MTP_TOKENS=3 bash "${2:-$REPO_ROOT/llm/serve-llm.sh}" 2>&1
+}
+l="$(llm 6)"
+contains "serve-llm.sh, Hub muet : LLM servi depuis le disque" "$l" "offline=1 serve org/model --host 0.0.0.0"
+contains "…avec sa recette intacte"                     "$l" "--tool-call-parser qwen3_xml"
+l="$(llm 0)"
+contains "serve-llm.sh, le Hub répond : rien ne change" "$l" "offline=unset serve org/model --host 0.0.0.0"
+# Un conteneur créé avant ce montage a serve-llm.sh sans hf-offline.sh à côté.
+mkdir -p "$HF/alone"; cp "$REPO_ROOT/llm/serve-llm.sh" "$HF/alone/serve-llm.sh"
+l="$(llm 6 "$HF/alone/serve-llm.sh")"
+contains "serve-llm.sh seul (ancien conteneur) : démarre comme avant" "$l" "offline=unset serve org/model --host 0.0.0.0"
+rm -rf "$HF"; unset CURL_LOG CURL_STDIN
+
+# Le compose : la décision est prise par les trois moteurs, et jamais figée.
+CH="$(cat "$REPO_ROOT/llm/docker-compose.yml")"
+check    "compose : hf-offline.sh monté dans les trois moteurs" \
+  "$(grep -c -- '- ./hf-offline.sh:/app/hf-offline.sh:ro' "$REPO_ROOT/llm/docker-compose.yml")" "3"
+check    "compose : embed et transcription démarrent par hf-offline.sh" \
+  "$(grep -c 'entrypoint: \["/bin/bash", "/app/hf-offline.sh", "serve"\]' "$REPO_ROOT/llm/docker-compose.yml")" "2"
+contains "compose : le LLM garde serve-llm.sh"          "$CH" 'entrypoint: ["/bin/bash", "/app/serve-llm.sh"]'
+# Un HF_HUB_OFFLINE: "1" en dur rendrait le premier démarrage (téléchargement) impossible.
+if grep -Eq '^[[:space:]]+HF_HUB_OFFLINE:' "$REPO_ROOT/llm/docker-compose.yml"; then
+  ko "compose : HF_HUB_OFFLINE est figé dans l'environnement d'un service"
+else
+  ok "compose : HF_HUB_OFFLINE n'est figé nulle part"
+fi
+proxy_block="$(sed -n '/^  vllm-proxy:/,$p' "$REPO_ROOT/llm/docker-compose.yml")"
+absent   "compose : le proxy n'a rien à voir avec le Hub" "$proxy_block" "hf-offline"
+
 # --- 2a. le contexte unifié : tout est épinglé par contenu ----------------------
 head_ "llm/unified/"
 X="$(cat "$REPO_ROOT/llm/unified/Dockerfile")"
