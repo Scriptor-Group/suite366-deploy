@@ -5,11 +5,11 @@
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "da407b612f91ff3961c8933a0f1b0891276dc5a12f0171133926d93d7c06bc56",
   "backup_sha256": "9004066456b4deea8a95303c16af6ff13bfcc055d0674eabf5c8ca2710b985ac",
-  "host_layer_sha256": "da4d8eb3fd156f94c9c8022c2281e4c3a1366a029a89849bea2b3b226bda99fd",
-  "serial": "1794567990",
-  "expires": "2027-11-13T11:06:30Z",
+  "host_layer_sha256": "b73ca95e1ab54472f14952e8496413a52cb5ac518ce42f21acd50fed22bd7b56",
+  "serial": "1794830541",
+  "expires": "2027-11-16T12:02:21Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Suite 366 1.31.0, chart 0.10.5. New: Gmail mailboxes synchronised by labels (off until switched on per domain), desktop sync with conflicts resolved by the user, OpenAI Responses API on the router (/v1/responses), add a message to a reflection in progress (text or voice). Fixes: no more empty answers from the box model, a chosen mention no longer erases the text before the @, the box AI now starts even when the network is not up yet at boot. Applying restarts the application and reloads the AI models once: a few minutes without Suite 366."
+  "notes": "Suite 366 1.31.0, chart 0.10.5 (unchanged). Host layer only: the box AI now reports how much of each prompt was served from its cache (usage.prompt_tokens_details.cached_tokens) on every model, not only on Qwen 27B - OrcaSAQ and OrcaSAQ batch included. Applying restarts nothing: the application and the AI models keep running, and the new figure appears the next time the AI engine starts (a model switch from the app, or a reboot)."
 }
