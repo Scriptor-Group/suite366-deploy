@@ -28,6 +28,14 @@ fi
 # Shared by the four: bind, budgets, and the fact that the app never sends
 # video (not reserving encoder budget for it). The video limit is a no-op on a
 # text-only model (orcasaq), vLLM ignores it there.
+#
+# --enable-prompt-tokens-details: usage.prompt_tokens_details.cached_tokens in
+# every response, i.e. how much of the prompt the prefix cache served. A flag
+# of the OpenAI front end, not of the engine: it changes what the usage block
+# reports and nothing about how a model is loaded or run, which is why it is
+# here and not in a recipe. It used to be on qwen27b alone, so a box on
+# orcasaq-batch — the profile whose long shared prefixes make that number
+# worth reading — answered without it.
 common=(
   --host 0.0.0.0 --port 8000
   --served-model-name "$LLM_MODEL"
@@ -36,6 +44,7 @@ common=(
   --gpu-memory-utilization "$LLM_GPU_MEM_UTIL"
   --enable-chunked-prefill
   --enable-prefix-caching
+  --enable-prompt-tokens-details
   --limit-mm-per-prompt.video=0
 )
 
@@ -46,13 +55,10 @@ case "$LLM_PROFILE" in
     # No --quantization: the ModelOpt mixed NVFP4/FP8 recipe is read from
     # hf_quant_config.json. No --trust-remote-code: config.json carries no
     # auto_map, vLLM's own handler loads this architecture.
-    # --enable-prompt-tokens-details: usage.prompt_tokens_details.cached_tokens
-    # in every response, i.e. how much of the prompt the prefix cache served.
     exec vllm serve "$LLM_MODEL" "${common[@]}" \
       --kv-cache-dtype fp8 \
       --max-num-batched-tokens 8192 \
       --async-scheduling \
-      --enable-prompt-tokens-details \
       --load-format fastsafetensors \
       --reasoning-parser qwen3 \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml \
