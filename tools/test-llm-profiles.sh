@@ -149,7 +149,6 @@ contains "qwen27b : parseur d'outils qwen3_xml"    "$q" "--tool-call-parser qwen
 contains "qwen27b : KV en fp8"                     "$q" "--kv-cache-dtype fp8"
 contains "qwen27b : chargement fastsafetensors"    "$q" "--load-format fastsafetensors"
 contains "qwen27b : tête MTP à 3"                  "$q" -- '"num_speculative_tokens":3'
-contains "qwen27b : cached_tokens dans l'usage"    "$q" "--enable-prompt-tokens-details"
 absent   "qwen27b : pas le gabarit Gemma"          "$q" "tool_chat_template_gemma4"
 # orcasaq-batch suit la recette orcasaq : seuls les budgets changent, et ils arrivent par l'env.
 b="$(serve orcasaq-batch)"
@@ -178,6 +177,23 @@ absent   "gemma : aucune tête MTP"                 "$g" "speculative-config"
 # Le flag est un remède à Gemma, pas une règle : les deux autres gardent le gestionnaire hybride.
 absent   "qwen27b : gestionnaire KV hybride conservé" "$q" "disable-hybrid-kv-cache-manager"
 absent   "orcasaq : gestionnaire KV hybride conservé" "$o" "disable-hybrid-kv-cache-manager"
+
+# cached_tokens dans l'usage : un drapeau du serveur OpenAI, pas d'une recette. Il n'était posé
+# que sur qwen27b ; une box en orcasaq-batch répondait donc sans ce chiffre (16/11/2026). Il vit
+# dans le bloc commun : les cinq profils l'ont, une seule fois chacun.
+# Flash-Next sert un chemin de snapshot : un checkpoint factice, complet, sans config.json
+# (hf-offline.sh ne sonde alors pas le Hub, le test reste sans réseau).
+FN="$(mktemp -d)"; fsnap="$FN/hub/models--the-model/snapshots/rev0"
+mkdir -p "$fsnap" "$FN/hub/models--the-model/refs"; printf 'rev0' > "$FN/hub/models--the-model/refs/main"
+printf '{"weight_map":{"w":"w.safetensors"}}' > "$fsnap/model.safetensors.index.json"
+: > "$fsnap/tokenizer.json"; : > "$fsnap/w.safetensors"
+f="$(HF_HOME="$FN" serve flash-next)"
+contains "flash-next : sert le snapshot du disque" "$f" "serve $fsnap --host 0.0.0.0"
+for pair in "qwen27b:$q" "orcasaq:$o" "orcasaq-batch:$b" "flash-next:$f" "gemma:$g"; do
+  n="$(grep -o -- '--enable-prompt-tokens-details' <<<"${pair#*:}" | wc -l)"
+  check "${pair%%:*} : cached_tokens dans l'usage (drapeau commun, une fois)" "$n" "1"
+done
+rm -rf "$FN"
 if ! grep -q 'VLLM_NVFP4_GEMM_BACKEND=\|VLLM_USE_FLASHINFER_MOE_FP4=' "$REPO_ROOT/llm/serve-llm.sh" "$REPO_ROOT/llm/docker-compose.yml"; then
   ok "plus aucun forçage de backend NVFP4 (les trois modèles prennent le noyau natif)"
 else
