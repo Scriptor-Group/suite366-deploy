@@ -871,7 +871,7 @@ compute_diffs() {
   # up-to-date box could only get it from a root shell. Guarded so the diffs
   # self-test, which extracts this function alone, is unaffected.
   if declare -F ensure_appliance_values >/dev/null && ensure_appliance_values --check; then values_diff=1; fi
-  if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench / OnlyOffice image) — converged on apply"; fi
+  if [[ "$values_diff" == 1 ]]; then info "config values : behind the template (bridges / workbench / browser / OnlyOffice image) — converged on apply"; fi
   # The tunnel's Traefik entrypoint (lib/ingress.sh), same idea: READ here,
   # converged by `apply` only (it restarts Traefik). Guarded like the line above.
   if declare -F public_ingress_missing >/dev/null && public_ingress_missing; then ingress_diff=1; fi
@@ -897,7 +897,7 @@ compute_diffs() {
   [[ "$app_diff"   == 1 ]] && parts+=("app ${cur_app:-?} -> $want_app")
   [[ "$vllm_diff"  == 1 ]] && parts+=("vLLM image -> $want_vllm")
   [[ "$host_diff"  == 1 ]] && parts+=("host layer (model switch, transcription) -> ${want_host:0:12}")
-  [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench, OnlyOffice image)")
+  [[ "$values_diff" == 1 ]] && parts+=("configuration (values.yaml: bridges, workbench, agents' browser, OnlyOffice image)")
   [[ "${ingress_diff:-0}" == 1 ]] && parts+=("public ingress entrypoint (:${PUBLIC_INGRESS_PORT:-8443})")
   [[ "$UPDATE_SOURCE" == "usb" && ${#parts[@]} -gt 0 ]] && parts+=("from USB package")
   summary_line="$(IFS='; '; echo "${parts[*]}")"
@@ -1156,6 +1156,12 @@ EOF
 # an update — the pin rewrite above only touches lines that exist. The block is
 # added whole when absent, pinned on the app version this apply installs, and
 # never edited when present: an admin who turned it off keeps it off.
+#
+# And the top-level `browser:` block (agents' web browser, chart drive >=
+# 0.11.0), on the same terms: added whole when absent, never edited when
+# present. A chart older than 0.11.0 ignores it. Its API address is the node-ip
+# of /etc/rancher/k3s/config.yaml (the stable internal IP); without one the
+# chart reads the `kubernetes` EndpointSlice at upgrade time.
 detect_stt_model() { # -> the transcription model the box's profile serves, or empty
   local envf="$DATA_DIR/llm/.env" profiles="$DATA_DIR/llm/profiles.sh" prof model
   [[ -f "$envf" && -f "$profiles" ]] || return 0
@@ -1186,7 +1192,7 @@ ensure_appliance_values() { # ensure_appliance_values [--check] -> 0 changed/wou
     return 1
   fi
   stt="$(detect_stt_model)"
-  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" ONLYOFFICE_IMAGE="${ONLYOFFICE_IMAGE:-}" CHECK_ONLY="$check" python3 - "$vals" <<'PY'
+  out="$(DATA_DIR="$DATA_DIR" STT_MODEL="$stt" APP_VERSION="${want_app:-${cur_app:-}}" ONLYOFFICE_IMAGE="${ONLYOFFICE_IMAGE:-}" K3S_CONFIG="${K3S_CONFIG:-/etc/rancher/k3s/config.yaml}" CHECK_ONLY="$check" python3 - "$vals" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 data_dir = os.environ["DATA_DIR"]
@@ -1304,6 +1310,39 @@ if si is not None:
         if re.match(r"^  workbench:\s*$", lines[k]):
             added += ensure_quoted_limit(k, sub_block(k, sj, 2), 4, "idleStopMs", "7200000")
             break
+# browser: the whole block, as the template renders it, when the file has none.
+# Appended at the end (a top-level key). Present = left alone (an admin who set
+# `enabled: false` keeps it off).
+if app_version and not any(re.match(r"^browser:", l) for l in lines):
+    node_ip = ""
+    try:
+        for l in open(os.environ.get("K3S_CONFIG", "/etc/rancher/k3s/config.yaml"), encoding="utf-8"):
+            m = re.match(r'^node-ip:\s*"?([0-9.]+)"?\s*$', l)
+            if m:
+                node_ip = m.group(1)
+                break
+    except OSError:
+        pass
+    block = [
+        "",
+        "# Agents' web browser (chart drive >= 0.11.0), added by update.sh: see the",
+        "# template's values.yaml for the details. Images follow image.tag.",
+        "browser:",
+        "  enabled: true",
+        "  singleNode: true",
+        "  live:",
+        "    enabled: true",
+        "  hostUsers: false",
+        "  maxSessions: 4",
+        "  maxPerOrg: 4",
+        "  maxPerUser: 2",
+    ]
+    if node_ip:
+        block += ["  networkPolicy:", '    apiserverCidrs: ["' + node_ip + '/32"]']
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines.extend(block)
+    added += 1
 # Deliberately NOT converged here: `config.APPLIANCE_ADMIN_EMAIL` and
 # `config.APPLIANCE_CLAIM_LAN_ONLY` (both only gate the FIRST organisation of a
 # virgin box — every box that runs this has one already, and adding either
@@ -1462,6 +1501,32 @@ roll_release() { # roll_release CHART_VERSION
     || die "helm upgrade failed — roll back with: sudo helm rollback $RELEASE -n $NAMESPACE"
 }
 
+# --- k3s: a PID ceiling per pod -----------------------------------------------
+# Kubernetes has no per-container equivalent of the Docker driver's
+# BROWSER_PIDS_LIMIT: the cap is the kubelet's podPidsLimit, which lib/k3s.sh
+# writes into /etc/rancher/k3s/config.yaml on install. A box installed earlier
+# gets it here, once, when the agents' browser is on — in the very layout
+# lib/k3s.sh renders, so a later install.sh re-run sees no difference. A k3s
+# restart leaves the containers running (KillMode=process). Best-effort: it
+# never fails the apply.
+ensure_k3s_pid_limit() {
+  local cfg="${K3S_CONFIG:-/etc/rancher/k3s/config.yaml}" pids="${K3S_POD_PIDS:-4096}" i
+  [[ -f "$cfg" ]] || return 0
+  grep -q 'pod-max-pids=' "$cfg" && return 0
+  if grep -q '^kubelet-arg:' "$cfg"; then
+    warn "k3s config has its own kubelet-arg list: pod-max-pids not added (add pod-max-pids=$pids by hand)."
+    return 0
+  fi
+  printf 'kubelet-arg:\n  - pod-max-pids=%s\n' "$pids" >> "$cfg"
+  log "k3s: pod-max-pids=$pids (agents' browser runners) — restarting k3s"
+  if ! systemctl restart k3s; then
+    warn "k3s restart failed — check: journalctl -u k3s"; return 0
+  fi
+  for i in $(seq 1 60); do kc get nodes >/dev/null 2>&1 && break; sleep 2; done
+  kc wait --for=condition=Ready node --all --timeout=120s >/dev/null 2>&1 \
+    || warn "node not Ready yet after the k3s restart — check: sudo k3s kubectl get nodes"
+}
+
 # sandbox-api reads its configuration through `envFrom` on configmap-sandbox-api
 # at start, and the chart puts no checksum on its pod template: a converged
 # values.yaml that turned the workbench on rewrites the ConfigMap and nothing
@@ -1580,6 +1645,7 @@ do_apply() {
   if ensure_appliance_values; then values_changed=1; fi
   [[ "$chart_diff" == 1 ]] || target_chart="${cur_chart:-$want_chart}"
   if [[ "$chart_diff" == 1 || "$app_diff" == 1 || "$values_changed" == 1 ]]; then
+    grep -q '^browser:' "$vals" && ensure_k3s_pid_limit
     log "helm upgrade $RELEASE: chart ${cur_chart:-?} -> $target_chart, app ${cur_app:-?} -> ${want_app:-unchanged}$([[ "$values_changed" == 1 ]] && printf ', values.yaml converged')"
     roll_release "$target_chart"
     # After the health check below; the flag is read there.
@@ -1607,6 +1673,18 @@ do_apply() {
     k3s crictl pull "ghcr.io/scriptor-group/suite-366-sandbox-runner:$want_app" >/dev/null 2>&1 \
       && info "sandbox-runner:$want_app pre-pulled." \
       || warn "sandbox-runner:$want_app pre-pull failed (offline restart may miss it)."
+  fi
+  # The agents' browser runner, same reason: spawned by browser-api, on the
+  # app's image.tag. Also when values.yaml just gained the browser block.
+  if [[ "$UPDATE_SOURCE" != "usb" && ( "$app_diff" == 1 || "$values_changed" == 1 ) ]] \
+     && grep -q '^browser:' "$vals"; then
+    local brtag
+    brtag="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$vals" | head -1)"
+    if [[ -n "$brtag" ]]; then
+      k3s crictl pull "ghcr.io/scriptor-group/suite-366-browser-runner:$brtag" >/dev/null 2>&1 \
+        && info "browser-runner:$brtag pre-pulled." \
+        || warn "browser-runner:$brtag pre-pull failed (the first browser session will pull it)."
+    fi
   fi
 
   rm -f "$MARKER"

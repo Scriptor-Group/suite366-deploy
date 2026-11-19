@@ -383,6 +383,8 @@ PACKAGE_PUBLIC_KEY_PEM="${PACKAGE_PUBLIC_KEY_PEM:-$_DEFAULT_PACKAGE_PUBLIC_KEY}"
 # the release's sha256sum file itself), helm with the sha256 of each tarball
 # (https://get.helm.sh/helm-<v>-linux-<arch>.tar.gz.sha256sum).
 K3S_VERSION="${K3S_VERSION:-v1.36.2+k3s1}"
+# Kubelet PID ceiling per pod (lib/k3s.sh, update.sh ensure_k3s_pid_limit).
+K3S_POD_PIDS="${K3S_POD_PIDS:-4096}"
 HELM_VERSION="${HELM_VERSION:-v3.21.3}"
 HELM_SHA256_ARM64="67f58155079ff9ffab98ba5c88daff0ed9b542f3a4732f5dd426dde7dd0f5244"
 HELM_SHA256_AMD64="15e041a93a590dce8100f39385cd98c84a765c9e36aeeb9e2dc6ff9e4769e2e0"

@@ -468,3 +468,31 @@ sandbox:
       limitsMemory: "40Gi"
       persistentVolumeClaims: "30"
       requestsStorage: "300Gi"
+
+# Agents' web browser (suite-366 documentation/37, chart drive >= 0.11.0):
+# browser-api and its egress proxy in `suite366-browser`, one Chromium runner
+# pod per session in `suite366-browser-sessions` — both namespaces created by
+# the chart, which also adds /br-live/ (live view) to every ingress host above.
+# The images follow `image.tag` (same release train): nothing to pin here, and
+# update.sh's pin rewrite already moves them. Requires public GHCR packages
+# suite-366-browser-{api,runner} and a runner that waits for kube-router to
+# program the NetworkPolicies (suite-366#974).
+browser:
+  enabled: true
+  # One node: the live view's keystrokes never leave the box — what lets
+  # live.enabled pass the chart's guard without an encrypting CNI.
+  singleNode: true
+  live:
+    enabled: true
+  # Runners in a user namespace: uid 61000 of the pod is nobody on the host
+  # (kernel >= 6.3 and containerd 2.x, which k3s ships).
+  hostUsers: false
+  # GB10 unified memory: up to 4 runners of 1.5 GB (+ tmp/downloads). One
+  # organisation may use them all; a user, two.
+  maxSessions: 4
+  maxPerOrg: 4
+  maxPerUser: 2
+  networkPolicy:
+    # The Kubernetes API after the DNAT of the `kubernetes` Service: the node
+    # IP, i.e. the stable internal IP k3s is pinned to (lib/k3s.sh node-ip).
+    apiserverCidrs: ["@SUITE_IP@/32"]
