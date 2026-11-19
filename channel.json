@@ -1,15 +1,15 @@
 {
   "channel": "stable",
   "chart_version": "0.10.5",
-  "app_version": "1.31.0",
+  "app_version": "1.32.1",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "da407b612f91ff3961c8933a0f1b0891276dc5a12f0171133926d93d7c06bc56",
   "backup_sha256": "9004066456b4deea8a95303c16af6ff13bfcc055d0674eabf5c8ca2710b985ac",
   "host_layer_sha256": "b73ca95e1ab54472f14952e8496413a52cb5ac518ce42f21acd50fed22bd7b56",
-  "serial": "1794831154",
-  "expires": "2027-11-16T12:12:34Z",
+  "serial": "1795102932",
+  "expires": "2027-11-19T15:42:12Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Suite 366 1.31.0, chart 0.10.5 (unchanged). Host layer only: the box AI now reports how much of each prompt was served from its cache (usage.prompt_tokens_details.cached_tokens) on every model, not only on Qwen 27B - OrcaSAQ and OrcaSAQ batch included. Applying restarts nothing: the application and the AI models keep running, and the new figure appears the next time the AI engine starts (a model switch from the app, or a reboot)."
+  "notes": "Suite 366 1.32.1, chart 0.10.5 (unchanged). Meetings: public invitation link with a key for external guests, a video call can start on an existing calendar event, and a recording mode can be chosen. Agents: a Persistent memory switch for static agents; long PersonIA conversations keep their compaction summary instead of re-summarising the whole history on every turn. Workflows: a regex Extract text action, and CRM boards usable as references for an AI analysis. Chat: member card from the directory and the voice participants, mention menu and PersonIA Stop button fixes. Updating restarts the application (database migrations run at startup); the AI models keep running."
 }
