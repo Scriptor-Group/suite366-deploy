@@ -14,6 +14,9 @@
 #     directory — naming its sensitive files one by one is how backup.env (S3
 #     credentials in clear) and the repository key ended up inside the
 #     repository they protect;
+#   • it also leaves out cache/ and ANY file over 32 MiB, and names the large
+#     files in the run's log — ~1.5 TiB of model checkpoints and downloads left
+#     in $DATA_DIR went into one box's nightly snapshot;
 #   • a pg_dump that dies mid-stream makes the run PARTIAL, never success (a
 #     truncated dump in a valid snapshot is the worst possible outcome: it
 #     looks like a backup until someone restores it);
@@ -210,11 +213,30 @@ bk init;   check "init refuses without a destination" "$?" "1"
 echo "== configured appliance =="
 printf 'test-encryption-key\n' > "$PRIV/repo.pass"; chmod 0600 "$PRIV/repo.pass"
 write_env "s3:s3.example.com/bucket/spark-01"
+# What a model-tuning run left in $DATA_DIR on a real box (Nov 2026): a large
+# checkpoint next to small files, outside every directory excluded by name.
+# Sparse, so the test writes nothing. The one in models/ is excluded by name
+# and must not be reported as left out by the cap.
+mkdir -p "$DATA/llm-work" "$DATA/cache/vllm"
+truncate -s 40M "$DATA/llm-work/model-00001-of-00002.safetensors"
+echo "notes" > "$DATA/llm-work/notes.txt"
+truncate -s 40M "$DATA/models/huge.safetensors"
 : > "$RLOG"
 bk run; rc=$?
 check "a full run succeeds" "$rc" "0"
 check "last_run.status is 'success'" "$(field status)" "success"
 log="$(cat "$RLOG")"
+contains "config snapshot excludes cache/ (JIT caches)" "--exclude $DATA/cache" "$log"
+contains "config snapshot caps file size at 32 MiB"     "--exclude-larger-than 32M" "$log"
+contains "the run names the large file it leaves out"   "$DATA/llm-work/model-00001-of-00002.safetensors" "$(out)"
+contains "…and says it is NOT backed up"                "NOT backed up" "$(out)"
+absent   "…but not the small file next to it"           "notes.txt" "$(out)"
+absent   "…nor a file under models/ (excluded by name)" "huge.safetensors" "$(out)"
+: > "$RLOG"
+BACKUP_CONFIG_MAX_FILE_MB='1;id' bk run
+contains "a cap that is not a number is refused"        "is not a size in MiB" "$(out)"
+contains "…and the run falls back to 32 MiB"            "--exclude-larger-than 32M" "$(cat "$RLOG")"
+rm -rf "$DATA/llm-work" "$DATA/cache" "$DATA/models/huge.safetensors"
 contains "postgres arrives as a stdin snapshot"   "--stdin-filename postgres.dump" "$log"
 contains "minio directory is backed up"           "backup $MINIO_DATA" "$log"
 contains "minio EXCLUDES .minio.sys"              "--exclude $MINIO_DATA/.minio.sys" "$log"
@@ -1031,6 +1053,17 @@ if PATH="$ORIG_PATH" command -v restic >/dev/null 2>&1; then
     ok "real restic: backup -> restore returns identical bytes"
   else
     ko "real restic: backup -> restore returns identical bytes"
+  fi
+  # The cap's syntax, checked by restic itself: a flag it rejected would fail
+  # the config snapshot every night. 32M is what backup_config passes by default.
+  RCAP="$WORK/realcap"; mkdir -p "$RCAP"
+  truncate -s 40M "$RCAP/big.safetensors"; echo "config" > "$RCAP/values.yaml"
+  if PATH="$ORIG_PATH" restic backup "$RCAP" --exclude-larger-than 32M >/dev/null 2>&1; then
+    rls="$(PATH="$ORIG_PATH" restic ls latest 2>/dev/null)"
+    contains "real restic: --exclude-larger-than 32M keeps the small file" "$RCAP/values.yaml" "$rls"
+    absent   "real restic: …and leaves the 40 MiB one out"                 "big.safetensors" "$rls"
+  else
+    ko "real restic: --exclude-larger-than 32M is accepted"
   fi
   unset RESTIC_REPOSITORY RESTIC_PASSWORD RESTIC_CACHE_DIR
 else
