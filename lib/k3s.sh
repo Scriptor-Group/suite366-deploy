@@ -13,7 +13,9 @@ install_k3s() {
   # service route (pods -> 10.43.0.1: "no route to host") and crash-loops the
   # whole cluster. node-ip on the always-up dummy iface makes this immune to
   # DHCP/NIC/offline changes. tls-san keeps the API cert valid for remote
-  # kubectl over the current LAN IP + hostname. Written BEFORE the install (and
+  # kubectl over the current LAN IP + hostname. pod-max-pids caps the PIDs of
+  # every pod (the agents' browser runners run Chromium: Kubernetes has no
+  # per-container equivalent of Docker's --pids-limit). Written BEFORE the install (and
   # reconciled on re-runs) so it also repairs an already-broken box.
   mkdir -p /etc/rancher/k3s
   local cfg=/etc/rancher/k3s/config.yaml new
@@ -25,6 +27,8 @@ tls-san:
   - $HOST_IP
   - $(hostname)
   - 127.0.0.1
+kubelet-arg:
+  - pod-max-pids=$K3S_POD_PIDS
 EOF
 )"
   if [[ "$(cat "$cfg" 2>/dev/null)" != "$new" ]]; then

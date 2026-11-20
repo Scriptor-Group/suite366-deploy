@@ -302,9 +302,17 @@ prepull_images() {
   local wbrunner
   wbrunner="$(sed -n 's|^[[:space:]]*runnerImage:[[:space:]]*\(.*suite-366-workbench-runner:.*\)$|\1|p' \
                 "$DATA_DIR/values.yaml" 2>/dev/null | head -1)"
+  # The agents' browser runner is spawned by browser-api, never by Helm either.
+  # It has no pin of its own: the chart runs it on the app's image.tag.
+  local brrunner="" apptag
+  if grep -q '^browser:' "$DATA_DIR/values.yaml" 2>/dev/null; then
+    apptag="$(sed -n 's/^  tag: "\(.*\)"/\1/p' "$DATA_DIR/values.yaml" 2>/dev/null | head -1)"
+    [[ -n "$apptag" ]] && brrunner="ghcr.io/scriptor-group/suite-366-browser-runner:$apptag"
+  fi
   extra="busybox:1.37
 ${runner:-ghcr.io/scriptor-group/suite-366-sandbox-runner:1.11.3}
-${wbrunner:-ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.3}"
+${wbrunner:-ghcr.io/scriptor-group/suite-366-workbench-runner:1.11.3}
+${brrunner}"
   for i in $imgs $extra; do
     [[ -z "$i" ]] && continue
     if k3s crictl pull "$i" >/dev/null 2>&1; then info "  ✓ $i"; else warn "  ✗ $i (pull failed — offline restart may miss it)"; fi

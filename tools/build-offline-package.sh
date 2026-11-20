@@ -183,9 +183,12 @@ carries no 'image:' field — either the chart layout changed or the values \
 substitution above produced nothing usable."
 
 # Images Helm never schedules but the box needs offline: the livekit
-# initContainer and the sandbox runner (spawned on demand by sandbox-api).
-# Kept in sync with prepull_images() in lib/suite.sh.
+# initContainer, the sandbox runner (spawned on demand by sandbox-api) and the
+# agents' browser runner (spawned by browser-api; browser-api itself is in the
+# render above). Kept in sync with prepull_images() in lib/suite.sh.
 images+=( "busybox:1.37" "ghcr.io/scriptor-group/suite-366-sandbox-runner:$APP_VERSION" )
+grep -q '^browser:' "$REPO_ROOT/values.yaml" \
+  && images+=( "ghcr.io/scriptor-group/suite-366-browser-runner:$APP_VERSION" )
 mapfile -t images < <(printf '%s\n' "${images[@]}" | sort -u)
 
 info "${#images[@]} image(s) to export"

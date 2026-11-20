@@ -406,6 +406,40 @@ check "workbench éteint par l'admin : un seul bloc"  "$(grep -c '^  workbench:'
 contains "workbench éteint par l'admin : reste éteint" "$(cat "$OFF/values.yaml")" "    enabled: false"
 absent   "workbench éteint par l'admin : pas de quota injecté" "$(cat "$OFF/values.yaml")" "resourceQuota"
 
+# Le navigateur des agents : bloc ajouté entier en fin de fichier quand il manque,
+# adresse de l'API = node-ip de la config k3s ; présent = jamais touché.
+contains "juillet : bloc browser ajouté"          "$(cat "$JULY/values.yaml")" "browser:"
+check    "juillet : browser en dernier, clé de premier niveau" "$(grep -E '^[a-zA-Z]' "$JULY/values.yaml" | tail -1)" "browser:"
+absent   "juillet : sans config k3s, pas d'adresse d'API (lue par le chart)" "$(sed -n '/^browser:/,$p' "$JULY/values.yaml")" "apiserverCidrs"
+BRW="$WORK/browser"; mkdir -p "$BRW/llm"; cp "$BOX/llm/.env" "$BRW/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$BRW/llm/profiles.sh"
+printf 'node-ip: 10.99.0.1\nflannel-iface: suite0\ntls-san:\n  - 10.99.0.1\n' > "$BRW/k3s-config.yaml"
+cat > "$BRW/values.yaml" <<'Y'
+image:
+  tag: "1.33.1"
+config:
+  VLLM_MODEL_EMBEDDING: "e"
+  VLLM_MODEL_TRANSCRIPTION: ""
+sandbox:
+  enabled: true
+  limits:
+    idleTimeoutMs: "1800000"
+  workbench:
+    enabled: true
+    limits:
+      idleStopMs: "7200000"
+Y
+K3S_CONFIG="$BRW/k3s-config.yaml" vals_run "$BRW"
+if python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1]))['browser']; assert d['enabled'] is True and d['singleNode'] is True and d['live']['enabled'] is True and d['hostUsers'] is False; assert d['maxSessions']==4 and d['maxPerOrg']==4 and d['maxPerUser']==2; assert d['networkPolicy']['apiserverCidrs']==['10.99.0.1/32']" "$BRW/values.yaml" 2>/dev/null; then ok "browser : YAML valide, live sur un nœud, hostUsers false, API = node-ip/32"; else ko "browser : YAML valide, live sur un nœud, hostUsers false, API = node-ip/32" "$(sed -n '/^browser:/,$p' "$BRW/values.yaml" | tr '\n' '|')"; fi
+before="$(sha256sum < "$BRW/values.yaml")"
+K3S_CONFIG="$BRW/k3s-config.yaml" vals_run "$BRW"
+check "browser : une fois ajouté, plus rien à converger" "$(sha256sum < "$BRW/values.yaml")" "$before"
+BOFF="$WORK/browser-off"; mkdir -p "$BOFF/llm"; cp "$BOX/llm/.env" "$BOFF/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$BOFF/llm/profiles.sh"
+{ cat "$BRW/values.yaml" | sed '/^browser:/,$d' | sed '/^# Agents/,$d'; printf 'browser:\n  enabled: false\n'; } > "$BOFF/values.yaml"
+K3S_CONFIG="$BRW/k3s-config.yaml" vals_run "$BOFF"
+check    "browser éteint par l'admin : un seul bloc"  "$(grep -c '^browser:' "$BOFF/values.yaml")" "1"
+contains "browser éteint par l'admin : reste éteint"  "$(sed -n '/^browser:/,$p' "$BOFF/values.yaml")" "  enabled: false"
+absent   "browser éteint par l'admin : rien d'injecté" "$(sed -n '/^browser:/,$p' "$BOFF/values.yaml")" "singleNode"
+
 # Un admin qui a déjà réglé les délais garde ses valeurs, même non citées.
 TUNED="$WORK/tuned"; mkdir -p "$TUNED/llm"; cp "$BOX/llm/.env" "$TUNED/llm/.env"; cp "$REPO_ROOT/llm/profiles.sh" "$TUNED/llm/profiles.sh"
 cat > "$TUNED/values.yaml" <<'Y'
@@ -505,7 +539,7 @@ vdiff() { # vdiff RC — the stubbed `ensure_appliance_values --check` returns R
 out="$(vdiff 1)"; check "values.yaml à jour : pas une mise à jour"  "${out%% *}" "0"
 contains "…et la box est à jour" "$out" "up-to-date"
 out="$(vdiff 0)"; check "values.yaml en retard : mise à jour"      "${out%% *}" "1"
-contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench, OnlyOffice image)"
+contains "…nommée pour l'admin" "$out" "configuration (values.yaml: bridges, workbench, agents' browser, OnlyOffice image)"
 
 # --- 5. sandbox-api suit la ConfigMap convergée ------------------------------------------
 head_ "update.sh restart_sandbox_api"
