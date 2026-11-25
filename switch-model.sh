@@ -2,9 +2,9 @@
 # =============================================================================
 # Suite 366 — switch the appliance's generative model.
 #
-# The appliance can serve five profiles (llm/profiles.sh). Switching is not
+# The appliance can serve six profiles (llm/profiles.sh). Switching is not
 # just a model id: each needs its share of the unified memory pool and its own
-# vLLM flags (four run the unified image, Flash-Next its own), and the id
+# vLLM flags (five run the unified image, Flash-Next its own), and the id
 # itself lives in THREE places that must agree or the app breaks in a way
 # nothing reports:
 #
@@ -174,7 +174,7 @@ BASE_IMAGE="$(env_get VLLM_IMAGE)"
 [[ -n "$BASE_IMAGE" ]] || die "VLLM_IMAGE missing from $ENV_FILE — is this an installed appliance?"
 FLASH_NEXT_IMAGE="$(llm_flash_next_image "${FLASH_NEXT_PATCHES_COMMIT:-}")"
 
-# The engine image three of the four profiles, the transcription engine and
+# The engine image every profile but Flash-Next, the transcription engine and
 # the embed run: VLLM_IMAGE itself when it is the unified image (the channel's,
 # recognised by its label), else the same Dockerfile built here over it, once
 # per tag (ensure_engine_image). lib/vllm.sh carries the same two functions:

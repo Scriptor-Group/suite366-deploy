@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Entrypoint of the vllm-llm container. ONE script for the five profiles,
+# Entrypoint of the vllm-llm container. ONE script for the six profiles,
 # because the compose must not change when the operator switches model:
-# everything profile-specific lives here and in llm/profiles.sh. Four profiles
+# everything profile-specific lives here and in llm/profiles.sh. Five profiles
 # run the unified image (llm/unified/), Flash-Next its own.
 #
 # Split of responsibilities:
@@ -51,7 +51,11 @@ common=(
 case "$LLM_PROFILE" in
 
   # --- Qwen3.8-27B-NVFP4 — dense hybrid, the vLLM recipe's GB10 profile ------
-  qwen27b)
+  # rallm is the same recipe: RaLLM is that model fine-tuned, merged and
+  # quantised with the same ModelOpt recipe — same tensors, same mixed
+  # NVFP4/FP8 layout, the base model's MTP head, and a chat template that
+  # renders the same prompts (the tool calls stay in qwen3_xml's format).
+  qwen27b|rallm)
     # No --quantization: the ModelOpt mixed NVFP4/FP8 recipe is read from
     # hf_quant_config.json. No --trust-remote-code: config.json carries no
     # auto_map, vLLM's own handler loads this architecture.

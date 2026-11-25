@@ -107,14 +107,14 @@ The script is interactive (reads `/dev/tty`, so it works through
 | `ADMIN_EMAIL` | `admin@<DOMAIN>` | the appliance administrator: the only account allowed to register the first organisation (cf. § Licensing and several organisations) |
 | `APPLIANCE_CLAIM_LAN_ONLY` | empty | `1` (set by suite366-fleet): an **unclaimed** box — no `admin@<DOMAIN>` default, `ADMIN_EMAIL` may be empty, and the first administrator can only be created from the LAN (cf. § The public entrypoint) |
 | `LICENSE_KEY` | empty | optional instance licence (EdDSA JWT, scope `instance`): several organisations, seats pooled. A secret, kept across re-runs |
-| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
+| `LLM_PROFILE` | `qwen27b` | generative model: `qwen27b`, `rallm`, `orcasaq`, `orcasaq-batch`, `flash-next` or `gemma` (cf. § Choosing a model) |
 | `LLM_MODEL` | *from the profile* | override the HF id the profile names |
 | `EMBED_MODEL` | `Qwen/Qwen3-VL-Embedding-8B` | embeddings model (HF id) |
 | `VLLM_IMAGE` | `vllm/vllm-openai:v0.29.0` | base image: the embed runs it, Flash-Next and OrcaSAQ are built on it (the `gemma` profile pins its own) |
 | `PROXY_IMAGE` | `nginx:alpine` | unified vLLM proxy image |
 | `LLM_GPU_MEM_UTIL` | *from the profile* | share of the unified pool for the generative (0.45 / 0.71 / 0.55) |
 | `EMBED_GPU_MEM_UTIL` | `0.20` | share of the unified pool for embeddings |
-| `LLM_MAX_NUM_SEQS` | *from the profile* | max concurrent streams on the generative: 6 for `qwen27b`, 8 for `orcasaq-batch`, 2 for the others (cf. § GB10 realities) |
+| `LLM_MAX_NUM_SEQS` | *from the profile* | max concurrent streams on the generative: 6 for `qwen27b` and `rallm`, 8 for `orcasaq-batch`, 2 for the others (cf. § GB10 realities) |
 | `LLM_MAX_MODEL_LEN` | *from the profile* | max context length (262144 / 131072 / 262144) |
 | `EMBED_MAX_MODEL_LEN` | `8192` | max length for embeddings (enough for RAG chunks) |
 | `VLLM_EMBEDDING_DIMENSIONS` | `4096` | embedding vector dimension (Qwen3-VL-Embedding-8B) |
@@ -381,32 +381,75 @@ plumbing, not the AI path.
 
 ## Choosing a model
 
-The appliance serves ONE generative model at a time, out of five profiles (four
+The appliance serves ONE generative model at a time, out of six profiles (five
 models, one of them in two configurations) that were each measured end to end
-on the test Spark. `LLM_PROFILE` picks it at install time, `switch-model.sh`
+on a Spark. `LLM_PROFILE` picks it at install time, `switch-model.sh`
 changes it afterwards without a reinstall.
 
-| | `qwen27b` *(default)* | `orcasaq` | `orcasaq-batch` | `flash-next` | `gemma` |
-|---|---|---|---|---|---|
-| Model | Qwen3.8-27B-NVFP4 | OrcaSAQ-2-27B | OrcaSAQ-2-27B, alone on the box | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
-| Shape | dense 27B hybrid | the same 27B, 3.2-bit trellis | the same | MoE 176B, 6B active | MoE 26B, 4B active |
-| On disk | 21.9 GB | 12.3 GB | 12.3 GB | 123.5 GB | 18 GB |
-| Resident | 20.8 GiB | 11.5 GiB | 11.5 GiB + 67 GiB of KV | 77.1 GiB | 18.0 GiB |
-| Context served | 262,144 | 262,144 | 262,144, 8 requests at once | 131,072 | 262,144 |
-| Decode, French prose | 19-20 t/s | 38.1 t/s | 31 t/s alone, ~75 t/s over 8 streams | 26.7 t/s | 28-30 t/s |
-| Decode, code | ~30 t/s | 45.0 t/s | 42 t/s | 34.9 t/s | not measured |
-| Prefill | 69k in 49 s (1,400 tok/s) | 23k in 22.5 s (1,014 tok/s) | 35k in 34 s; 242k in 410 s | 69k in 33 s | 62k in 65 s |
-| Swap in use, idle | 0 | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
-| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
-| Vision | yes | no (text-only checkpoint) | no | yes | yes |
-| Embeddings | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B | **none** (its memory is the KV cache) | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B |
-| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | **none** | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
+| | `qwen27b` *(default)* | `rallm` | `orcasaq` | `orcasaq-batch` | `flash-next` | `gemma` |
+|---|---|---|---|---|---|---|
+| Model | Qwen3.8-27B-NVFP4 | RaLLM-v2.4-NVFP4 | OrcaSAQ-2-27B | OrcaSAQ-2-27B, alone on the box | Qwen3.8-Flash-Next-NVFP4 | Gemma-4-26B-A4B-NVFP4 |
+| Shape | dense 27B hybrid | the same 27B, fine-tuned for the Suite 366 assistant | the same 27B, 3.2-bit trellis | the same | MoE 176B, 6B active | MoE 26B, 4B active |
+| On disk | 21.9 GB | 21.9 GB | 12.3 GB | 12.3 GB | 123.5 GB | 18 GB |
+| Resident | 20.8 GiB | as `qwen27b` (the same tensors) | 11.5 GiB | 11.5 GiB + 67 GiB of KV | 77.1 GiB | 18.0 GiB |
+| Context served | 262,144 | 262,144 | 262,144 | 262,144, 8 requests at once | 131,072 | 262,144 |
+| Decode, French prose | 19-20 t/s | as `qwen27b` (23.7 t/s against 23.5, same box, same day) | 38.1 t/s | 31 t/s alone, ~75 t/s over 8 streams | 26.7 t/s | 28-30 t/s |
+| Decode, code | ~30 t/s | as `qwen27b` (30.5 t/s against 32.6) | 45.0 t/s | 42 t/s | 34.9 t/s | not measured |
+| Prefill | 69k in 49 s (1,400 tok/s) | as `qwen27b` (30k in 15.5 s against 14.7) | 23k in 22.5 s (1,014 tok/s) | 35k in 34 s; 242k in 410 s | 69k in 33 s | 62k in 65 s |
+| Swap in use, idle | 0 | 0 | 0 | 0 | 7-10 GiB | 3 GiB (with transcription) |
+| vLLM | the unified image (v0.30.0 + `llm/unified/`) | the unified image | the unified image | the unified image | v0.29.0 + `llm/flash-next/`, built on the box | the unified image |
+| Vision | yes | yes (the base model's tower, outside the fine-tune's evaluation) | no (text-only checkpoint) | no | yes | yes |
+| Embeddings | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B | **none** (its memory is the KV cache) | Qwen3-VL-Embedding-8B | Qwen3-VL-Embedding-8B |
+| Transcription | Qwen3-ASR-1.7B (+10 GiB resident) | Qwen3-ASR-1.7B | Qwen3-ASR-1.7B | **none** | none (no room) | Qwen3-ASR-1.7B (share lowered to 0.45) |
 
 **`qwen27b` is the default** because it leaves the box real headroom: 20.8 GiB
 of weights, a KV cache of ~800k fp8 tokens (3x a full 262k request) and zero
 swap at idle. It is also the slowest of the four to
 decode, which is physics: 20.8 GiB over the GB10's 273 GB/s is 12 t/s, and the
 in-checkpoint MTP head recovers it to 19-20.
+
+**`rallm` is the same Qwen3.8-27B fine-tuned for the Suite 366 assistant.**
+RaLLM v2.4 is Devana's fine-tune: a LoRA trained on synthetic conversations
+written in the product's format (no customer data), merged into the BF16 base
+and quantised with the ModelOpt recipe NVIDIA used for `qwen27b`'s checkpoint.
+What it changes is the decision between calling a tool and answering. The
+[model card](https://huggingface.co/Devanaai/RaLLM-v2.4-NVFP4) compares it with
+`qwen27b`'s checkpoint on the same server: the right decision on 97.8 % of 592
+held-out Suite 366 turns against 90.5 %, 8 unneeded tool calls against 47, 83 %
+of the expected calls made against 70 %, and 6 writes to the CRM or the calendar
+despite a restricting system prompt (« read-only », « ask first ») out of 279
+against 85. General knowledge, arithmetic, code and function calling on public
+tools are level with the base. Those figures are the card's, not ours.
+The checkpoint is `qwen27b`'s in everything the box has to budget for: the same
+2,194 tensors in the same three shards, the same 208 projections in FP8 and 193
+in NVFP4, the base model's MTP head and vision tower left unquantised, and a
+chat template that renders the same prompts (140 conversations compared, with
+and without tools, thinking and images — the file itself differs by the
+`generation` markers a newer transformers writes). So the profile has no numbers
+of its own: `qwen27b`'s share, context, slots, MTP depth, side engines and vLLM
+flags. Measured on a Spark on 2026-11-25 (the unified image, vLLM 0.30), both
+models through the same switch on the same box, one after the other: a KV cache
+of 793,754 fp8 tokens against 796,683 (3.0x a full 262k request either way),
+23.99 GiB consumed at start against 23.87, the box at 104/121 GiB with the embed
+and the transcription engine up, no swap, no memory pressure. Decode 23.7 t/s on
+French prose against 23.5 and 30.5 on code against 32.6 (the base model's MTP
+head still drafts for the fine-tune: 1.39 tokens accepted per draft of 3 on
+prose against 1.37, 2.09 on code against 2.29); six streams at once 94.5 t/s in
+all against 100.8; a 29.6k-token prompt read in 15.5 s against 14.7 and re-read
+from the prefix cache in 1.6 s. The first start is cold — the compile and
+autotune caches are keyed by model — and took 7 min 50 s, 5 min 26 s of it the
+FlashInfer autotune; the switch waits for it. Tool calls come out through
+`qwen3_xml` as on `qwen27b`, and the one restricted-write case replayed there
+went the card's way: under « read-only access », asked to mark a deal as won,
+`rallm` declined and `qwen27b` called the update tool.
+It was trained and evaluated with thinking off, which is how every profile is
+served, in French and English, on text. Images go through the base model's
+vision tower, which the fine-tune did not touch and its evaluation did not
+cover: it described a test image correctly, no more was measured. Reasoning on
+request (`reasoning_effort` in the request) takes the same three values as
+`qwen27b`, but `low` is not safe on it: on four arithmetic questions asked six
+times each it got 15 answers right out of 24 where `qwen27b` got 23, while
+`medium`, `xhigh` and no reasoning at all gave 23 out of 24 against 24.
 
 **`orcasaq` is the same Qwen3.8-27B at 3.2 bits per weight.** `orcarouter`
 quantised it with a sensitivity-searched mixed-precision trellis code (the EXL3 /
@@ -478,7 +521,7 @@ parameters against 27B.
 ### Switching
 
 ```bash
-sudo /opt/suite366/switch-model.sh list            # the five, and which is active
+sudo /opt/suite366/switch-model.sh list            # the six, and which is active
 sudo /opt/suite366/switch-model.sh status          # what this box runs right now
 sudo /opt/suite366/switch-model.sh qwen27b --dry-run
 sudo /opt/suite366/switch-model.sh qwen27b
@@ -497,7 +540,7 @@ A profile that leaves the memory for it also serves a **speech-to-text model**,
 in a third vLLM container (`suite366-vllm-stt`) behind the same proxy: the app's
 dictation, voice reports and meeting notes already speak the OpenAI
 `/v1/audio/transcriptions` route and only need a model to be named. Today that
-is `qwen27b`, `orcasaq` and `gemma` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
+is `qwen27b`, `rallm`, `orcasaq` and `gemma` with **Qwen3-ASR-1.7B**: 4.4 GiB of weights, 30 languages detected
 automatically, 4.75 % WER on FLEURS French against 6.31 for Whisper-large-v3,
 and it takes the vocabulary hint the app sends with every window. Audio longer
 than 30 s is split by vLLM at the quietest point of each window, so a 5 min
@@ -617,8 +660,8 @@ FlashInfer autotune sweep, Triton kernels): a restart on an unchanged config is
 96-106 s instead of 257. Change a flag that alters the compiled graph and the
 next start is cold again.
 
-**Concurrency.** `max_num_seqs=6` on `qwen27b`, 8 on `orcasaq-batch`, 2 on the
-others. With 2 slots, a third message waits for a whole answer to finish before
+**Concurrency.** `max_num_seqs=6` on `qwen27b` and `rallm`, 8 on `orcasaq-batch`,
+2 on the others. With 2 slots, a third message waits for a whole answer to finish before
 its prompt is even read: replaying 5 users' Suite 366 conversations on the test
 Spark (2026-10-21), the first token came after 39 s median, 47 s p90. At 6 slots
 it is 3.4 s / 8.6 s, each user writing at 17.5 t/s instead of 23, and the total

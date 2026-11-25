@@ -3,7 +3,7 @@
 # Self-test of the model-profile machinery — no hardware, no network, no Docker.
 #
 # What it actually guards:
-#   • the four profiles resolve to the model, image and budgets that were
+#   • the six profiles resolve to the model, image and budgets that were
 #     measured, and nothing silently shares a value it should not;
 #   • llm/serve-llm.sh builds the right flag set per profile, and refuses an
 #     unknown one instead of serving something arbitrary;
@@ -12,10 +12,10 @@
 #   • the SQL it would run touches the LLM row and the three known agents, and
 #     never the embedding row;
 #   • the transcription model rides along with the profiles that have the room
-#     (qwen27b, orcasaq, gemma), through a compose profile, a lazily resolved
+#     (qwen27b, rallm, orcasaq, gemma), through a compose profile, a lazily resolved
 #     nginx route and its own AIModel row — and a profile without one
 #     (flash-next) turns all of that off rather than leaving it half on;
-#   • three profiles, the transcription engine and the embed share the unified
+#   • five profiles, the transcription engine and the embed share the unified
 #     image, Flash-Next alone keeps its own, and the unified context pins every
 #     third-party input by content.
 # =============================================================================
@@ -41,8 +41,8 @@ head_ "llm/profiles.sh"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/llm/profiles.sh"
 
-check "les cinq profils sont déclarés" "$LLM_PROFILES" "qwen27b orcasaq orcasaq-batch flash-next gemma"
-for p in qwen27b orcasaq orcasaq-batch flash-next gemma; do
+check "les six profils sont déclarés" "$LLM_PROFILES" "qwen27b rallm orcasaq orcasaq-batch flash-next gemma"
+for p in qwen27b rallm orcasaq orcasaq-batch flash-next gemma; do
   if llm_profile_known "$p"; then ok "profil connu : $p"; else ko "profil connu : $p"; fi
 done
 if llm_profile_known nope; then ko "un profil inconnu est refusé"; else ok "un profil inconnu est refusé"; fi
@@ -85,6 +85,21 @@ check "orcasaq-batch : tête MTP à 3"  "$LLM_P_MTP_TOKENS"     "3"
 check "orcasaq-batch : pas de build"  "$LLM_P_NEEDS_BUILD"    "0"
 check "orcasaq-batch : pas de transcription" "$LLM_P_STT_MODEL" ""
 check "orcasaq-batch : pas d'embed"   "$LLM_P_EMBED"          "0"
+# rallm : RaLLM v2.4, le Qwen3.8-27B affiné par Devana pour l'assistant, fusionné puis
+# quantifié avec la recette de NVIDIA. Même architecture, mêmes 21,9 Go : il n'a pas de
+# budget à lui, il prend ceux de qwen27b — un écart entre les deux serait une erreur de saisie.
+llm_profile_apply qwen27b "$UNIFIED" "$FLASH"
+qwen_budgets="$LLM_P_IMAGE|$LLM_P_GPU_MEM_UTIL|$LLM_P_MAX_MODEL_LEN|$LLM_P_MAX_NUM_SEQS|$LLM_P_CONTEXT_WINDOW|$LLM_P_MTP_TOKENS|$LLM_P_NEEDS_BUILD|$LLM_P_BUILD_DIR|$LLM_P_SWAPPINESS|$LLM_P_STT_MODEL|$LLM_P_EMBED|$LLM_P_DISK_GB"
+llm_profile_apply rallm "$UNIFIED" "$FLASH"
+check "rallm : modèle"          "$LLM_P_MODEL"          "Devanaai/RaLLM-v2.4-NVFP4"
+check "rallm : image = l'image moteur (unifiée)" "$LLM_P_IMAGE" "$UNIFIED"
+check "rallm : pas de build"    "$LLM_P_NEEDS_BUILD"    "0"
+check "rallm : transcription Qwen3-ASR" "$LLM_P_STT_MODEL" "$STT_MODEL"
+check "rallm : embed servi"     "$LLM_P_EMBED"          "1"
+check "rallm : image, budgets et moteurs annexes de qwen27b" \
+  "$LLM_P_IMAGE|$LLM_P_GPU_MEM_UTIL|$LLM_P_MAX_MODEL_LEN|$LLM_P_MAX_NUM_SEQS|$LLM_P_CONTEXT_WINDOW|$LLM_P_MTP_TOKENS|$LLM_P_NEEDS_BUILD|$LLM_P_BUILD_DIR|$LLM_P_SWAPPINESS|$LLM_P_STT_MODEL|$LLM_P_EMBED|$LLM_P_DISK_GB" \
+  "$qwen_budgets"
+
 check "profils compose : embed + stt" "$(llm_compose_profiles 1 "$STT_MODEL")" "embed,stt"
 check "profils compose : embed seul (flash-next)" "$(llm_compose_profiles 1 "")" "embed"
 check "profils compose : aucun (orcasaq-batch)" "$(llm_compose_profiles 0 "")" ""
@@ -124,7 +139,7 @@ absent "plus aucune image par profil dans la table" "$(grep 'LLM_P_IMAGE=' "$REP
 # arrondie) : switch-model.sh y ajoute 10 Go et refuse un premier téléchargement
 # qui ne tiendrait pas — 133 Go de Flash-Next sur un disque déjà plein meurent à
 # mi-chemin et laissent un hub/models--… que checkpoint_on_disk prend pour présent.
-for pair in qwen27b:25 orcasaq:15 orcasaq-batch:15 flash-next:140 gemma:20; do
+for pair in qwen27b:25 rallm:25 orcasaq:15 orcasaq-batch:15 flash-next:140 gemma:20; do
   llm_profile_apply "${pair%%:*}" "$UNIFIED" "$FLASH"
   check "${pair%%:*} : ${pair##*:} Go sur disque" "$LLM_P_DISK_GB" "${pair##*:}"
 done
@@ -150,6 +165,9 @@ contains "qwen27b : KV en fp8"                     "$q" "--kv-cache-dtype fp8"
 contains "qwen27b : chargement fastsafetensors"    "$q" "--load-format fastsafetensors"
 contains "qwen27b : tête MTP à 3"                  "$q" -- '"num_speculative_tokens":3'
 absent   "qwen27b : pas le gabarit Gemma"          "$q" "tool_chat_template_gemma4"
+# rallm suit la recette qwen27b : même format ModelOpt, même gabarit de chat, même tête MTP.
+r="$(serve rallm)"
+check    "rallm : même ligne vllm que qwen27b"     "$r" "$q"
 # orcasaq-batch suit la recette orcasaq : seuls les budgets changent, et ils arrivent par l'env.
 b="$(serve orcasaq-batch)"
 o="$(serve orcasaq)"
@@ -180,7 +198,7 @@ absent   "orcasaq : gestionnaire KV hybride conservé" "$o" "disable-hybrid-kv-c
 
 # cached_tokens dans l'usage : un drapeau du serveur OpenAI, pas d'une recette. Il n'était posé
 # que sur qwen27b ; une box en orcasaq-batch répondait donc sans ce chiffre (16/11/2026). Il vit
-# dans le bloc commun : les cinq profils l'ont, une seule fois chacun.
+# dans le bloc commun : les six profils l'ont, une seule fois chacun.
 # Flash-Next sert un chemin de snapshot : un checkpoint factice, complet, sans config.json
 # (hf-offline.sh ne sonde alors pas le Hub, le test reste sans réseau).
 FN="$(mktemp -d)"; fsnap="$FN/hub/models--the-model/snapshots/rev0"
@@ -189,7 +207,7 @@ printf '{"weight_map":{"w":"w.safetensors"}}' > "$fsnap/model.safetensors.index.
 : > "$fsnap/tokenizer.json"; : > "$fsnap/w.safetensors"
 f="$(HF_HOME="$FN" serve flash-next)"
 contains "flash-next : sert le snapshot du disque" "$f" "serve $fsnap --host 0.0.0.0"
-for pair in "qwen27b:$q" "orcasaq:$o" "orcasaq-batch:$b" "flash-next:$f" "gemma:$g"; do
+for pair in "qwen27b:$q" "rallm:$r" "orcasaq:$o" "orcasaq-batch:$b" "flash-next:$f" "gemma:$g"; do
   n="$(grep -o -- '--enable-prompt-tokens-details' <<<"${pair#*:}" | wc -l)"
   check "${pair%%:*} : cached_tokens dans l'usage (drapeau commun, une fois)" "$n" "1"
 done
@@ -434,6 +452,7 @@ sw() { DATA_DIR="$BOX" bash "$REPO_ROOT/switch-model.sh" "$@" 2>&1; }
 
 l="$(sw list)"
 contains "list : les quatre profils"     "$l" "qwen27b"
+contains "list : rallm listé avec son modèle" "$l" "rallm         Devanaai/RaLLM-v2.4-NVFP4"
 contains "list : orcasaq listé avec sa transcription" "$l" "orcasaq"
 contains "list : marque l'actif"         "$l" "*flash-next"
 s_="$(sw status)"
@@ -470,6 +489,25 @@ contains "dry-run qwen27b : SQL — défaut d'organisation (embedding)" "$d" 'SE
 contains "dry-run qwen27b : chart informé (embedding)" "$d" "VLLM_MODEL_EMBEDDING -> Qwen/Qwen3-VL-Embedding-8B"
 contains "dry-run qwen27b : conteneur embed conservé" "$d" "suite366-vllm-embed kept"
 absent "dry-run : ne modifie rien"              "$(cat "$BOX/llm/.env")" "qwen27b"
+
+# rallm : la bascule de qwen27b, au nom du modèle près — les trois endroits où l'id vit
+# (.env, chart, lignes AIModel/Agent) reçoivent celui de RaLLM, et il entre dans la liste
+# des modèles de la box : sans lui, les agents d'une box passée sur rallm ne suivraient plus
+# la bascule suivante.
+r_="$(sw rallm --dry-run)"
+contains "dry-run rallm : modèle dans .env"        "$r_" "LLM_MODEL=Devanaai/RaLLM-v2.4-NVFP4"
+contains "dry-run rallm : profil dans .env"        "$r_" "LLM_PROFILE=rallm"
+contains "dry-run rallm : même image moteur que qwen27b" "$r_" "VLLM_LLM_IMAGE=$UNIFIED"
+contains "dry-run rallm : fraction de qwen27b"     "$r_" "LLM_GPU_MEM_UTIL=0.45"
+contains "dry-run rallm : 6 slots"                 "$r_" "LLM_MAX_NUM_SEQS=6"
+contains "dry-run rallm : tête MTP à 3"            "$r_" "LLM_MTP_TOKENS=3"
+contains "dry-run rallm : transcription activée"   "$r_" "STT_MODEL=$STT_MODEL"
+contains "dry-run rallm : conteneur embed conservé" "$r_" "suite366-vllm-embed kept"
+contains "dry-run rallm : contexte annoncé à l'app" "$r_" "VLLM_MAX_CONTEXT_WINDOW -> 200000"
+contains "dry-run rallm : SQL — le modèle"         "$r_" "\\set model 'Devanaai/RaLLM-v2.4-NVFP4'"
+contains "dry-run rallm : 35 Go libres exigés (25 + 10)" "$r_" "needs 35 GB free (25 + 10 margin)"
+absent   "dry-run rallm : aucun build de l'image Flash-Next" "$r_" "image build: $FLASH"
+contains "dry-run : les agents en RaLLM suivent la bascule suivante" "$d" "'Devanaai/RaLLM-v2.4-NVFP4'"
 
 # Flash-Next et OrcaSAQ demandent un build, chacun depuis son contexte ; seul
 # Flash-Next touche à la swappiness.
@@ -586,7 +624,12 @@ if [[ -f "$STATE" ]]; then ok "state.json est écrit"; else ko "state.json est �
 if python3 -m json.tool "$STATE" >/dev/null 2>&1; then ok "state.json est du JSON valide"; else ko "state.json est du JSON valide"; fi
 probe() { python3 -c "import json,sys; d=json.load(open('$STATE')); print($1)" 2>/dev/null; }
 check "state : profil actif"           "$(probe 'd["active"]')" "qwen27b"
-check "state : les cinq profils"       "$(probe 'len(d["profiles"])')" "5"
+check "state : les six profils"        "$(probe 'len(d["profiles"])')" "6"
+# La carte de RaLLM dans l'app : son modèle, la fenêtre de qwen27b, et un checkpoint
+# qui n'est PAS sur ce disque (seul celui de qwen27b y est) — 22 Go à télécharger.
+check "state : rallm publie son modèle" "$(probe '[p for p in d["profiles"] if p["key"]=="rallm"][0]["model"]')" "Devanaai/RaLLM-v2.4-NVFP4"
+check "state : rallm publie la fenêtre de qwen27b" "$(probe '[p for p in d["profiles"] if p["key"]=="rallm"][0]["context_window"]')" "200000"
+check "state : rallm pas encore téléchargé" "$(probe '[p for p in d["profiles"] if p["key"]=="rallm"][0]["downloaded"]')" "False"
 # Ce que la carte du profil annonce : avec ou sans embed (recherche documentaire).
 check "state : qwen27b annonce son embed"     "$(probe '[p for p in d["profiles"] if p["key"]=="qwen27b"][0]["embed"]')" "True"
 check "state : orcasaq-batch n'en annonce pas" "$(probe '[p for p in d["profiles"] if p["key"]=="orcasaq-batch"][0]["embed"]')" "False"

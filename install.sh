@@ -62,9 +62,11 @@
 #                              pooled. A secret, kept across re-runs; later:
 #                              update.sh license set -
 #   LLM_PROFILE                which generative model to serve: qwen27b
-#                              (default), orcasaq, orcasaq-batch (the same
-#                              model alone on the box: no embed, no
-#                              transcription), flash-next or gemma. Each
+#                              (default), rallm (the same model fine-tuned
+#                              by Devana for the Suite 366 assistant),
+#                              orcasaq, orcasaq-batch (the same model alone
+#                              on the box: no embed, no transcription),
+#                              flash-next or gemma. Each
 #                              carries its own image, memory budget and vLLM
 #                              flags — see
 #                              llm/profiles.sh and README "Choosing a model".
@@ -82,7 +84,7 @@
 #                              unified image CI publishes from llm/unified/,
 #                              ghcr.io/scriptor-group/suite-366-vllm, see
 #                              README): the embed, the transcription engine and
-#                              the qwen27b/orcasaq/gemma profiles run it. Given
+#                              the qwen27b/rallm/orcasaq/gemma profiles run it. Given
 #                              a plain upstream image instead, the box builds
 #                              the same Dockerfile over it. Flash-Next has its
 #                              own image, built on the box over vLLM v0.29.0.
@@ -94,7 +96,7 @@
 #   EMBED_GPU_MEM_UTIL         to each vLLM (sum < 1.0). The generative side is
 #                              profile-driven (0.45 / 0.71 / 0.55); the embed is
 #                              0.20 for all three, with an explicit 4 GiB KV cap.
-#   LLM_MAX_NUM_SEQS,          generative tuning (slots per profile: 6 qwen27b, 8 orcasaq-batch, 2 others; context
+#   LLM_MAX_NUM_SEQS,          generative tuning (slots per profile: 6 qwen27b and rallm, 8 orcasaq-batch, 2 others; context
 #   LLM_MAX_MODEL_LEN          262144 or 131072 per profile — see README)
 #   EMBED_MAX_MODEL_LEN        embed max length (default 8192, enough for RAG)
 #   VLLM_EMBEDDING_DIMENSIONS  embedding vector dimension served by the local
