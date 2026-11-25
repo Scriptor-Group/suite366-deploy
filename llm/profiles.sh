@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # =============================================================================
-# llm/profiles.sh — the five profiles the appliance can serve (four generative
+# llm/profiles.sh — the six profiles the appliance can serve (five generative
 # models, one of them twice), and the two side engines — embeddings and
 # transcription — that ride along with the profiles that leave room for them.
 #
@@ -15,7 +15,7 @@
 # the test Spark and the reasoning lives next to it. The vLLM FLAGS live in llm/serve-llm.sh, which runs inside
 # the container; this file is the host-side table.
 #
-# Images: three of the four profiles, the transcription engine and the embed
+# Images: every profile but Flash-Next, the transcription engine and the embed
 # run ONE image, the unified one (llm/unified/Dockerfile), published by CI and
 # pulled by the box, or built on the box from the same Dockerfile when the box
 # only has a plain upstream image. Flash-Next alone keeps an image of its own
@@ -23,7 +23,7 @@
 # =============================================================================
 
 # Order matters: it is the order the operator sees in `switch-model.sh --list`.
-LLM_PROFILES="qwen27b orcasaq orcasaq-batch flash-next gemma"
+LLM_PROFILES="qwen27b rallm orcasaq orcasaq-batch flash-next gemma"
 
 llm_profile_known() { # llm_profile_known KEY
   case " $LLM_PROFILES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -168,6 +168,46 @@ llm_profile_apply() {
       LLM_P_BUILD_DIR=""
       LLM_P_SWAPPINESS=""
       # 34 GiB free measured next to it.
+      LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
+      LLM_P_EMBED="1"
+      # 21.9 GB on disk.
+      LLM_P_DISK_GB="25"
+      ;;
+    rallm)
+      # RaLLM v2.4: Devana's fine-tune of Qwen3.8-27B for the Suite 366
+      # assistant — a LoRA trained on synthetic conversations in the product's
+      # format, merged into the BF16 base and quantised with the ModelOpt recipe
+      # NVIDIA used for the checkpoint above (MLP and lm_head in NVFP4, attention
+      # and Gated-DeltaNet projections in FP8; vision tower and MTP head are the
+      # base model's, not quantised). What it changes is the decision
+      # between calling a tool and answering: on the card's 592 held-out turns
+      # it is right on 97.8 % against 90.5 % for qwen27b, with 8 unneeded tool
+      # calls against 47, and it writes to the CRM or the calendar despite a
+      # restricting system prompt in 6 cases out of 279 against 85. The public
+      # benchmarks are level with the base. Trained and evaluated with thinking
+      # off, on text: the vision tower is the base model's, outside its
+      # evaluation.
+      LLM_P_MODEL="Devanaai/RaLLM-v2.4-NVFP4"
+      LLM_P_IMAGE="$engine_image"
+      # Tensor for tensor the layout of qwen27b's checkpoint (2,194 tensors in
+      # the same three shards, 208 projections in FP8, 193 in NVFP4), so it
+      # takes qwen27b's budgets and its recipe in llm/serve-llm.sh, unchanged.
+      # Measured 2026-11-25 on a Spark, both models through the same switch,
+      # one after the other: KV cache 793,754 fp8 tokens against 796,683 for
+      # qwen27b, 23.99 GiB consumed at start against 23.87, 104/121 GiB with
+      # the two side engines up; 23.7 t/s on French prose against 23.5, 30.5
+      # on code against 32.6, 94.5 t/s over six streams against 100.8. The
+      # base model's MTP head still drafts for it (1.39 tokens accepted per
+      # draft of 3 on prose against 1.37). First start cold, 7 min 50 s: the
+      # FlashInfer autotune cache is keyed by model.
+      LLM_P_GPU_MEM_UTIL="0.45"
+      LLM_P_MAX_MODEL_LEN="262144"
+      LLM_P_MAX_NUM_SEQS="6"
+      LLM_P_CONTEXT_WINDOW="200000"
+      LLM_P_MTP_TOKENS="3"
+      LLM_P_NEEDS_BUILD="0"
+      LLM_P_BUILD_DIR=""
+      LLM_P_SWAPPINESS=""
       LLM_P_STT_MODEL="$LLM_STT_MODEL_DEFAULT"
       LLM_P_EMBED="1"
       # 21.9 GB on disk.
@@ -327,6 +367,7 @@ llm_profile_apply() {
 llm_profile_summary() { # llm_profile_summary KEY
   case "$1" in
     qwen27b)    printf 'dense 27B, NVFP4 — 262k context, ~20 t/s, real headroom' ;;
+    rallm)      printf 'dense 27B, NVFP4 — qwen27b fine-tuned by Devana for the Suite 366 assistant (tool use), same context, speed and memory' ;;
     orcasaq)    printf 'dense 27B, 3.2-bit EXL3 — 262k context, ~38 t/s, 12 GB of weights' ;;
     orcasaq-batch) printf 'the same 27B EXL3 ALONE on the box — 8 parallel requests of 262k (1.9M tokens of KV), no embeddings, no transcription' ;;
     flash-next) printf 'MoE 176B-A6B — 131k context, ~30 t/s, n-gram table on the NVMe, no memory headroom, own image (vLLM 0.29)' ;;

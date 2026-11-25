@@ -144,13 +144,15 @@ NAMESPACE="${NAMESPACE:-suite366}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-sandbox}"
 RELEASE="${RELEASE:-drive}"
 
-# --- Generative model: one of four measured profiles -------------------------
-# The appliance can serve four models and switch between them without a
+# --- Generative model: one of the measured profiles --------------------------
+# The appliance can serve five models and switch between them without a
 # reinstall. LLM_PROFILE picks one; llm/profiles.sh holds the whole recipe
 # (model id, image, memory budgets, context window) and llm/serve-llm.sh the
 # vLLM flags. `switch-model.sh` changes it on a running box.
 #
 #   qwen27b     dense 27B NVFP4 — 262k context, ~20 t/s, real headroom
+#   rallm       the same 27B fine-tuned by Devana for the Suite 366 assistant
+#               (tool use) — same context, speed and memory as qwen27b
 #   orcasaq     dense 27B EXL3  — 262k context, ~38 t/s, 12 GB of weights
 #   flash-next  MoE 176B-A6B    — 131k context, ~30 t/s, runs at the memory wall
 #   gemma       MoE 26B-A4B     — 262k context, ~30 t/s, what the appliance shipped with
@@ -164,8 +166,8 @@ EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}"
 # the UNIFIED image CI publishes from llm/unified/Dockerfile — the official
 # Docker Hub release vllm/vllm-openai:v0.30.0 (CUDA 13.0, multi-arch, no
 # `docker login`) plus the EXL3 kernels, the audio extras and Gemma's template
-# — the image the embed, the transcription engine and three of the four
-# generative profiles run. The box recognises it by its label; given a PLAIN
+# — the image the embed, the transcription engine and every generative
+# profile but Flash-Next run. The box recognises it by its label; given a PLAIN
 # upstream image here instead (an offline package, an older channel), it
 # builds the same Dockerfile itself (lib/vllm.sh ensure_engine_image). A tagged
 # release rather than a nightly: the old `cu130-nightly` tag silently stopped

@@ -30,7 +30,7 @@ fetch_host_layer() {
 }
 
 # --- The engine image: the unified one, pulled or built ---------------------
-# Three of the four profiles, the transcription engine and the embed run ONE
+# Every profile but Flash-Next, the transcription engine and the embed run ONE
 # image, llm/unified/Dockerfile: the official vLLM image plus exllamav3 and the
 # EXL3 plugin (OrcaSAQ), the audio extras (transcription) and Gemma's chat
 # template. CI publishes it (ghcr.io/scriptor-group/suite-366-vllm) and the

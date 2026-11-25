@@ -65,7 +65,7 @@ x-logging: &default-logging
 
 services:
   vllm-llm:
-    # The engine image for qwen27b/orcasaq/gemma (the unified image, see
+    # The engine image for qwen27b/rallm/orcasaq/gemma (the unified image, see
     # ./unified/), or Flash-Next's own (built on the box over vLLM v0.29.0 from
     # ./flash-next/). lib/vllm.sh and switch-model.sh write which.
     image: ${VLLM_LLM_IMAGE}
