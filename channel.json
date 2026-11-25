@@ -1,15 +1,15 @@
 {
   "channel": "stable",
   "chart_version": "0.11.0",
-  "app_version": "1.33.1",
+  "app_version": "1.34.0",
   "vllm_image": "ghcr.io/scriptor-group/suite-366-vllm:v0.30.0-u1",
   "updater_sha256": "d23131d8ed3723814dc050e0566979c96d7ec43c8d46dc2543fc5d7ea17eeff5",
   "backup_sha256": "67a0e49c61daef3c5de8203f3551bb385fe007936bfac9f725ba1cbd65601f1b",
   "host_layer_sha256": "0ed392fd036371b318d57ae0c161b144787b10f87c404b184ed996ef7f56dfca",
-  "serial": "1795602283",
-  "expires": "2027-11-25T10:24:43Z",
+  "serial": "1795607477",
+  "expires": "2027-11-25T11:51:17Z",
   "restic_version": "0.19.1",
   "restic_sha256_arm64": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
   "restic_sha256_amd64": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
-  "notes": "Suite 366 1.33.1, chart 0.11.0. Agents get a real web browser on the appliance: enable the Agents web browser module and the Browse websites permission on an agent; it opens pages through a filtered egress proxy, and the person it works for can watch it live, take over for a login or a CAPTCHA, then hand back. The browser is switched on at the update run that follows this one, which also caps processes per pod in k3s (one k3s restart, containers keep running) and pre-pulls the browser image. Meetings and voice rooms: camera background blur and virtual backgrounds. Agents: blocking sub-agents get 20 min instead of 5, compaction respects the declared window of a custom API provider, truncated outputs are retried, real tool durations in activities. Chat: readable conversation previews and quoted mentions. Updating restarts the application (database migrations run at startup); the AI models keep running."
+  "notes": "Suite 366 1.34.0, chart 0.11.0. A new AI model can be selected on the box: RaLLM v2.4, the Qwen3.8 27B fine-tuned by Devana for the Suite 366 assistant. It is better at deciding between calling a tool and answering, makes far fewer unneeded tool calls, and runs at the same speed and in the same memory as the default model, which does not change. Switching to it from the model page downloads 22 GB once, and its first start takes about 8 minutes. CRM dashboards: cumulative flow and created-versus-resolved tiles, and redesigned charts on six pages. PersonIA: the tasks it scheduled are listed on the bots page and can be stopped there. Meetings: a scheduled meeting creates its calendar event. Pages: search and favourites for spaces. Chat: a mention notification shows the message excerpt and where it was posted. Dictation: a launcher in the header. Drive: seeking inside a video or an audio preview works. Updating restarts the application (database migrations run at startup); the AI models keep running."
 }
